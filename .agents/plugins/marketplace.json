@@ -1,0 +1,20 @@
+{
+  "name": "codex-cost-orchestrator",
+  "interface": {
+    "displayName": "Codex Cost Orchestrator"
+  },
+  "plugins": [
+    {
+      "name": "codex-cost-orchestrator",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-cost-orchestrator"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

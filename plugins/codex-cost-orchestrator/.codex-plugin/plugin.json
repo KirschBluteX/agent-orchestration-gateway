@@ -1,0 +1,36 @@
+{
+  "name": "codex-cost-orchestrator",
+  "version": "0.2.0",
+  "description": "Implicit cost-aware Codex implementation routing with a Sol control plane, tiered workers, bounded context, and independent review epochs.",
+  "author": {
+    "name": "KirschQAQ",
+    "url": "https://github.com/KirschBluteX"
+  },
+  "homepage": "https://github.com/KirschBluteX/codex-cost-orchestrator#readme",
+  "repository": "https://github.com/KirschBluteX/codex-cost-orchestrator",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "orchestration",
+    "multi-agent",
+    "gpt-5.6"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Cost Orchestrator",
+    "shortDescription": "Default cost-aware routing with guarded direct execution and verified worker lanes.",
+    "longDescription": "Codex Cost Orchestrator implicitly classifies implementation work, verifies atomic low-risk edits directly in Sol, routes closed contracts to Luna and bounded complex work to Terra, upgrades without losing the original baseline, and gates orchestrated results through an exact-state review epoch.",
+    "developerName": "KirschQAQ",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/KirschBluteX/codex-cost-orchestrator",
+    "defaultPrompt": [
+      "Implement and verify this feature using the default cost-aware route.",
+      "Classify this change, then use the least costly adequate execution lane.",
+      "Review this accumulated change set with a fresh review epoch."
+    ]
+  }
+}

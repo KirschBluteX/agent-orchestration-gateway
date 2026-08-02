@@ -1,0 +1,17 @@
+.DS_Store
+*.log
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+*.egg-info/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+build/
+dist/
+.codex-skill-validator/
