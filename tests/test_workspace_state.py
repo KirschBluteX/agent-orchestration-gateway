@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -224,6 +225,91 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 2)
             self.assertIn("invalid lease path", verify.stderr)
             self.assertEqual(verify.stdout, "")
+
+    def test_rejects_noncanonical_lease_path_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+
+            for path in (
+                "../escape.txt",
+                "/absolute.txt",
+                "C:/absolute.txt",
+                "C:relative.txt",
+                "\\\\server\\share\\owned.txt",
+                "src\\owned.txt",
+                "src//owned.txt",
+                "src/./owned.txt",
+                "src/../owned.txt",
+                "src//",
+            ):
+                with self.subTest(path=path):
+                    verify = subprocess.run(
+                        [
+                            sys.executable,
+                            str(STATE_TOOL),
+                            "verify",
+                            "--repo",
+                            str(repo),
+                            "--baseline",
+                            str(baseline),
+                            "--allow",
+                            path,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(verify.returncode, 2)
+                    self.assertIn("invalid lease path", verify.stderr)
+
+    @unittest.skipUnless(
+        os.path.normcase("A") == os.path.normcase("a"),
+        "case aliases are distinct on this host",
+    )
+    def test_case_insensitive_host_compares_lease_aliases_by_casefold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "src" / "owned.txt").write_text("changed\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "SRC/OWNED.TXT",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 0, verify.stderr)
+            self.assertEqual(json.loads(verify.stdout)["violations"], [])
 
     def test_rejects_staging_even_when_the_file_is_in_the_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

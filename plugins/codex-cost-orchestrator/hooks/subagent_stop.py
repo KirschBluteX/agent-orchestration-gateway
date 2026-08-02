@@ -4,8 +4,25 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 import sys
+from typing import Callable
+
+from protocol_envelope import EnvelopeError, load_utf8_json, parse_envelope
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+try:
+    from protocol_hash import (  # noqa: E402
+        ProtocolHashError as _ProtocolHashError,
+        digest as protocol_digest,
+    )
+    PROTOCOL_HASH_ERRORS: tuple[type[Exception], ...] = (_ProtocolHashError,)
+except Exception:
+    protocol_digest = None
+    PROTOCOL_HASH_ERRORS = ()
 
 
 WORKER_ROLES = frozenset(
@@ -15,23 +32,40 @@ WORKER_ROLES = frozenset(
     }
 )
 REVIEWER_ROLE = "cost_orchestrator_reviewer"
-WORK_RESULT_HEADER = "CCO_WORK_RESULT cco.v3"
+WORK_RESULT_HEADER = "CCO_WORK_RESULT cco.v4"
 WORK_RESULT_FIELDS = (
     "NODE",
     "CONTRACT_REV",
+    "CONTRACT_SHA256",
+    "INPUT_CLOSURE_SHA256",
     "RUN",
+    "ATTEMPT",
+    "FOLLOWUP",
     "LEASE",
+    "LEASE_GENERATION",
+    "STOP_GENERATION",
+    "ACCEPTANCE_IDS",
     "STATUS",
+    "FAILURE_ACCEPTANCE_OR_VERIFICATION_ID",
+    "FAILURE_CLASS",
+    "FAILURE_EXIT_STATUS",
+    "FAILURE_DIAGNOSTIC_IDS",
+    "FAILURE_SIGNATURE",
     "CHANGED",
     "VERIFIED",
     "JUDGMENT",
     "DEVIATIONS",
     "BLOCKERS",
 )
-REVIEW_RESULT_HEADER = "CCO_REVIEW_RESULT cco.v3"
+REVIEW_RESULT_HEADER = "CCO_REVIEW_RESULT cco.v4"
 REVIEW_RESULT_FIELDS = (
     "EPOCH",
     "MODE",
+    "ATTEMPT",
+    "FOLLOWUP",
+    "INPUT_CLOSURE_SHA256",
+    "ACCEPTANCE_IDS",
+    "EVIDENCE_SHA256",
     "REVIEWED_STATE",
     "VERDICT",
     "REASON",
@@ -45,67 +79,171 @@ REVIEW_RESULT_ENUMS = {
     "MODE": frozenset({"fresh", "delta"}),
     "VERDICT": frozenset({"ship", "fix-first", "rethink"}),
 }
-FIELD_LINE = re.compile(r"^([A-Z][A-Z0-9_]*):(?:\s*(.*))?$")
+SHA256_VALUE = re.compile(r"^sha256:[0-9a-f]{64}$")
+WORK_IDENTITY = re.compile(r"^[a-z0-9][a-z0-9_]*$")
+RUN_IDENTITY = re.compile(r"^run_([a-z0-9][a-z0-9_]*)_(r[0-9]{2,})$")
+EPOCH_IDENTITY = re.compile(r"^e[0-9]{2,}$")
+FAILURE_ID = re.compile(r"^[AV][0-9]{2,}$")
+FAILURE_CLASS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+DIAGNOSTIC_ID = re.compile(r"^D[A-Z0-9_]{1,63}$")
+VERIFIED_LINE = re.compile(
+    r"^- (V[0-9]{2,}) (\[A[0-9]{2,}(?:,A[0-9]{2,})*\]): (.+) => (.+)$"
+)
+WORK_RESULT_PATTERNS = {
+    "CONTRACT_SHA256": SHA256_VALUE,
+    "INPUT_CLOSURE_SHA256": SHA256_VALUE,
+    "NODE": WORK_IDENTITY,
+    "RUN": WORK_IDENTITY,
+    "LEASE": WORK_IDENTITY,
+}
+REVIEW_RESULT_PATTERNS = {
+    "EPOCH": EPOCH_IDENTITY,
+    "INPUT_CLOSURE_SHA256": SHA256_VALUE,
+    "EVIDENCE_SHA256": SHA256_VALUE,
+    "REVIEWED_STATE": SHA256_VALUE,
+}
+MAX_SAFE_INTEGER = (1 << 53) - 1
+MAX_SAFE_INTEGER_DIGITS = len(str(MAX_SAFE_INTEGER))
+WORK_LIST_FIELDS = frozenset(
+    {"CHANGED", "VERIFIED", "JUDGMENT", "DEVIATIONS", "BLOCKERS"}
+)
+REVIEW_LIST_FIELDS = frozenset({"FINDINGS", "RESIDUAL_RISK"})
 
 
-def _first_content_line(message: str) -> str | None:
-    lines = iter(message.splitlines())
+def _integer_in_range(value: str, *, minimum: int) -> bool:
+    if re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        return False
+    if len(value) > MAX_SAFE_INTEGER_DIGITS:
+        return False
+    parsed = int(value)
+    return minimum <= parsed <= MAX_SAFE_INTEGER
+
+
+def _counter_in_range(value: str, *, minimum: int) -> bool:
+    match = re.fullmatch(r"(0|[1-9][0-9]*)/([1-9][0-9]*)", value)
+    if match is None:
+        return False
+    parts = match.groups()
+    if any(len(part) > MAX_SAFE_INTEGER_DIGITS for part in parts):
+        return False
+    current, limit = (int(part) for part in parts)
+    return minimum <= current <= limit <= MAX_SAFE_INTEGER
+
+
+def _optional_exit_status(value: str) -> bool:
+    if value == "none":
+        return True
+    if re.fullmatch(r"-?(0|[1-9][0-9]*)", value) is None:
+        return False
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > MAX_SAFE_INTEGER_DIGITS:
+        return False
+    return -MAX_SAFE_INTEGER <= int(value) <= MAX_SAFE_INTEGER
+
+
+def _valid_acceptance_ids(value: str) -> bool:
+    if re.fullmatch(r"\[A[0-9]{2,}(?:,A[0-9]{2,})*\]", value) is None:
+        return False
+    identifiers = value[1:-1].split(",")
+    return identifiers == sorted(set(identifiers))
+
+
+def _valid_diagnostic_ids(value: str) -> bool:
+    if value == "[]":
+        return True
+    if re.fullmatch(r"\[D[A-Z0-9_]{1,63}(?:,D[A-Z0-9_]{1,63})*\]", value) is None:
+        return False
+    identifiers = value[1:-1].split(",")
+    return all(DIAGNOSTIC_ID.fullmatch(item) for item in identifiers) and (
+        identifiers == sorted(set(identifiers))
+    )
+
+
+def _acceptance_ids(value: str) -> list[str]:
+    return value[1:-1].split(",")
+
+
+def _valid_verified(value: str, status: str, accepted: str) -> bool:
+    lines = value.split("\n")
+    if lines == ["- none"]:
+        return status != "complete"
+    accepted_ids = set(_acceptance_ids(accepted))
+    seen_verifications: list[str] = []
+    covered: set[str] = set()
     for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("```"):
-            for fenced_line in lines:
-                fenced = fenced_line.strip()
-                if fenced:
-                    return fenced
-            return None
-        return stripped
-    return None
+        match = VERIFIED_LINE.fullmatch(line)
+        if match is None:
+            return False
+        verification_id, ids_value, _operation, _outcome = match.groups()
+        ids = _acceptance_ids(ids_value)
+        if ids != sorted(set(ids)) or not set(ids) <= accepted_ids:
+            return False
+        seen_verifications.append(verification_id)
+        covered.update(ids)
+    if seen_verifications != sorted(set(seen_verifications)):
+        return False
+    return covered == accepted_ids if status == "complete" else covered <= accepted_ids
 
 
-def _packet_fields(
-    message: str, header: str
-) -> tuple[dict[str, str], set[str]]:
-    fields: dict[str, str] = {}
-    duplicates: set[str] = set()
-    current_name: str | None = None
-    current_content: list[str] = []
+WORK_RESULT_VALIDATORS: dict[str, Callable[[str], bool]] = {
+    "CONTRACT_REV": lambda value: _integer_in_range(value, minimum=1),
+    "ATTEMPT": lambda value: _counter_in_range(value, minimum=1),
+    "FOLLOWUP": lambda value: _counter_in_range(value, minimum=0),
+    "LEASE_GENERATION": lambda value: _integer_in_range(value, minimum=1),
+    "STOP_GENERATION": lambda value: _integer_in_range(value, minimum=0),
+    "ACCEPTANCE_IDS": _valid_acceptance_ids,
+    "FAILURE_EXIT_STATUS": _optional_exit_status,
+    "FAILURE_DIAGNOSTIC_IDS": _valid_diagnostic_ids,
+}
+REVIEW_RESULT_VALIDATORS: dict[str, Callable[[str], bool]] = {
+    "ATTEMPT": lambda value: _counter_in_range(value, minimum=1),
+    "FOLLOWUP": lambda value: _counter_in_range(value, minimum=0),
+    "ACCEPTANCE_IDS": _valid_acceptance_ids,
+}
 
-    def finish_field() -> None:
-        nonlocal current_name, current_content
-        if current_name is None:
-            return
-        value = "\n".join(part for part in current_content if part).strip()
-        if current_name in fields:
-            duplicates.add(current_name)
-        else:
-            fields[current_name] = value
-        current_name = None
-        current_content = []
 
-    found_header = False
-    for raw_line in message.splitlines():
-        line = raw_line.strip()
-        if not found_header:
-            if not line or line.startswith("```"):
-                continue
-            found_header = line == header
-            if not found_header:
-                break
-            continue
-        if line.startswith("```"):
-            break
-        match = FIELD_LINE.fullmatch(line)
-        if match:
-            finish_field()
-            current_name = match.group(1)
-            inline_value = (match.group(2) or "").strip()
-            current_content = [inline_value] if inline_value else []
-        elif current_name is not None and line:
-            current_content.append(line)
-    finish_field()
-    return fields, duplicates
+def _valid_failure(fields: dict[str, str]) -> bool:
+    status = fields.get("STATUS")
+    failure_id = fields.get("FAILURE_ACCEPTANCE_OR_VERIFICATION_ID", "")
+    failure_class = fields.get("FAILURE_CLASS", "")
+    exit_status = fields.get("FAILURE_EXIT_STATUS", "")
+    diagnostics_value = fields.get("FAILURE_DIAGNOSTIC_IDS", "")
+    signature = fields.get("FAILURE_SIGNATURE", "")
+    if status == "complete":
+        return (
+            failure_id == "none"
+            and failure_class == "none"
+            and exit_status == "none"
+            and diagnostics_value == "[]"
+            and signature == "none"
+        )
+    if status not in {"partial", "blocked"}:
+        return False
+    if (
+        FAILURE_ID.fullmatch(failure_id) is None
+        or FAILURE_CLASS.fullmatch(failure_class) is None
+        or failure_class == "none"
+        or not _optional_exit_status(exit_status)
+        or not _valid_diagnostic_ids(diagnostics_value)
+        or SHA256_VALUE.fullmatch(signature) is None
+    ):
+        return False
+    diagnostics = [] if diagnostics_value == "[]" else diagnostics_value[1:-1].split(",")
+    payload = {
+        "acceptance_or_verification_id": failure_id,
+        "contract_sha256": fields.get("CONTRACT_SHA256"),
+        "diagnostic_ids": diagnostics,
+        "exit_status": None if exit_status == "none" else int(exit_status),
+        "failure_class": failure_class,
+        "node": fields.get("NODE"),
+        "protocol": "cco.v4",
+    }
+    if protocol_digest is None:
+        raise RuntimeError("protocol hash helper is unavailable")
+    try:
+        return protocol_digest("failure", payload) == signature
+    except PROTOCOL_HASH_ERRORS + (TypeError, ValueError):
+        return False
 
 
 def _missing_fields(
@@ -114,18 +252,69 @@ def _missing_fields(
     header: str,
     required: tuple[str, ...],
     enums: dict[str, frozenset[str]],
+    patterns: dict[str, re.Pattern[str]],
+    validators: dict[str, Callable[[str], bool]],
 ) -> list[str]:
-    if _first_content_line(message) != header:
-        return [header]
-    fields, duplicates = _packet_fields(message, header)
-    missing = [
-        name
-        for name in required
-        if not fields.get(name) or name in duplicates
-    ]
+    list_fields = WORK_LIST_FIELDS if header == WORK_RESULT_HEADER else REVIEW_LIST_FIELDS
+    try:
+        fields = parse_envelope(
+            message,
+            header=header,
+            required=required,
+            list_fields=list_fields,
+            allow_text_fence=True,
+        )
+    except EnvelopeError as error:
+        return list(error.issues)
+    missing: list[str] = []
     for name, allowed_values in enums.items():
         if fields.get(name) not in allowed_values and name not in missing:
             missing.append(name)
+    for name, pattern in patterns.items():
+        value = fields.get(name)
+        if value and pattern.fullmatch(value) is None and name not in missing:
+            missing.append(name)
+    for name, validator in validators.items():
+        value = fields.get(name)
+        if value and not validator(value) and name not in missing:
+            missing.append(name)
+    if header == WORK_RESULT_HEADER:
+        run_match = RUN_IDENTITY.fullmatch(fields.get("RUN", ""))
+        if (
+            run_match is None
+            or run_match.group(1) != fields.get("NODE")
+            or fields.get("LEASE")
+            != f"wl_{fields.get('NODE')}_{run_match.group(2)}"
+        ):
+            missing.extend(name for name in ("RUN", "LEASE") if name not in missing)
+        if not _valid_failure(fields) and "FAILURE_SIGNATURE" not in missing:
+            missing.append("FAILURE_SIGNATURE")
+        verified = fields.get("VERIFIED")
+        accepted = fields.get("ACCEPTANCE_IDS")
+        status = fields.get("STATUS")
+        if (
+            verified
+            and accepted
+            and _valid_acceptance_ids(accepted)
+            and not _valid_verified(verified, status or "", accepted)
+            and "VERIFIED" not in missing
+        ):
+            missing.append("VERIFIED")
+    else:
+        followup = fields.get("FOLLOWUP", "")
+        match = re.fullmatch(r"(0|[1-9][0-9]*)/[1-9][0-9]*", followup)
+        current_text = match.group(1) if match is not None else ""
+        current = (
+            int(current_text)
+            if current_text and len(current_text) <= MAX_SAFE_INTEGER_DIGITS
+            else None
+        )
+        mode = fields.get("MODE")
+        if (
+            (mode == "fresh" and current != 0)
+            or (mode == "delta" and (current is None or current < 1))
+        ) and "FOLLOWUP" not in missing:
+            missing.append("FOLLOWUP")
     return missing
 
 
@@ -162,10 +351,14 @@ def _evaluate(payload: object) -> dict[str, str]:
         header = REVIEW_RESULT_HEADER
         required = REVIEW_RESULT_FIELDS
         enums = REVIEW_RESULT_ENUMS
+        patterns = REVIEW_RESULT_PATTERNS
+        validators = REVIEW_RESULT_VALIDATORS
     elif agent_type in WORKER_ROLES:
         header = WORK_RESULT_HEADER
         required = WORK_RESULT_FIELDS
         enums = WORK_RESULT_ENUMS
+        patterns = WORK_RESULT_PATTERNS
+        validators = WORK_RESULT_VALIDATORS
     else:
         return {}
 
@@ -175,6 +368,8 @@ def _evaluate(payload: object) -> dict[str, str]:
             header=header,
             required=required,
             enums=enums,
+            patterns=patterns,
+            validators=validators,
         )
         if isinstance(message, str)
         else [header]
@@ -190,7 +385,7 @@ def _evaluate(payload: object) -> dict[str, str]:
 def main() -> int:
     outcome: dict[str, str] = {}
     try:
-        outcome = _evaluate(json.load(sys.stdin))
+        outcome = _evaluate(load_utf8_json(sys.stdin.buffer))
     except Exception:
         pass
 

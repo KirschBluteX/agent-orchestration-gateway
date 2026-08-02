@@ -4,11 +4,12 @@
 
 Cost-aware, contract-driven orchestration for native Codex agents.
 
-Codex Cost Orchestrator keeps the user goal, architecture, decomposition, and final
-acceptance in a primary Sol session. It routes closed implementation contracts to a
-Luna Max routine lane or a Terra Max complex lane, verifies the actual repository
-state in the primary session, and gates orchestrated completion through a Sol review
-epoch. Read-only requests and guarded atomic edits avoid that delegation overhead.
+Codex Cost Orchestrator (CCO v4) keeps the user goal, architecture, decomposition, and
+final acceptance in a primary Sol session. It routes closed contracts to model-neutral
+leaf roles with user-selectable model and reasoning effort, verifies the actual
+repository state and primary evidence in Sol, and gates orchestrated completion through
+an exact-state review epoch. Read-only requests and guarded atomic edits avoid that
+delegation overhead.
 
 The goal is not to make every turn cheap. It is to move well-specified implementation
 volume to the least costly adequate worker while keeping expensive planning and
@@ -91,27 +92,45 @@ agent.
   acceptance-critical checks to pass, and a `ship` verdict bound to the exact final
   state.
 
-## Roles
+## Roles and worker selection
 
-| Responsibility | Native role | Pinned profile | Boundary |
+| Responsibility | Native role | Runtime selection | Boundary |
 | --- | --- | --- | --- |
 | Control plane | Primary Codex task | Sol; effort selected by the user | Resolve ambiguity, design, decompose, route, verify, and accept |
-| Routine lane | `cost_orchestrator_routine_worker` | GPT-5.6 Luna / Max | Fully determined, mechanical, independently verifiable work |
-| Complex lane | `cost_orchestrator_complex_worker` | GPT-5.6 Terra / Max | Bounded algorithms, debugging, compatibility, security, or wider implementation judgment |
+| Routine lane | `cost_orchestrator_routine_worker` | User-selected per node; route order starts Luna / Max, then Terra / Max | Fully determined, mechanical, independently verifiable work |
+| Complex lane | `cost_orchestrator_complex_worker` | User-selected per node; Terra / Max is the route recommendation | Bounded algorithms, debugging, compatibility, security, or wider implementation judgment |
 | Review lane | `cost_orchestrator_reviewer` | GPT-5.6 Sol / High; requests read-only | Fresh epoch review and contract-preserving delta review |
 
-The worker profiles disable their own agent collaboration features. They are leaf
-executors, not secondary orchestrators. A worker must stop when a needed decision is
-outside its versioned contract or write set.
+Routine and complex describe contract closure, not fixed models. Worker TOMLs omit
+`model` and `model_reasoning_effort`; native spawn carries the selected dimensions.
+The profiles disable their own collaboration features, so workers remain leaf
+executors rather than secondary orchestrators. Codex native subagent tools remain the
+only agent runtime.
+
+Choose values in the task request, independently by lane or node. For example:
+
+```text
+Use CCO for this change. Use <model-a> at high effort for routine nodes, <model-b> at max effort for complex nodes, and keep the reviewer default.
+```
+
+Use `native` for either dimension when Codex should inherit/resolve it instead. If no
+choice is given, routine uses the finite Luna Max then Terra Max preference order;
+complex uses Terra Max. When Codex exposes a native capability catalog, CCO checks the
+model, supported effort, and task-required capabilities before dispatch. Native spawn
+validation and observed effective values remain authoritative.
+
+The dimensions remain independent during fallback. CCO overlays them into candidate
+tuples and advances only a dimension whose policy is `route_default`; an explicit user
+value and an omitted `native` dimension remain unchanged.
 
 ```mermaid
 flowchart TD
     U["User goal"] --> S["Sol control plane"]
     S --> C{"Contract closed?"}
     C -->|"No"| S
-    C -->|"Routine"| L["Luna Max worker"]
-    C -->|"Bounded complex"| T["Terra Max worker"]
-    L --> V["Sol verifies actual state"]
+    C -->|"Routine"| L["Routine role + selected model/effort"]
+    C -->|"Bounded complex"| T["Complex role + selected model/effort"]
+    L --> V["Sol verifies actual state + evidence"]
     T --> V
     V --> R["Fresh Sol review epoch"]
     R -->|"fix-first"| F["Same owner fixes; same reviewer checks delta"]
@@ -125,27 +144,84 @@ flowchart TD
 
 ### Versioned work nodes
 
-Every delegated node uses a `cco.v3` packet with a stable `NODE`, material
-`CONTRACT_REV`, unique agent-thread `RUN`, baseline-bound `LEASE`, exact write paths,
-interfaces, discretion, exclusions, acceptance criteria, and expected verification
-evidence. A current packet supersedes inherited conversational assumptions.
+Every delegated node uses a `cco.v4` packet with a stable `NODE`, material
+`CONTRACT_REV`, canonical `CONTRACT_SHA256`, chained `INPUT_CLOSURE_SHA256`, unique
+agent-thread `RUN`, finite `ATTEMPT` and `FOLLOWUP`, bound `fork_turns`, baseline-bound `LEASE`,
+`LEASE_GENERATION`, `STOP_GENERATION`, exact write paths, stable acceptance IDs, and
+expected verification evidence. The initial work packet plus the latest valid chained
+live in-turn steer supersedes inherited conversational assumptions.
 
 The control plane also maintains a single-flight ledger for each
-`NODE@CONTRACT_REV`. A revision cannot be spawned twice while active or accepted;
-contract-preserving retries continue the recorded canonical task path, and a new run
-must first retire the old owner.
+`NODE@CONTRACT_REV`. One active owner is allowed. A contract-preserving steer may
+continue the recorded canonical task path only while that worker is still running; a
+completed worker receives a new run, attempt, explicit route, and lease generation.
 
-Luna is the default only when the packet determines the result. Terra is used when
-architecture and interfaces are already fixed but bounded implementation judgment
-remains. Work stays in Sol while the objective, architecture, public interface,
-ownership, or acceptance criteria are unresolved.
+### Per-node model and effort
+
+The user can select model and effort independently for every worker node. `MODEL_POLICY`
+and `EFFORT_POLICY` each use `user`, `route_default`, or `native`. A user value always
+wins. Route defaults use Luna Max then Terra Max for routine and Terra Max for complex
+without pinning either worker TOML. A native dimension is omitted from spawn so Codex
+resolves it from current defaults or inheritance. A rejected proposal that creates no
+thread consumes no worker attempt or lease generation; a user selection never falls
+back, while a route default may try only its next predeclared candidate. Once a usable
+worker exists, an unobservable or mismatched route is fenced and rejected.
+
+### Structural Multi gate
+
+Full orchestration does not automatically mean concurrent fan-out. Multi dispatch
+requires at least two dependency-ready nodes, closed contract and input hashes,
+pairwise-disjoint write leases, complete acceptance ownership, and a planned
+independent review epoch, plus native capacity for at least two worker threads.
+Otherwise CCO serializes, merges an artificial split, or
+keeps unresolved work in Sol. Price, tokens, latency, request count, file count, and
+predicted quality are advice, not hard gates.
+
+### Hash-bound inputs, fencing, and bounded recovery
+
+`CONTRACT_SHA256` binds stable task semantics. Every initial dispatch and follow-up has
+an `INPUT_CLOSURE_SHA256`; follow-ups also bind
+`PREVIOUS_INPUT_CLOSURE_SHA256`. `LEASE_GENERATION` identifies the active write owner,
+while `STOP_GENERATION` is incremented before interrupt to fence late results. It does
+not prevent late writes, so Sol still checks the actual workspace delta.
+
+The spawn guardrail rebuilds the canonical contract and initial input preimages from
+the readable packet, including `fork_turns` and the complete acceptance-ID set, and
+recomputes both hashes. Live worker steers carry canonical `BINDING_JSON` and bind the
+full canonical native `TARGET`; reviewer deltas do the same before the native
+continuation call.
+
+Attempts are finite across input, role, model, and effort changes for one
+`NODE@CONTRACT_REV`; follow-ups are finite and consecutive per run. Sol recomputes a
+stable `FAILURE_SIGNATURE` from the structured failure ID, class, exit status, and
+bounded diagnostics for failed verification or blocked work. A recurring signature
+requires a materially different intervention, not another unchanged prompt.
+
+Build each checksum from the exact JSON preimage defined in
+[`contracts-v4.md`](plugins/codex-cost-orchestrator/skills/orchestrate/references/contracts-v4.md):
+
+```text
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain contract
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain input_closure
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain failure
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain evidence
+```
+
+The helper validates the complete cco.v4 schema before hashing: exact keys and nested
+types, policy/null pairing, identifier coverage, NFC text, and canonical set ordering.
+It does not turn hashes into authentication, a content store, or proof that omitted
+inputs were complete. `INPUTS` entries are fingerprints, not content transport or
+locators: each one must correspond to bounded material already included in the packet
+or to an exact repository location named in the packet and readable by the worker.
 
 ### Bounded context and cache-aware dispatch
 
 Custom roles use `fork_turns: none` when the packet plus repository anchors are
 sufficient. When inherited conversation is indispensable, the orchestrator selects
 the smallest positive turn count that contains the earliest still-binding decision.
-It never uses `fork_turns: all` with these custom roles.
+It never uses `fork_turns: all` with a custom role. The pinned Codex source permits a
+full-history fork with model/effort overrides alone; CCO's custom role is the reason
+that combination remains unavailable here.
 
 Stable policy lives in the role profiles; changing task facts live in compact packets.
 This avoids repeatedly sending tool schemas, environment descriptions, full histories,
@@ -179,45 +255,79 @@ resets, or rewrites files. Ignored files remain outside its observation surface,
 concurrent writers can still race the capture/check window.
 Omit `--allow` to reject every mutation during a behaviorally read-only review.
 
-### Same-thread corrections
+Protocol paths use exact NFC Git spelling, forward slashes, and repository-relative
+segments without aliases such as absolute paths, drives, UNC forms, backslashes,
+`.`/`..`, empty segments, or trailing slashes. On a case-insensitive host, Sol compares
+active leases by case-folded spelling before dispatch. A documented trailing slash is
+used only when deriving an intentional directory-prefix argument for the workspace
+helper.
 
-Contract-preserving corrections, verification requests, and completion requests reuse
-the existing worker with a compact `CCO_WORK_FOLLOWUP`. A new worker run is required
-when the role or any material contract field changes. The old owner must stop before a
-lease transfers, and an unchanged failed prompt is not simply repeated.
+### Live corrections and completed-worker recovery
+
+While a worker is observably running, Sol may deliver one compact,
+contract-preserving `CCO_WORK_FOLLOWUP cco.v4` with native `send_message`. Each live
+steer increments its bounded counter, carries exact canonical `BINDING_JSON`, preserves
+the hash-bound acceptance IDs, binds the complete canonical native `TARGET`, and chains
+a new input-closure hash. It is a delta over the initial packet, never standalone
+authority.
+
+Current V2 can transparently reload a known completed task, but reload does not replay
+the worker's original per-spawn model/effort overrides. Because CCO worker profiles are
+model-neutral, a completed or idle worker never receives `followup_task`. Sol inspects
+its delta, fences and retires the owner, and creates a new worker `RUN` with a complete
+packet, explicit routing, another attempt, and a new lease generation. The same rule
+already applies when role, model, effort, non-follow-up input, or a material contract
+field changes.
 
 This reduces duplicate planning and prevents parallel workers from silently expanding
 or overlapping the same assignment.
 
-Reuse is a live same-session optimization. A completed hard-leaf agent that has been
-unloaded or resumed cold may return `ThreadNotFound`; the orchestrator keeps the hard
-leaf controls, starts a new worker `RUN` with the unchanged contract when needed, and
-uses a new fresh review epoch if the missing target was the reviewer.
+Live steering is a same-session optimization, not durable thread storage or a cache-hit
+promise. A role-pinned reviewer may use bounded `followup_task` delta review, with its
+route, sandbox evidence, and workspace state checked again afterward; an unrecoverable
+reviewer uses a bounded fresh attempt. Native `Interrupted` is not terminal, so a
+fenced path is never steered again and its lease is not transferred until it is
+observed idle or terminal.
 
-The plugin's fail-open `SubagentStop` hook checks only the structure of explicit CCO
-worker and reviewer result packets. On the first incomplete packet it requests one
-bounded continuation that tells the agent not to redo completed work; an active second
-stop is always allowed. The hook does not judge the truth of a report, enforce a
-lease, or replace primary verification.
+The plugin ships fail-open, read-only guardrails. PreToolUse hooks cover native `Agent`,
+`send_message`, and `followup_task` calls. They reject structurally inconsistent CCO
+roles, packets, full continuation targets, acceptance closures, forks, model/effort
+requests, unsupported fields, or envelopes over 1 MiB; rebuild self-contained preimages; and block worker
+`followup_task`. They have no persistent ledger and cannot prove prior-hash issuance,
+live residency, lease disjointness, or complete hook coverage. The `SubagentStop` hook
+checks explicit CCO result envelopes, recomputes a claimed failure checksum, and asks
+once for syntax-only envelope repair. That repair is not an implementation follow-up
+and cannot authorize more work. Neither hook judges report truth or replaces Sol.
 
 Plugin hooks are discovered enabled but untrusted, so they do not execute merely
 because the plugin is installed. Open `/hooks`, inspect the plugin-sourced command and
 current hash, and explicitly trust that definition before relying on this check. A
 changed current hash requires a new trust decision.
 Command hooks run with ambient OS permissions rather than the reviewer sandbox; the
-shipped hook is read-only and its workspace non-mutation behavior is tested, but its
-source should still be inspected before trust is granted.
+shipped hooks are read-only and their workspace non-mutation behavior is tested, but
+their source should still be inspected before trust is granted.
 
 ### Review epochs
 
-The first review of every epoch uses a fresh Sol reviewer with no inherited turns. If
-the reviewer returns `fix-first` and the contract remains unchanged, the owning worker
-implements the bounded fix and the same reviewer performs a delta review. A change to
-the goal, architecture, public interfaces or schemas, safety constraints, ownership,
-exclusions, or acceptance criteria starts a new fresh epoch. `rethink` also starts a
-new epoch.
+Sol maps the complete sorted acceptance-ID array to primary evidence at one
+`CURRENT_STATE`; each record includes operation, normalized outcome, exit status,
+observed result, implementation owner, and artifact hashes. Sol hashes the bundle as
+`EVIDENCE_SHA256` and supplies its exact compact canonical preimage as `EVIDENCE_JSON`.
+Every record must be `passed` before a fresh or delta review is eligible. The reviewer
+recomputes the evidence hash and checks that its acceptance IDs and current state match
+the review packet. The first review of every
+epoch uses a fresh Sol reviewer with no inherited turns. Its input closure binds every
+contract hash, the acceptance IDs, current state, evidence hash, accumulated delta,
+and risks.
 
-A `ship` verdict is bound to one exact `STATE`; any later mutation invalidates it.
+If the reviewer returns `fix-first` and the contract remains unchanged, the owning
+worker implements the bounded fix, Sol refreshes evidence for the new state, and the
+same reviewer receives the refreshed canonical `EVIDENCE_JSON`, recomputes it, and
+performs a bounded delta review. A change to goal, architecture, public
+interfaces or schemas, safety, ownership, exclusions, or acceptance starts a fresh
+epoch. `rethink` also starts one. `ship` is valid only when the reviewer echoes the
+complete IDs, review closure, `EVIDENCE_SHA256`, and exact `REVIEWED_STATE`; any later
+mutation invalidates both evidence and verdict.
 
 ## Install
 
@@ -225,7 +335,8 @@ Requirements:
 
 - a current Codex CLI or desktop build with plugins, native subagents, and custom
   agents available;
-- access to the Sol, Terra, and Luna profiles named above;
+- access to the reviewer model and whichever worker model/effort combinations the user
+  or route selects;
 - Git and Python 3.11 or newer.
 
 Clone the public repository, register that checkout as a marketplace, install the
@@ -245,12 +356,14 @@ The same commands work in PowerShell and POSIX shells. On Windows, `py -3` can r
 
 The installer adds only missing files. It never overwrites a differing user-owned
 profile, edits `config.toml`, or invokes Codex. Its default target is
-`$CODEX_HOME/agents` when `CODEX_HOME` is set and `~/.codex/agents` otherwise. Use an
-explicit disposable target when evaluating the installer:
+`$CODEX_HOME/agents` when `CODEX_HOME` is set and `~/.codex/agents` otherwise. It also
+checks the current workspace by default and fails if a selected role is visibly
+shadowed by a differing same-name profile in the target config home or active project
+`.codex` layers. Use explicit disposable paths when evaluating the installer:
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory>
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --check
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace>
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace> --check
 ```
 
 Repeat `--profile routine`, `--profile complex`, or `--profile reviewer` to install or
@@ -259,6 +372,17 @@ are selected.
 
 Start a new Codex task after installation. Custom agent types are discovered when a
 task starts, so an already-open task may not see the new profiles.
+
+Before a full CCO write, the new task must expose native spawn fields for `task_name`,
+`message`, `agent_type`, and `fork_turns`, plus `model` or `reasoning_effort` whenever
+that dimension is not `native`. Installing profiles and passing `--check` cannot prove
+those runtime capabilities; a missing field or role fails closed before delegated
+writes.
+
+Run the non-mutating profile check from, or point `--workspace` at, every active target
+repository before its first CCO graph. The scan covers visible file-backed layers; it
+cannot prove provenance through unexposed managed or runtime configuration, so observed
+role/model/effort and exact result checks remain mandatory.
 
 Explicit invocation is not required for ordinary matching implementation requests.
 This example also asks for worker lanes and a review epoch, so it forces the full path:
@@ -269,26 +393,31 @@ Use $codex-cost-orchestrator:orchestrate to implement and verify this change thr
 
 ## Runtime routing evidence
 
-Codex's native spawn/details metadata is the first source of role, model, and effort
-evidence. When required fields are omitted and local rollouts are accessible, the
-read-only fallback inspector accepts one exact native thread UUID:
+Native V2 spawn returns a canonical task path, not public effective role, model, or
+effort details. Native validation proves that the requested combination was accepted;
+it does not prove that a custom role did not override it. When local rollouts are
+accessible, the read-only inspector accepts either that exact path or the child UUID.
+Path lookup uses the current `CODEX_THREAD_ID` as parent by default, or an explicit
+parent UUID:
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py <thread-id>
-python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py --sessions-dir <sessions-directory> <thread-id>
+python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py <child-uuid-or-canonical-path>
+python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py --sessions-dir <sessions-directory> --parent-thread-id <parent-uuid> <canonical-path>
+python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py --expect-role <role> --expect-model <model> --expect-effort <effort> <child-uuid-or-canonical-path>
 ```
 
 It emits only `thread_id`, `agent_role`, `model`, `effort`,
 `sandbox_policy_type`, and `permission_profile_type`. It rejects invalid IDs,
-ambiguous matches, and missing or conflicting required metadata. It does not emit
-prompts, messages, paths, provider configuration, environment variables, or arbitrary
-rollout payloads.
+invalid paths or parents, ambiguous matches, and missing or conflicting required
+metadata. It does not emit prompts, messages, paths, parent IDs, provider configuration,
+environment variables, or arbitrary rollout payloads. Omit an expectation only for a
+`native` selection dimension; the effective value must still be present and stable.
 
 ## Update
 
-Version 0.2.0 starts a new repository history. Re-clone once if an existing checkout
-predates 0.2.0, then register that new checkout as the marketplace. For a checkout at
-0.2.0 or later:
+Version 0.3.0 introduces schema-checked CCO v4 packets, model-neutral worker templates,
+availability-aware route preferences, and pre-/post-dispatch hook guardrails. For a
+clean existing checkout:
 
 ```text
 git pull --ff-only
@@ -350,6 +479,8 @@ release verification because it is distributed with Codex rather than the pinned
   comparison, and must report the broader permissions as residual risk.
 - Worker and reviewer result packets are claims until the primary Sol session checks
   the actual state and evidence.
+- Profile exactness and shadow scans cover visible file-backed configuration only;
+  unexposed managed/runtime role provenance remains an explicit residual risk.
 - Fresh Sol review is context-independent from the orchestrator, not model-family or
   provider independent.
 - This repository defines routing and verification policy. It does not provide hard

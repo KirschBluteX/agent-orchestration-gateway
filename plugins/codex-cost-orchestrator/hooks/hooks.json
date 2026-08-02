@@ -1,6 +1,34 @@
 {
-  "description": "Fail-open CCO result-envelope check with one bounded continuation.",
+  "description": "Fail-open CCO dispatch, continuation, and result-envelope guardrails.",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
+            "timeout": 5,
+            "async": false,
+            "statusMessage": "Checking CCO spawn packet"
+          }
+        ]
+      },
+      {
+        "matcher": "send_message|followup_task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
+            "timeout": 5,
+            "async": false,
+            "statusMessage": "Checking CCO continuation packet"
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "matcher": "cost_orchestrator_routine_worker|cost_orchestrator_complex_worker|cost_orchestrator_reviewer",

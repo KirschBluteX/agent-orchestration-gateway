@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -118,6 +119,196 @@ class InstallerBehaviorTests(unittest.TestCase):
             self.assertEqual(selected.returncode, 0, selected.stderr)
             self.assertIn("routine, reviewer", selected.stdout)
             self.assertNotEqual(all_profiles.returncode, 0)
+
+    def test_check_rejects_a_shadowing_role_in_the_active_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "codex-home" / "agents"
+            workspace = root / "repo"
+            (workspace / ".git").mkdir(parents=True)
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--target-dir",
+                    str(target),
+                    "--workspace",
+                    str(workspace),
+                    "--profile",
+                    "routine",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+            installed_before = (target / AGENT_FILENAMES[0]).read_bytes()
+
+            project_agents = workspace / ".codex" / "agents"
+            project_agents.mkdir(parents=True)
+            (project_agents / "shadow.toml").write_text(
+                'name = "cost_orchestrator_routine_worker"\n'
+                'description = "Shadowing role"\n'
+                'developer_instructions = "Different authority"\n'
+                "[features]\n"
+                "multi_agent = false\n"
+                "multi_agent_v2 = false\n",
+                encoding="utf-8",
+            )
+
+            checked = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--target-dir",
+                    str(target),
+                    "--workspace",
+                    str(workspace),
+                    "--check",
+                    "--profile",
+                    "routine",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(checked.returncode, 0)
+            self.assertIn("shadow", checked.stderr.lower())
+            self.assertEqual((target / AGENT_FILENAMES[0]).read_bytes(), installed_before)
+
+    def test_check_rejects_a_shadowing_declared_role_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "codex-home" / "agents"
+            workspace = root / "repo"
+            project_config = workspace / ".codex"
+            (workspace / ".git").mkdir(parents=True)
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--target-dir",
+                    str(target),
+                    "--workspace",
+                    str(workspace),
+                    "--profile",
+                    "reviewer",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(install.returncode, 0, install.stderr)
+
+            project_config.mkdir()
+            (project_config / "shadow-reviewer.toml").write_text(
+                'name = "cost_orchestrator_reviewer"\n'
+                'description = "Shadow reviewer"\n'
+                'developer_instructions = "Different review authority"\n',
+                encoding="utf-8",
+            )
+            (project_config / "config.toml").write_text(
+                "[agents.cost_orchestrator_reviewer]\n"
+                'config_file = "./shadow-reviewer.toml"\n',
+                encoding="utf-8",
+            )
+
+            checked = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--target-dir",
+                    str(target),
+                    "--workspace",
+                    str(workspace),
+                    "--check",
+                    "--profile",
+                    "reviewer",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(checked.returncode, 0)
+            self.assertIn("project config shadows", checked.stderr.lower())
+
+    def test_refuses_a_shipped_worker_template_with_runtime_pins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied_plugin = Path(temp_dir) / "plugin"
+            scripts = copied_plugin / "scripts"
+            agents = copied_plugin / "agents"
+            scripts.mkdir(parents=True)
+            agents.mkdir()
+            shutil.copy2(INSTALLER, scripts / INSTALLER.name)
+            for filename in AGENT_FILENAMES:
+                shutil.copy2(PLUGIN / "agents" / filename, agents / filename)
+
+            routine = agents / AGENT_FILENAMES[0]
+            contents = routine.read_text(encoding="utf-8")
+            routine.write_text(
+                contents.replace(
+                    'description = "Non-delegating executor for deterministic CCO work nodes."\n',
+                    'description = "Non-delegating executor for deterministic CCO work nodes."\n'
+                    'model = "gpt-fixed-by-mistake"\n',
+                ),
+                encoding="utf-8",
+            )
+            target = Path(temp_dir) / "installed"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(scripts / INSTALLER.name),
+                    "--target-dir",
+                    str(target),
+                    "--profile",
+                    "routine",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("worker profile must not pin model", result.stderr)
+            self.assertFalse(target.exists())
+
+    def test_refuses_a_shipped_profile_with_a_nested_agents_table(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            copied_plugin = Path(temp_dir) / "plugin"
+            scripts = copied_plugin / "scripts"
+            agents = copied_plugin / "agents"
+            scripts.mkdir(parents=True)
+            agents.mkdir()
+            shutil.copy2(INSTALLER, scripts / INSTALLER.name)
+            for filename in AGENT_FILENAMES:
+                shutil.copy2(PLUGIN / "agents" / filename, agents / filename)
+
+            routine = agents / AGENT_FILENAMES[0]
+            routine.write_text(
+                routine.read_text(encoding="utf-8")
+                + "\n[agents]\nenabled = false\n",
+                encoding="utf-8",
+            )
+            target = Path(temp_dir) / "installed"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(scripts / INSTALLER.name),
+                    "--target-dir",
+                    str(target),
+                    "--profile",
+                    "routine",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must not declare an agents table", result.stderr)
+            self.assertFalse(target.exists())
 
     def test_codex_home_target_does_not_edit_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

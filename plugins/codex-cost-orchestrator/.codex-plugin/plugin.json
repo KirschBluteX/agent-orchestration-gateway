@@ -1,7 +1,7 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "0.2.0",
-  "description": "Implicit cost-aware Codex implementation routing with a Sol control plane, tiered workers, bounded context, and independent review epochs.",
+  "version": "0.3.0",
+  "description": "Implicit cost-aware Codex routing with selectable workers, schema-checked inputs, dispatch guardrails, generation fencing, and exact-state review.",
   "author": {
     "name": "KirschQAQ",
     "url": "https://github.com/KirschBluteX"
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Cost Orchestrator",
-    "shortDescription": "Default cost-aware routing with guarded direct execution and verified worker lanes.",
-    "longDescription": "Codex Cost Orchestrator implicitly classifies implementation work, verifies atomic low-risk edits directly in Sol, routes closed contracts to Luna and bounded complex work to Terra, upgrades without losing the original baseline, and gates orchestrated results through an exact-state review epoch.",
+    "shortDescription": "Cost-aware routing with selectable workers and exact-state acceptance.",
+    "longDescription": "Codex Cost Orchestrator implicitly classifies implementation work, verifies atomic low-risk edits directly in Sol, routes schema-checked closed contracts through availability-aware user-selectable model and effort policies, preflights native dispatch, fences stale worker results, preserves the original baseline, and gates orchestrated results through hash-bound primary evidence and an exact-state review epoch.",
     "developerName": "KirschQAQ",
     "category": "Productivity",
     "capabilities": [

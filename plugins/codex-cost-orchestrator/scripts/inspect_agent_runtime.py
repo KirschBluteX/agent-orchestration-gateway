@@ -15,6 +15,9 @@ from typing import Any
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+CANONICAL_TASK_PATH_PATTERN = re.compile(
+    r"^/root(?:/[a-z0-9][a-z0-9_]*)+$"
+)
 
 
 class InspectionError(Exception):
@@ -31,7 +34,15 @@ def parse_args() -> argparse.Namespace:
         description="Inspect safe routing metadata for one native Codex subagent."
     )
     parser.add_argument("--sessions-dir", type=Path, default=default_sessions_dir())
-    parser.add_argument("thread_id")
+    parser.add_argument("--expect-role")
+    parser.add_argument("--expect-model")
+    parser.add_argument("--expect-effort")
+    parser.add_argument(
+        "--parent-thread-id",
+        default=os.environ.get("CODEX_THREAD_ID"),
+        help="Parent UUID used to resolve a canonical native task path.",
+    )
+    parser.add_argument("target", help="Child thread UUID or exact canonical task path.")
     return parser.parse_args()
 
 
@@ -65,12 +76,64 @@ def read_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def inspect(sessions_dir: Path, thread_id: str) -> dict[str, str | None]:
-    if THREAD_ID_PATTERN.fullmatch(thread_id) is None:
-        raise InspectionError("THREAD_ID must be a lowercase UUID")
+def read_session_metadata(path: Path) -> dict[str, Any] | None:
+    """Read only far enough to identify one rollout during path resolution."""
+    try:
+        with path.open(encoding="utf-8") as rollout:
+            for line in rollout:
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise InspectionError("rollout contains a non-object record")
+                payload = value.get("payload")
+                if value.get("type") == "session_meta" and isinstance(payload, dict):
+                    return payload
+    except (OSError, json.JSONDecodeError) as error:
+        raise InspectionError("rollout is unavailable or invalid") from error
+    return None
+
+
+def resolve_thread_id(
+    sessions_dir: Path, target: str, parent_thread_id: str | None
+) -> str:
+    if THREAD_ID_PATTERN.fullmatch(target) is not None:
+        return target
+    if CANONICAL_TASK_PATH_PATTERN.fullmatch(target) is None:
+        raise InspectionError("TARGET must be a lowercase UUID or canonical task path")
+    if (
+        not isinstance(parent_thread_id, str)
+        or THREAD_ID_PATTERN.fullmatch(parent_thread_id) is None
+    ):
+        raise InspectionError("canonical task path requires a lowercase parent thread UUID")
+
+    matches: list[str] = []
+    for rollout_path in sessions_dir.rglob("rollout-*.jsonl"):
+        try:
+            session = read_session_metadata(rollout_path)
+        except InspectionError:
+            continue
+        if session is None:
+            continue
+        if (
+            string_or_none(session.get("parent_thread_id")) == parent_thread_id
+            and string_or_none(session.get("agent_path")) == target
+        ):
+            child_id = string_or_none(session.get("id"))
+            if child_id is None or THREAD_ID_PATTERN.fullmatch(child_id) is None:
+                raise InspectionError("matching rollout has an invalid child thread ID")
+            matches.append(child_id)
+
+    if len(matches) != 1:
+        raise InspectionError("expected exactly one rollout for the requested task path")
+    return matches[0]
+
+
+def inspect(
+    sessions_dir: Path, target: str, parent_thread_id: str | None = None
+) -> dict[str, str | None]:
     sessions_dir = sessions_dir.expanduser().resolve()
     if not sessions_dir.is_dir():
         raise InspectionError("sessions directory is unavailable")
+    thread_id = resolve_thread_id(sessions_dir, target, parent_thread_id)
 
     matches = list(sessions_dir.rglob(f"rollout-*-{thread_id}.jsonl"))
     if len(matches) != 1:
@@ -132,7 +195,16 @@ def inspect(sessions_dir: Path, thread_id: str) -> dict[str, str | None]:
 def main() -> int:
     args = parse_args()
     try:
-        output = inspect(args.sessions_dir, args.thread_id)
+        output = inspect(args.sessions_dir, args.target, args.parent_thread_id)
+        expected = {
+            "agent_role": args.expect_role,
+            "model": args.expect_model,
+            "effort": args.expect_effort,
+        }
+        for field, value in expected.items():
+            if value is not None and output[field] != value:
+                label = "role" if field == "agent_role" else field
+                raise InspectionError(f"runtime {label} does not match expectation")
     except InspectionError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

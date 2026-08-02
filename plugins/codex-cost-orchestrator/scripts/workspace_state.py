@@ -7,15 +7,18 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
 from typing import Any
 
+from protocol_hash import ProtocolHashError, require_repository_path
+
 
 SCHEMA = "cco.workspace-state.v1"
+CASE_INSENSITIVE_HOST = os.path.normcase("A") == os.path.normcase("a")
 
 
 class StateError(Exception):
@@ -204,25 +207,23 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
 
 
 def normalize_allow(value: str) -> str:
-    normalized = value.replace("\\", "/")
-    is_prefix = normalized.endswith("/")
-    normalized = normalized.rstrip("/")
-    path = PurePosixPath(normalized)
-    if (
-        not normalized
-        or path.is_absolute()
-        or ".." in path.parts
-        or "." in path.parts
-        or (path.parts and path.parts[0].casefold() == ".git")
-    ):
+    is_prefix = value.endswith("/")
+    candidate = value[:-1] if is_prefix else value
+    try:
+        normalized = require_repository_path(candidate, "lease path")
+    except ProtocolHashError as error:
+        raise StateError(f"invalid lease path: {value}") from error
+    if normalized.split("/", 1)[0].casefold() == ".git":
         raise StateError(f"invalid lease path: {value}")
-    result = path.as_posix()
-    return result + "/" if is_prefix else result
+    return normalized + "/" if is_prefix else normalized
 
 
 def is_allowed(path: str, allowed: list[str]) -> bool:
+    candidate = path.casefold() if CASE_INSENSITIVE_HOST else path
     return any(
-        path.startswith(item) if item.endswith("/") else path == item
+        candidate.startswith(item.casefold() if CASE_INSENSITIVE_HOST else item)
+        if item.endswith("/")
+        else candidate == (item.casefold() if CASE_INSENSITIVE_HOST else item)
         for item in allowed
     )
 

@@ -4,9 +4,10 @@
 
 面向 Codex 原生代理、以合同驱动的成本感知编排插件。
 
-Codex Cost Orchestrator（CCO）把用户目标、架构、任务拆分和最终验收保留在主
-Sol 会话中；将已经闭合的实现合同交给 Luna Max 常规执行通道或 Terra Max 复杂
-执行通道；由主 Sol 检查真实仓库状态；最后通过 Sol 审查 epoch 决定能否交付。
+Codex Cost Orchestrator（CCO v4）把用户目标、架构、任务拆分和最终验收保留在主
+Sol 会话中；将已经闭合的合同交给模型中立的叶子角色，用户可为每个 worker 节点分别
+选择模型与思考强度；由主 Sol 检查真实仓库状态与一手证据；最后通过精确状态的 Sol
+审查 epoch 决定能否交付。
 
 审查 epoch 是完整编排路径的交付门禁；只读请求和受约束的原子修改会避开没有收益的
 委派开销。
@@ -83,26 +84,41 @@ delta，不能让早期修改隐藏在重建基线之后。
 - 完整编排路径必须覆盖 Sol-owned 与 worker-owned 的全部修改，通过验收关键检查，并取得
   绑定精确最终状态的 `ship` verdict。
 
-## 角色
+## 角色与 worker 选择
 
-| 职责 | 原生角色 | 固定配置 | 边界 |
+| 职责 | 原生角色 | 运行时选择 | 边界 |
 | --- | --- | --- | --- |
 | 控制平面 | 主 Codex 任务 | Sol；推理强度由用户选择 | 消除歧义、设计、拆分、路由、验证和验收 |
-| 常规通道 | `cost_orchestrator_routine_worker` | GPT-5.6 Luna / Max | 合同完全决定结果、机械性强、可独立验证的工作 |
-| 复杂通道 | `cost_orchestrator_complex_worker` | GPT-5.6 Terra / Max | 架构和接口已固定，但算法、调试、兼容性、安全或较广实现仍需有限判断 |
+| 常规通道 | `cost_orchestrator_routine_worker` | 每节点由用户选择；默认顺序为 Luna / Max，再到 Terra / Max | 合同完全决定结果、机械性强、可独立验证的工作 |
+| 复杂通道 | `cost_orchestrator_complex_worker` | 每节点由用户选择；路由建议 Terra / Max | 架构和接口已固定，但算法、调试、兼容性、安全或较广实现仍需有限判断 |
 | 审查通道 | `cost_orchestrator_reviewer` | GPT-5.6 Sol / High；请求只读 | fresh epoch 审查与合同不变时的 delta 审查 |
 
-worker 配置会关闭其自身的代理协作能力。它们是叶子执行器，不是二级规划者。只要所需
-决策超出版本化合同或写入范围，worker 就必须停止并把问题交还控制平面。
+常规与复杂通道描述的是合同闭合度，而不是固定模型。两个 worker TOML 都不写
+`model` 或 `model_reasoning_effort`，由原生 spawn 传入选择值；它们仍关闭自身的代理
+协作能力，只作为叶子执行器。Codex 原生子代理工具仍是唯一的 Agent runtime。
+
+可在任务请求中按通道或节点分别指定，例如：
+
+```text
+这个修改使用 CCO：常规节点使用 <模型A> / high，复杂节点使用 <模型B> / max，reviewer 保持默认配置。
+```
+
+任一维度也可以写 `native`，让 Codex 继承或解析该值。用户未选择时，常规节点使用有限的
+Luna Max → Terra Max 顺序，复杂节点使用 Terra Max。当前 Codex 若公开原生 capability
+catalog，主控会在派发前检查模型、支持的强度和任务所需能力；原生 spawn 校验与真实运行时
+值仍是最终依据。
+
+回退时两个维度仍保持独立：CCO 将它们叠加成候选组合，只允许策略为 `route_default` 的
+维度沿有限顺序前进；用户显式选择与省略传参的 `native` 维度保持不变。
 
 ```mermaid
 flowchart TD
     U["用户目标"] --> S["Sol 控制平面"]
     S --> C{"合同是否闭合？"}
     C -->|"否"| S
-    C -->|"常规"| L["Luna Max worker"]
-    C -->|"有限复杂"| T["Terra Max worker"]
-    L --> V["Sol 验证真实状态"]
+    C -->|"常规"| L["常规角色 + 所选模型/强度"]
+    C -->|"有限复杂"| T["复杂角色 + 所选模型/强度"]
+    L --> V["Sol 验证真实状态与证据"]
     T --> V
     V --> R["Fresh Sol review epoch"]
     R -->|"fix-first"| F["原 owner 修复；同一 reviewer 检查 delta"]
@@ -116,23 +132,72 @@ flowchart TD
 
 ### 版本化工作节点
 
-每个委派节点都使用 `cco.v3` 数据包，包含稳定的 `NODE`、代表实质合同版本的
-`CONTRACT_REV`、代理线程唯一的 `RUN`、绑定基线的 `LEASE`、精确写入路径、接口、
-允许自行判断的范围、排除项、验收标准和预期验证证据。当前数据包优先于继承对话中的
-旧假设。
+每个委派节点都使用 `cco.v4` 数据包，包含稳定的 `NODE`、`CONTRACT_REV`、规范化
+`CONTRACT_SHA256`、链式 `INPUT_CLOSURE_SHA256`、线程唯一的 `RUN`、有限
+`ATTEMPT` / `FOLLOWUP`、绑定的 `fork_turns`、基线 `LEASE`、`LEASE_GENERATION`、
+`STOP_GENERATION`、稳定验收 ID 和预期验证证据。初始工作数据包加上最新有效的运行中
+链式 steer，共同优先于继承对话中的旧假设。
 
 控制平面还会为每个 `NODE@CONTRACT_REV` 维护 single-flight 台账。同一版本处于执行中
-或已被验收后，不能重复派发；不改变合同的重试应继续使用已记录的 canonical task
-path；如需新 run，必须先结束旧 owner。
+只允许一个 active owner。只有 worker 仍明确处于 running 时，不改变合同的 steer 才能沿
+canonical task path 继续；worker 完成后必须使用新的 run、attempt、显式路由与 lease generation。
 
-只有数据包已经决定结果时才默认交给 Luna。架构与接口已固定、但实现仍需有限复杂判断
-时使用 Terra。目标、架构、公共接口、所有权或验收标准尚未解决时，工作必须留在 Sol。
+### 每节点模型与思考强度
+
+用户可为每个 worker 节点分别选择模型与思考强度。`MODEL_POLICY` 与
+`EFFORT_POLICY` 分别支持 `user`、`route_default`、`native`。用户选择始终优先；路由
+默认顺序为常规节点 Luna Max → Terra Max、复杂节点 Terra Max，不写死在 worker TOML 中；
+`native` 维度不传给 spawn，由 Codex 当前默认值或继承规则解析。未创建线程的拒绝提案不
+消耗 worker attempt 或 lease generation；用户选择不可用时不回退，route default 只能尝试
+预先声明的下一个候选。可用 worker 启动后，无法观察或不一致的路由会被 fence 并拒绝。
+
+### 结构型 Multi 门禁
+
+完整编排不代表无条件并发。只有同时存在至少两个 dependency-ready 节点、合同与输入闭包
+均已闭合、写租约两两不重叠、验收所有权完整、已规划独立 review epoch，且可观察到至少
+两个可用原生 worker 线程容量，才允许 Multi
+并发派发。否则必须串行、合并人为拆分，或把未解决工作留在 Sol。价格、token、时延、
+请求数、文件数和预测质量只能提供建议，不能成为硬门禁。
+
+### 哈希闭包、代际 fencing 与有限恢复
+
+`CONTRACT_SHA256` 绑定稳定任务语义。每次初始派发和 follow-up 都有
+`INPUT_CLOSURE_SHA256`，follow-up 还会绑定 `PREVIOUS_INPUT_CLOSURE_SHA256`。
+`LEASE_GENERATION` 标识当前写 owner；主控在 interrupt 前递增 `STOP_GENERATION`，
+拒绝迟到结果。fence 不能阻止迟到写入，因此 Sol 仍需检查真实 workspace delta。
+
+spawn guardrail 会从可读数据包重建规范 contract 与初始 input preimage（包括
+`fork_turns` 和完整验收 ID 集合），并重算两个 hash。worker live steer 携带规范
+`BINDING_JSON` 并绑定完整的原生 canonical `TARGET`；reviewer delta 也会在原生
+continuation 调用前进行同样的重建与校验。
+
+同一 `NODE@CONTRACT_REV` 的 attempt 会跨输入、角色、模型和强度变化累计；同一 run 的
+follow-up 必须有限且连续。验证失败或 blocked 时，Sol 根据结构化失败 ID、类别、exit status
+与有限诊断标识重算稳定 `FAILURE_SIGNATURE`；
+相同签名再次出现时，必须采用实质不同的干预方式，不能重复原提示。
+
+每个 checksum 都必须依据
+[`contracts-v4.md`](plugins/codex-cost-orchestrator/skills/orchestrate/references/contracts-v4.md)
+定义的精确 JSON preimage 生成：
+
+```text
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain contract
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain input_closure
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain failure
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain evidence
+```
+
+helper 会在哈希前校验完整 cco.v4 schema：精确字段与嵌套类型、policy/null 配对、标识覆盖、
+NFC 文本和规范集合顺序。哈希不是认证、内容存储，也不能证明遗漏输入已经闭合。`INPUTS`
+条目只是内容指纹，不负责传输内容或定位内容；每个条目都必须对应数据包中已经包含的有界
+材料，或数据包中明确写出且 worker 可直接读取的精确仓库位置。
 
 ### 有界上下文与缓存感知派发
 
 当 `CCO_WORK` 数据包和仓库锚点已包含足够信息时，自定义角色使用
 `fork_turns: none`。只有继承对话确实不可缺少时，编排器才选择最小的正整数 turn 数，
-覆盖最早仍有效的决定。对于这些自定义角色，绝不使用 `fork_turns: all`。
+覆盖最早仍有效的决定。带自定义角色时绝不使用 `fork_turns: all`。固定的 Codex 源码允许
+单独的模型/强度 override 与 full-history fork 组合；这里真正冲突的是 CCO 必需的自定义角色。
 
 稳定策略保存在角色 TOML 中，变化的任务事实放在紧凑数据包中。这样可以避免重复传输
 工具 Schema、环境说明、完整历史或全部 diff。部分上下文 fork 会重新构建子代理上下文，
@@ -161,43 +226,67 @@ python plugins/codex-cost-orchestrator/scripts/workspace_state.py verify --repo 
 可能发生在 capture/check 窗口之间。不传 `--allow` 会拒绝所有修改，可用于行为只读
 审查。
 
-### 同线程修正
+协议路径必须使用 Git 中的精确 NFC 拼写、正斜杠和仓库相对段；拒绝绝对路径、盘符、UNC、
+反斜杠、`.` / `..`、空段和尾随斜杠等别名。在大小写不敏感宿主上，Sol 在派发前用
+`casefold()` 比较活动 lease。只有调用 workspace helper 表达明确目录前缀时，才从规范路径
+派生其文档规定的尾随斜杠形式。
 
-不改变合同的修正、验证请求和完成请求，会使用紧凑的 `CCO_WORK_FOLLOWUP` 继续现有
-worker。只有角色或任何实质合同字段改变时才创建新 worker run。租约转移前必须停止
-旧 owner，不能简单重复一个没有变化的失败提示。
+### 运行中修正与完成后恢复
+
+worker 明确仍在 running 时，Sol 才能通过原生 `send_message` 发送紧凑、合同不变的
+`CCO_WORK_FOLLOWUP cco.v4`。每次 live steer 都递增有限计数器、保留哈希绑定的验收 ID、
+绑定完整的原生 canonical `TARGET` 并链接新输入闭包；它只是初始数据包上的 delta，携带
+精确规范的 `BINDING_JSON`，不能单独作为权限包。
+
+当前 V2 可以透明重载已知的 completed task，但不会重放该 worker 首次 spawn 时的模型/强度
+override。由于 worker profile 是 model-neutral，completed 或 idle worker 绝不使用
+`followup_task`。Sol 会检查其 delta、fence 并退役旧 owner，然后用完整数据包、显式路由、
+新 attempt 与新 lease generation 创建新的 `RUN`。角色、模型、强度、非 follow-up 输入或
+实质合同字段改变时同样如此。
 
 这样可以减少重复规划，并防止并行 worker 静默扩张或重叠任务范围。
 
-复用是同一活动会话内的优化，不是持久线程存储。已完成的 hard-leaf 代理如果被卸载，
-或在冷恢复后继续，可能返回 `ThreadNotFound`。此时编排器不会为了复用而削弱 leaf
-限制，而是使用原合同创建新的 worker `RUN`；如果丢失的是 reviewer，则创建新的 fresh
-review epoch。
+live steer 是同一活动会话内的优化，不是持久线程存储或缓存命中承诺。角色固定为 Sol High
+的 reviewer 可进行有界 `followup_task` delta review，但之后必须再次检查其路由、sandbox
+证据与工作区状态；无法一致恢复时改用有界 fresh attempt。原生 `Interrupted` 不是终态，
+因此不会再向已 fenced 的路径发消息，只有观察到 idle/terminal 后才可转移租约。
 
-插件的 fail-open `SubagentStop` hook 只检查明确 CCO worker/reviewer 结果数据包的结构。
-第一次遇到不完整数据包时，它会请求一次有界续跑，并要求不要重做已经完成的工作；第二次
-停止始终放行。hook 不判断报告真假、不强制租约，也不能替代主会话验证。
+插件提供 fail-open、只读 guardrail。`PreToolUse` hooks 覆盖原生 `Agent`、`send_message` 与
+`followup_task`，会拒绝不一致的 CCO 角色、数据包、完整 continuation target、验收闭包、
+fork、模型/强度请求、未知字段或超过 1 MiB 的信封，重建自包含 preimage，并阻断 worker
+`followup_task`。它没有持久台账，
+不能证明 prior hash 确实签发、目标仍在运行、租约互斥或完整 hook 覆盖。`SubagentStop` hook 检查结果 envelope、重算声明
+的失败 checksum，并最多请求一次纯格式修复。该修复不是实现 follow-up，不能授权继续工作。
+两者都不判断报告真假，也不能替代主 Sol。
 
 插件 hook 会被发现，但默认处于未信任状态，因此仅安装插件不会执行它。请打开
 `/hooks`，检查来自插件的命令和当前 hash，再显式信任。hash 改变后需要重新决定是否
-信任。命令 hook 使用宿主操作系统的环境权限，而不是 reviewer sandbox；本项目的 hook
-为只读，并测试了不修改工作区的行为，但信任前仍应检查源代码。
+信任。命令 hook 使用宿主操作系统的环境权限，而不是 reviewer sandbox；本项目的 hooks
+均为只读，并测试了不修改工作区的行为，但信任前仍应检查源代码。
 
 ### 审查 epoch
 
-每个 epoch 的首次审查使用全新 Sol reviewer，且不继承对话 turn。如果 reviewer 返回
-`fix-first`，并且合同保持不变，原 worker 完成有限修复，同一 reviewer 再进行 delta
-审查。目标、架构、公共接口或 Schema、安全约束、所有权、排除项或验收标准发生变化时，
-必须创建新的 fresh epoch；`rethink` 也必须开始新 epoch。
+Sol 把完整、排序后的验收 ID 映射到同一 `CURRENT_STATE` 的一手证据；每条记录包含操作、
+规范化 outcome、exit status、真实观察、实现 owner 和 artifact hashes，再把完整证据包
+计算为 `EVIDENCE_SHA256`，并把精确、紧凑、规范化的证据 preimage 作为 `EVIDENCE_JSON`
+交给 reviewer。fresh 或 delta review 只有在每条 evidence record 都为 `passed` 时才有资格
+开始。reviewer 必须重算证据 hash，并核对其中的验收 ID 与当前状态是否匹配
+review 数据包。每个 epoch 的首次审查使用全新 Sol reviewer，且不继承实现者结论；review
+输入闭包绑定全部合同 hash、验收 ID、当前状态、证据 hash、累计 delta 与风险。
 
-`ship` 结论只绑定一个精确 `STATE`，之后任何修改都会使该结论失效。
+如果 reviewer 返回 `fix-first` 且合同不变，原 worker 完成有限修复，Sol 为新状态刷新
+证据，并把刷新后的规范 `EVIDENCE_JSON` 交给同一 reviewer 重算后再做有界 delta review。
+目标、架构、公共接口/Schema、安全、所有权、
+排除项或验收标准改变时必须创建 fresh epoch；`rethink` 同样如此。只有 reviewer 回显完整
+ID、review 闭包、`EVIDENCE_SHA256` 与精确 `REVIEWED_STATE` 时，`ship` 才有效；之后任何
+修改都会让证据闭包和 verdict 同时失效。
 
 ## 安装
 
 要求：
 
 - 当前版本的 Codex CLI 或桌面端，且支持插件、原生子代理和自定义 agent；
-- 能使用本文列出的 Sol、Terra 和 Luna 配置；
+- 能使用 reviewer 模型以及用户或路由所选择的 worker 模型/强度组合；
 - Git 与 Python 3.11 或更高版本。
 
 克隆公开仓库，将该 checkout 注册为 marketplace，安装插件，再安装配套角色配置：
@@ -215,12 +304,13 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --check
 Launcher，可用 `py -3` 代替 `python`。
 
 安装器只添加缺失文件，不会覆盖内容不同的用户配置、修改 `config.toml` 或调用 Codex。
-默认目标是已设置时的 `$CODEX_HOME/agents`，否则是 `~/.codex/agents`。评估安装器时可
-指定一次性目录：
+默认目标是已设置时的 `$CODEX_HOME/agents`，否则是 `~/.codex/agents`；默认检查当前
+workspace。若目标 config home 或活动项目 `.codex` 层中存在名称相同但内容不同的 selected
+role，安装或 `--check` 会 fail-closed。评估安装器时可指定一次性路径：
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory>
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --check
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace>
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace> --check
 ```
 
 可以重复传入 `--profile routine`、`--profile complex` 或 `--profile reviewer`，只安装或
@@ -228,6 +318,14 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <a
 
 安装后请新建 Codex 任务。自定义 agent type 在任务开始时被发现，已经打开的任务可能
 看不到刚安装的配置。
+
+完整 CCO 写入前，新任务必须暴露原生 spawn 的 `task_name`、`message`、`agent_type` 和
+`fork_turns`；某一维不是 `native` 时还必须暴露 `model` 或 `reasoning_effort`。安装配置通过
+`--check` 并不能证明这些运行时能力；字段或角色缺失时必须在委派写入前 fail-closed。
+
+每个目标仓库的首个 CCO graph 之前，都应在该仓库中运行非写入检查，或用 `--workspace`
+指向它。扫描覆盖可见的文件配置层，但不能证明未暴露的 managed/runtime 配置没有再次覆盖；
+因此仍必须观察实际 role/model/effort 并严格检查结果。
 
 普通匹配的实现请求无需显式调用。下面的示例还明确要求 worker 通道和 review epoch，
 因此会强制使用完整路径：
@@ -238,22 +336,26 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <a
 
 ## 运行时路由证据
 
-Codex 原生 spawn/details 元数据是角色、模型和推理强度证据的第一来源。如果其中缺少必要
-字段，且本地 rollout 可访问，只读检查器可以接收一个精确的原生线程 UUID：
+原生 V2 spawn 只返回 canonical task path，不公开有效角色、模型和思考强度详情。原生参数
+校验只能证明请求组合被接受，不能证明自定义角色没有覆盖它。本地 rollout 可访问时，只读
+检查器可以接收该精确 canonical path 或 child UUID。path 查找默认使用当前
+`CODEX_THREAD_ID` 作为 parent，也可显式传入 parent UUID：
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py <thread-id>
-python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py --sessions-dir <sessions-directory> <thread-id>
+python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py <child-uuid-or-canonical-path>
+python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py --sessions-dir <sessions-directory> --parent-thread-id <parent-uuid> <canonical-path>
+python plugins/codex-cost-orchestrator/scripts/inspect_agent_runtime.py --expect-role <role> --expect-model <model> --expect-effort <effort> <child-uuid-or-canonical-path>
 ```
 
 它只输出 `thread_id`、`agent_role`、`model`、`effort`、`sandbox_policy_type` 和
-`permission_profile_type`；会拒绝无效 ID、多个匹配，以及缺失或冲突的必需元数据；
-不会输出提示词、消息、路径、provider 配置、环境变量或任意 rollout 内容。
+`permission_profile_type`；会拒绝无效 ID/path/parent、多个匹配，以及缺失或冲突的必需
+元数据；不会输出提示词、消息、路径、parent ID、provider 配置、环境变量或任意 rollout 内容。只有使用
+`native` 的选择维度才省略对应 expectation；其实际值仍必须存在且在 run 内一致。
 
 ## 更新
 
-0.2.0 使用新的仓库历史。早于 0.2.0 的现有 checkout 需要一次性重新克隆，并将新
-checkout 重新注册为 marketplace。对于 0.2.0 及之后的 checkout：
+0.3.0 引入 schema 校验的 CCO v4 数据包、模型中立 worker 模板、可用性感知的路由顺序，
+以及派发前后的 hook guardrail。对于干净的现有 checkout：
 
 ```text
 git pull --ff-only
@@ -308,6 +410,8 @@ skill 校验器和 `git diff --check`。它只使用 runner 的一次性状态�
   确实为 `read-only` 时，才能声称存在操作系统级只读；否则只能称为行为只读，必须执行
   精确前后状态比较，并把更宽权限列为残余风险。
 - worker 和 reviewer 的结果数据包只是声明，主 Sol 检查真实状态与证据后才能接受。
+- profile 精确检查与 shadow 扫描只覆盖可见文件配置层；未暴露的 managed/runtime role
+  来源仍是显式残余风险。
 - fresh Sol review 与编排器上下文隔离，但不代表模型家族或 provider 独立。
 - 本仓库定义路由和验证策略，不提供硬工作区锁、独立 agent runtime、provider 切换、
   持久成本台账，也不保证固定节省比例。实际成本取决于任务闭合程度、上下文大小、重试率

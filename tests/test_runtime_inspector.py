@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,80 @@ INSPECTOR = (
 
 
 class RuntimeInspectorBehaviorTests(unittest.TestCase):
+    def test_resolves_canonical_path_with_exact_parent_thread(self) -> None:
+        parent_id = "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
+        child_id = "bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"
+        target = "/root/work_n01_auth_routine_r01"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions = Path(temp_dir) / "sessions" / "2026" / "08" / "02"
+            sessions.mkdir(parents=True)
+            for current_parent, current_child in (
+                (parent_id, child_id),
+                (
+                    "cccccccc-cccc-7ccc-8ccc-cccccccccccc",
+                    "dddddddd-dddd-7ddd-8ddd-dddddddddddd",
+                ),
+            ):
+                rollout = sessions / f"rollout-path-{current_child}.jsonl"
+                records = [
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": current_child,
+                            "parent_thread_id": current_parent,
+                            "agent_path": target,
+                            "agent_role": "cost_orchestrator_routine_worker",
+                        },
+                    },
+                    {
+                        "type": "turn_context",
+                        "payload": {"model": "gpt-worker", "effort": "max"},
+                    },
+                ]
+                rollout.write_text(
+                    "".join(json.dumps(record) + "\n" for record in records),
+                    encoding="utf-8",
+                )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSPECTOR),
+                    "--sessions-dir",
+                    str(Path(temp_dir) / "sessions"),
+                    "--parent-thread-id",
+                    parent_id,
+                    target,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["thread_id"], child_id)
+            self.assertNotIn(parent_id, result.stdout)
+            self.assertNotIn(target, result.stdout)
+
+            environment = os.environ.copy()
+            environment["CODEX_THREAD_ID"] = parent_id
+            from_environment = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSPECTOR),
+                    "--sessions-dir",
+                    str(Path(temp_dir) / "sessions"),
+                    target,
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(from_environment.returncode, 0, from_environment.stderr)
+            self.assertEqual(json.loads(from_environment.stdout)["thread_id"], child_id)
+
     def test_emits_only_allowlisted_consistent_routing_metadata(self) -> None:
         thread_id = "11111111-1111-7111-8111-111111111111"
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -219,6 +294,67 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
+
+    def test_expected_routing_values_fail_closed_without_fixed_worker_models(self) -> None:
+        thread_id = "99999999-9999-7999-8999-999999999999"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions_root = Path(temp_dir) / "sessions"
+            sessions = sessions_root / "2026" / "08" / "02"
+            sessions.mkdir(parents=True)
+            rollout = sessions / f"rollout-user-choice-{thread_id}.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "agent_role": "cost_orchestrator_complex_worker",
+                    },
+                },
+                {
+                    "type": "turn_context",
+                    "payload": {
+                        "model": "gpt-user-selected-worker",
+                        "effort": "ultra",
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            base = [
+                sys.executable,
+                str(INSPECTOR),
+                "--sessions-dir",
+                str(sessions_root),
+                "--expect-role",
+                "cost_orchestrator_complex_worker",
+                "--expect-model",
+                "gpt-user-selected-worker",
+                "--expect-effort",
+                "ultra",
+                thread_id,
+            ]
+            matched = subprocess.run(
+                base, text=True, capture_output=True, check=False
+            )
+            self.assertEqual(matched.returncode, 0, matched.stderr)
+            self.assertEqual(json.loads(matched.stdout)["effort"], "ultra")
+
+            mismatched = subprocess.run(
+                [
+                    *base[:-2],
+                    "high",
+                    thread_id,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(mismatched.returncode, 0)
+            self.assertEqual(mismatched.stdout, "")
+            self.assertNotIn("gpt-user-selected-worker", mismatched.stderr)
 
 
 if __name__ == "__main__":
