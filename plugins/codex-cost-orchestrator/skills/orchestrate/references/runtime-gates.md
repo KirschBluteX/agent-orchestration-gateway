@@ -26,6 +26,22 @@ Install missing profiles without overwriting user-owned files:
 python <install_agents.py> [--target-dir <agents-dir>] [--workspace <active-workspace>]
 ```
 
+Upgrade only byte-exact profiles from known published CCO templates:
+
+```text
+python <install_agents.py> [--target-dir <agents-dir>] \
+  [--workspace <active-workspace>] --upgrade
+```
+
+`--upgrade` is explicit. It prepares every replacement and backup before mutation,
+replaces only recognized legacy files, and rolls the complete selected batch back if
+any replacement or post-install exactness check fails. Same-directory hardlink
+backups restore the tested original inode, bytes, mode, and mtime; rollback refuses to
+overwrite a destination whose identity or bytes changed concurrently. It does not
+promise to preserve POSIX ctime or eliminate the final check/replace race. If the target filesystem cannot
+create same-directory hardlinks, preparation fails before mutation. It fails before writing when any
+selected destination is unknown or user-modified.
+
 Verify exact copies without mutation:
 
 ```text
@@ -47,7 +63,8 @@ installation because agent types are discovered at task creation.
 
 Once per orchestrated task, after routing the work graph:
 
-1. Select the reviewer plus every worker profile used by a node.
+1. Select every worker profile used by a node, plus the reviewer only when the
+   pre-dispatch acceptance chain ends in `independent`.
 2. Run the installer's non-mutating `--check` with those `--profile` values and the
    active workspace so visible same-name role shadows fail closed.
 3. Confirm profile shape: Worker templates must omit `model` and
@@ -64,6 +81,13 @@ Once per orchestrated task, after routing the work graph:
 Repeat only after an availability failure, runtime inconsistency, or profile change.
 Never use a generic agent as a routing fallback.
 
+Maintain a cached checked set of successful profile checks. A clean primary graph may
+omit the reviewer initially. On a primary-to-independent upgrade, if the reviewer is
+not in that cached checked set, run the non-mutating
+`python <install_agents.py> --workspace <active-workspace> --check --profile reviewer`
+check and record success before any fix or review. A failed check blocks corrective
+worker work and review; it cannot be deferred to the fresh reviewer spawn.
+
 If a required role is absent or differs from its template, fail closed before any
 delegated write. A missing override field in the live spawn schema fails closed when
 that dimension is user-selected or route-defaulted. Report the exact missing or
@@ -79,6 +103,11 @@ no attempt or lease generation; any mismatch observed after a usable worker star
 fenced and consumes that run. Native policy remains omission, never a silent fallback.
 
 ## Per-spawn evidence
+
+The short successful inspector command and its pass criteria are in `worker-core.md`.
+Load this section only for a mismatch, unavailable or ambiguous runtime metadata, a
+permission/isolation concern, or recovery. The expanded command below is for resolving
+those cases; it is not a replacement for the normal success path.
 
 V2 spawn returns a canonical task path but no public effective role, model, or effort
 details. Native argument validation proves that the proposed combination was accepted,
@@ -129,32 +158,54 @@ python <workspace_state.py> capture --repo <repo> --output <external-baseline.js
 ```
 
 The executable form is `workspace_state.py capture`; `--output` always writes UTF-8
-and refuses a destination inside the repository. After the worker stops, verify the
-exact baseline-relative delta:
+and refuses local repository/control-directory identities plus Win32 device or UNC
+spellings. After the worker stops, verify the exact baseline-relative delta:
 
 ```text
-python <workspace_state.py> verify --repo <repo> --baseline <external-baseline.json> [--allow <path> ...]
+python <workspace_state.py> verify --repo <repo> --baseline <external-baseline.json> [--allow exact:<path> ...] [--allow prefix:<directory> ...]
 ```
 
-The executable form is `workspace_state.py verify`. An allowed value names one exact
-repository-relative path; a trailing slash names that directory prefix. The helper
-fails when HEAD or the Git index changed, reports paths changed since the baseline,
-and returns a violation for every path outside the declared lease. It never stages,
-cleans, resets, or rewrites repository files.
-Omit `--allow` to enforce an empty lease for a behaviorally read-only review.
+The executable form is `workspace_state.py verify`. Capture emits
+`cco.workspace-state.v2`; verify emits `cco.workspace-verification.v2` with
+`allowed_scopes`. The snapshot
+binds all tracked worktree files independently of Git status shortcuts such as
+`assume-unchanged` and `skip-worktree`, recursively fingerprints initialized
+submodules, their marker and protected nested control state, and also binds commit and symbolic HEAD, the index, refs, effective Git
+config, hooks, `info`, selected Git administrative state, physical worktree and Git control-directory identities.
+Administrative coverage includes shallow state,
+object alternates and other `objects/info` data, linked-worktree registry data,
+reflogs, and merge/rebase/cherry-pick/revert/bisect/sequencer pseudo-state. Each
+allowed value explicitly names either one exact repository-relative path or one
+directory prefix. Untyped and trailing-slash-derived values are rejected. The helper
+reports observed paths changed since the baseline and returns a
+violation for every observed path outside the declared lease. It never stages, cleans,
+resets, or rewrites repository files. Omit `--allow` to reject all observed state
+changes during a behaviorally read-only review.
 
-Protocol `WRITE` and `ALLOWED_PATHS` values use exact NFC Git spelling with forward
-slashes and no trailing slash. When invoking the workspace helper for a deliberately
-owned directory, Sol may derive its documented trailing-slash prefix form. Reject
-absolute, drive, UNC, backslash, empty-segment, and dot-segment aliases. On a
-case-insensitive host, compare active leases with `casefold()` before dispatch so case
-aliases cannot appear disjoint.
+Protocol `WRITE` and `ALLOWED_PATHS` entries use `exact:<path>` or `prefix:<path>`;
+their canonical JSON records carry both `kind` and exact NFC Git `path` spelling with
+forward slashes and no trailing slash. The kind is contract-hashed and must be passed
+unchanged to the workspace helper. Reject
+absolute, drive, UNC, backslash, empty-segment, dot-segment, Git-control, Win32 device,
+forbidden-character, and trailing-dot/space aliases. Compare changed paths to leases
+using exact Git spelling on every host; an existing case or 8.3 alias is rejected
+before dispatch. Treat each indexed submodule as one atomic lease for worktree-content
+changes: allow its exact root, reject child-path leases, a prefix scope at the
+submodule root, and any ancestor prefix containing a gitlink. Nested index/HEAD/refs/
+config/admin changes remain violations even under the exact root. Before
+dispatch and verification, reject
+an existing path prefix that is a symlink/reparse traversal or resolves by filesystem
+identity into the Git control directories.
 
-This is a detect-only Git workspace check, not a filesystem sandbox. Git ignored paths
-are outside its observation surface, and a concurrent writer can still race between
-capture and verification. Use disjoint ownership, serialize shared paths, compare
-critical artifacts directly, and require an actual read-only sandbox when hard
-isolation is necessary.
+This is a detect-only Git workspace check, not a filesystem sandbox. Hashing all
+tracked files, recursive initialized submodules, documented administrative paths and
+lock files, and recursive prefix reparse scans may be material on large repositories.
+A passing serialized verify may use `--next-baseline` to atomically reuse the already
+computed current snapshot and avoid another full capture. Git ignored paths, NTFS alternate data streams, hardlink content aliases,
+and a reparse path created after validation remain outside the complete observation
+guarantee; a concurrent writer can still race between capture and verification. Use
+disjoint ownership, serialize shared paths, compare critical artifacts directly, and
+require an actual read-only sandbox when hard isolation is necessary.
 
 ## Reviewer isolation
 
@@ -242,7 +293,8 @@ the pre-dispatch hook is a structural guardrail, not a second ledger or coordina
   `followup_task`; fence and retire the old owner, inspect its lease delta, and start a
   new `RUN` with a complete work packet and explicit routing within the attempt limit.
   An unknown path may still return `ThreadNotFound`.
-- A missing reviewer uses a bounded fresh attempt. A role-pinned, contract-preserving
+- When independent acceptance is required, a missing reviewer uses a bounded fresh
+  attempt. A role-pinned, contract-preserving
   reviewer delta may use `followup_task`, but its effective route, sandbox evidence,
   and before/after workspace state must be rechecked after the turn.
 - Contract defect: revise `CONTRACT_REV`; do not hide it as a correction.

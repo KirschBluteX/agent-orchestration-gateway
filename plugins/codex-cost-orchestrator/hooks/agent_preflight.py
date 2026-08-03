@@ -20,16 +20,35 @@ from protocol_hash import (  # noqa: E402
     digest as protocol_digest,
     object_from_pairs,
     parse_safe_integer,
+    parse_repository_scope_text,
     require_canonical_task_path,
-    require_repository_path,
     reject_constant,
     reject_float,
+)
+from workspace_state import (  # noqa: E402
+    StateError,
+    repository_control_roots,
+    repository_gitlinks,
+    repository_index_records,
+    repository_path_spelling_map,
+    repository_root,
+    validate_repository_lease_path,
 )
 
 
 WORKER_ROLES = {
     "cost_orchestrator_routine_worker": "routine",
     "cost_orchestrator_complex_worker": "complex",
+}
+ROUTE_DEFAULT_VALUES = {
+    "routine": {
+        "model": frozenset({"gpt-5.6-luna", "gpt-5.6-terra"}),
+        "reasoning_effort": frozenset({"max"}),
+    },
+    "complex": {
+        "model": frozenset({"gpt-5.6-terra"}),
+        "reasoning_effort": frozenset({"max"}),
+    },
 }
 REVIEWER_ROLE = "cost_orchestrator_reviewer"
 WORK_HEADER = "CCO_WORK cco.v4"
@@ -41,6 +60,9 @@ WORK_FIELDS = (
     "CONTRACT_REV",
     "CONTRACT_SHA256",
     "INPUT_CLOSURE_SHA256",
+    "GRAPH_MANIFEST_SHA256",
+    "ACCEPTANCE_CHAIN_SHA256",
+    "ACCEPTANCE_CHAIN_JSON",
     "LANE",
     "ROLE",
     "RUN",
@@ -62,6 +84,7 @@ WORK_FIELDS = (
     "DISCRETION",
     "CONSTRAINTS",
     "EXCLUSIONS",
+    "RISK_FLAGS",
     "DEPENDENCIES",
     "INPUTS",
     "ACCEPTANCE",
@@ -74,6 +97,7 @@ WORK_LIST_FIELDS = frozenset(
         "DISCRETION",
         "CONSTRAINTS",
         "EXCLUSIONS",
+        "RISK_FLAGS",
         "DEPENDENCIES",
         "INPUTS",
         "ACCEPTANCE",
@@ -87,6 +111,8 @@ REVIEW_FIELDS = (
     "FOLLOWUP",
     "FORK_TURNS",
     "INPUT_CLOSURE_SHA256",
+    "GRAPH_MANIFEST_SHA256",
+    "ACCEPTANCE_CHAIN_SHA256",
     "CONTRACTS",
     "GOAL",
     "ACCEPTANCE_IDS",
@@ -116,6 +142,8 @@ WORK_FOLLOWUP_FIELDS = (
     "CONTRACT_SHA256",
     "PREVIOUS_INPUT_CLOSURE_SHA256",
     "INPUT_CLOSURE_SHA256",
+    "ACCEPTANCE_CHAIN_SHA256",
+    "ACCEPTANCE_CHAIN_JSON",
     "BINDING_JSON",
     "TARGET",
     "RUN",
@@ -141,6 +169,8 @@ REVIEW_DELTA_FIELDS = (
     "PRIOR_REVIEWED_STATE",
     "CURRENT_STATE",
     "CONTRACT_STATUS",
+    "GRAPH_MANIFEST_SHA256",
+    "ACCEPTANCE_CHAIN_SHA256",
     "CONTRACTS",
     "ACCEPTANCE_IDS",
     "EVIDENCE_SHA256",
@@ -154,11 +184,11 @@ REVIEW_DELTA_LIST_FIELDS = frozenset(
 )
 SHA256_VALUE = re.compile(r"^sha256:[0-9a-f]{64}$")
 NODE_VALUE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
-RUN_VALUE = re.compile(r"^run_([a-z0-9][a-z0-9_]*)_(r[0-9]{2,})$")
+RUN_VALUE = re.compile(r"^run_([a-z0-9][a-z0-9_]*)_(r0[1-3])$")
 WORK_TASK_VALUE = re.compile(
-    r"^work_[a-z0-9][a-z0-9_]*_(?:routine|complex)_r[0-9]{2,}$"
+    r"^work_[a-z0-9][a-z0-9_]*_(?:routine|complex)_r0[1-3]$"
 )
-REVIEW_TASK_VALUE = re.compile(r"^review_e[0-9]{2,}_r[0-9]{2,}$")
+REVIEW_TASK_VALUE = re.compile(r"^review_e[0-9]{2,}_r0[1-2]$")
 EPOCH_VALUE = re.compile(r"^e[0-9]{2,}$")
 ACCEPTANCE_LINE = re.compile(r"^- (A[0-9]{2,}): .+$")
 CONTRACT_REFERENCE_LINE = re.compile(
@@ -173,6 +203,11 @@ ANCHOR_LINE = re.compile(
 )
 MAX_SAFE_INTEGER = (1 << 53) - 1
 MAX_SAFE_INTEGER_DIGITS = len(str(MAX_SAFE_INTEGER))
+MAX_WORKER_ATTEMPTS = 3
+MAX_WORKER_FOLLOWUPS = 2
+MAX_REVIEW_ATTEMPTS = 2
+MAX_REVIEW_FOLLOWUPS = 2
+MAX_REPOSITORY_PATHS = 128
 SPAWN_INPUT_FIELDS = frozenset(
     {"agent_type", "fork_turns", "message", "model", "reasoning_effort", "task_name"}
 )
@@ -201,7 +236,7 @@ def is_reserved_cco_dispatch(tool_input: dict[str, Any]) -> bool:
     if isinstance(role, str) and role.startswith("cost_orchestrator_"):
         return True
     return isinstance(message, str) and re.search(
-        r"(?:^|[\r\n])[ \t]*(?:CCO_WORK|CCO_REVIEW) cco\.v4(?=$|[\r\n \t])",
+        r"(?:^|[\r\n])[ \t]*CCO_[A-Z_]+ cco\.v4(?=$|[\r\n \t])",
         message,
     ) is not None
 
@@ -247,6 +282,7 @@ def counter(
     *,
     expected_current: int | None = None,
     minimum_current: int = 0,
+    maximum_limit: int,
 ) -> tuple[int, int]:
     match = re.fullmatch(r"(0|[1-9][0-9]*)/([1-9][0-9]*)", value)
     if match is None:
@@ -255,7 +291,7 @@ def counter(
     if any(len(part) > MAX_SAFE_INTEGER_DIGITS for part in parts):
         raise PacketError("counter is out of range")
     current, limit = (int(part) for part in parts)
-    if current < minimum_current or current > limit or limit > MAX_SAFE_INTEGER:
+    if current < minimum_current or current > limit or limit > maximum_limit:
         raise PacketError("counter is out of range")
     if expected_current is not None and current != expected_current:
         raise PacketError("counter is stale")
@@ -303,19 +339,53 @@ def parse_contract_references(value: str) -> list[dict[str, object]]:
 
 
 def validate_repository_paths(
-    value: str, label: str, *, allow_none: bool = False
-) -> list[str]:
-    paths: list[str] = []
+    value: str,
+    label: str,
+    *,
+    allow_none: bool = False,
+    active_root: Path | None = None,
+    protected_roots: tuple[Path, ...] | None = None,
+) -> list[dict[str, str]]:
+    scopes: list[dict[str, str]] = []
     try:
-        for index, path in enumerate(bullet_values(value, allow_none=allow_none)):
-            paths.append(
-                require_repository_path(path, f"{label}[{index}]")
+        for index, item in enumerate(bullet_values(value, allow_none=allow_none)):
+            scopes.append(
+                parse_repository_scope_text(item, f"{label}[{index}]")
             )
     except ProtocolHashError as error:
-        raise PacketError(f"{label} contains an invalid path") from error
-    if paths != sorted(set(paths), key=lambda item: item.encode("utf-8")):
-        raise PacketError(f"{label} paths are not canonical")
-    return paths
+        raise PacketError(f"{label} contains an invalid scope") from error
+    identities = [(scope["path"], scope["kind"]) for scope in scopes]
+    if len(identities) != len(set(identities)) or identities != sorted(
+        identities,
+        key=lambda item: (item[0].encode("utf-8"), item[1].encode("utf-8")),
+    ):
+        raise PacketError(f"{label} scopes are not canonical")
+    if len(scopes) > MAX_REPOSITORY_PATHS:
+        raise PacketError(f"{label} contains too many scopes")
+    try:
+        root = repository_root(Path.cwd()) if active_root is None else active_root
+        control_roots = (
+            repository_control_roots(root)
+            if protected_roots is None
+            else protected_roots
+        )
+        index_records = repository_index_records(root)
+        gitlinks = repository_gitlinks(root, index_records)
+        tracked_spellings = repository_path_spelling_map(index_records)
+        directory_spellings: dict[str, frozenset[str]] = {}
+        for scope in scopes:
+            validate_repository_lease_path(
+                root,
+                scope["path"],
+                scope_kind=scope["kind"],
+                protected_roots=control_roots,
+                gitlinks=gitlinks,
+                tracked_spellings=tracked_spellings,
+                directory_spellings=directory_spellings,
+            )
+    except (OSError, StateError) as error:
+        raise PacketError(f"{label} scope is unsafe in the active repository") from error
+    return scopes
 
 
 def validate_acceptance_and_verify(fields: dict[str, str]) -> None:
@@ -385,8 +455,12 @@ def parse_anchor_records(value: str, hash_key: str) -> list[dict[str, str]]:
     return records
 
 
-def parse_counter(value: str, *, minimum_current: int) -> dict[str, int]:
-    current, limit = counter(value, minimum_current=minimum_current)
+def parse_counter(
+    value: str, *, minimum_current: int, maximum_limit: int
+) -> dict[str, int]:
+    current, limit = counter(
+        value, minimum_current=minimum_current, maximum_limit=maximum_limit
+    )
     return {"current": current, "limit": limit}
 
 
@@ -403,7 +477,9 @@ def validate_fork_turns(value: object) -> str:
     return value
 
 
-def worker_contract_preimage(fields: dict[str, str]) -> dict[str, object]:
+def worker_contract_preimage(
+    fields: dict[str, str], *, write_paths: list[dict[str, str]] | None = None
+) -> dict[str, object]:
     return {
         "acceptance": parse_acceptance_records(fields["ACCEPTANCE"]),
         "constraints": bullet_values(fields["CONSTRAINTS"], allow_none=True),
@@ -415,14 +491,24 @@ def worker_contract_preimage(fields: dict[str, str]) -> dict[str, object]:
         "node": fields["NODE"],
         "objective": fields["OBJECTIVE"],
         "protocol": "cco.v4",
+        "risk_flags": bullet_values(fields["RISK_FLAGS"], allow_none=True),
         "verification": parse_verification_records(fields["VERIFY"]),
-        "write": validate_repository_paths(fields["WRITE"], "WRITE", allow_none=True),
+        "write": (
+            validate_repository_paths(fields["WRITE"], "WRITE", allow_none=True)
+            if write_paths is None
+            else write_paths
+        ),
     }
 
 
 def worker_input_preimage(fields: dict[str, str]) -> dict[str, object]:
     return {
-        "attempt": parse_counter(fields["ATTEMPT"], minimum_current=1),
+        "acceptance_chain_sha256": fields["ACCEPTANCE_CHAIN_SHA256"],
+        "attempt": parse_counter(
+            fields["ATTEMPT"],
+            minimum_current=1,
+            maximum_limit=MAX_WORKER_ATTEMPTS,
+        ),
         "acceptance_ids": acceptance_ids(fields["ACCEPTANCE_IDS"]),
         "baseline": fields["BASELINE"],
         "content_anchors": parse_anchor_records(fields["INPUTS"], "content_sha256"),
@@ -430,8 +516,13 @@ def worker_input_preimage(fields: dict[str, str]) -> dict[str, object]:
         "contract_sha256": fields["CONTRACT_SHA256"],
         "dependencies": parse_anchor_records(fields["DEPENDENCIES"], "state_sha256"),
         "effort_policy": fields["EFFORT_POLICY"],
-        "followup": parse_counter(fields["FOLLOWUP"], minimum_current=0),
+        "followup": parse_counter(
+            fields["FOLLOWUP"],
+            minimum_current=0,
+            maximum_limit=MAX_WORKER_FOLLOWUPS,
+        ),
         "fork_turns": validate_fork_turns(fields["FORK_TURNS"]),
+        "graph_manifest_sha256": fields["GRAPH_MANIFEST_SHA256"],
         "kind": "worker_initial",
         "lease": fields["LEASE"],
         "lease_generation": integer(fields["LEASE_GENERATION"], minimum=1),
@@ -446,23 +537,39 @@ def worker_input_preimage(fields: dict[str, str]) -> dict[str, object]:
     }
 
 
-def review_input_preimage(fields: dict[str, str]) -> dict[str, object]:
+def review_input_preimage(
+    fields: dict[str, str], *, allowed_paths: list[dict[str, str]] | None = None
+) -> dict[str, object]:
     return {
         "acceptance": parse_acceptance_records(fields["ACCEPTANCE"]),
         "acceptance_ids": acceptance_ids(fields["ACCEPTANCE_IDS"]),
         "accumulated_delta": bullet_values(fields["ACCUMULATED_DELTA"]),
-        "allowed_paths": validate_repository_paths(
-            fields["ALLOWED_PATHS"], "ALLOWED_PATHS", allow_none=True
+        "allowed_paths": (
+            validate_repository_paths(
+                fields["ALLOWED_PATHS"], "ALLOWED_PATHS", allow_none=True
+            )
+            if allowed_paths is None
+            else allowed_paths
         ),
-        "attempt": parse_counter(fields["ATTEMPT"], minimum_current=1),
+        "attempt": parse_counter(
+            fields["ATTEMPT"],
+            minimum_current=1,
+            maximum_limit=MAX_REVIEW_ATTEMPTS,
+        ),
+        "acceptance_chain_sha256": fields["ACCEPTANCE_CHAIN_SHA256"],
         "baseline": fields["BASELINE"],
         "contracts": parse_contract_references(fields["CONTRACTS"]),
         "current_state": fields["CURRENT_STATE"],
         "epoch": fields["EPOCH"],
         "evidence_sha256": fields["EVIDENCE_SHA256"],
-        "followup": parse_counter(fields["FOLLOWUP"], minimum_current=0),
+        "followup": parse_counter(
+            fields["FOLLOWUP"],
+            minimum_current=0,
+            maximum_limit=MAX_REVIEW_FOLLOWUPS,
+        ),
         "fork_turns": validate_fork_turns(fields["FORK_TURNS"]),
         "goal": fields["GOAL"],
+        "graph_manifest_sha256": fields["GRAPH_MANIFEST_SHA256"],
         "interfaces": bullet_values(fields["INTERFACES"], allow_none=True),
         "kind": "review_fresh",
         "open_risks": bullet_values(fields["OPEN_RISKS"], allow_none=True),
@@ -493,11 +600,100 @@ def parse_canonical_object(value: str, label: str) -> dict[str, Any]:
     return parsed
 
 
+def validate_worker_acceptance_chain(
+    fields: dict[str, str], contract: dict[str, object]
+) -> None:
+    chain = parse_canonical_object(
+        fields["ACCEPTANCE_CHAIN_JSON"], "acceptance chain JSON"
+    )
+    try:
+        if (
+            protocol_digest("acceptance_chain", chain)
+            != fields["ACCEPTANCE_CHAIN_SHA256"]
+        ):
+            raise PacketError("acceptance chain hash does not match its preimage")
+        if chain["graph_manifest_sha256"] != fields["GRAPH_MANIFEST_SHA256"]:
+            raise PacketError("graph manifest hash does not match the worker closure")
+        matching = [
+            record
+            for record in chain["graph_manifest"]["contracts"]
+            if record["contract"]["node"] == fields["NODE"]
+        ]
+        if len(matching) != 1:
+            raise PacketError("worker contract is not uniquely declared by the graph")
+        graph_contract = matching[0]
+        if (
+            graph_contract["contract"] != contract
+            or graph_contract["contract_sha256"] != fields["CONTRACT_SHA256"]
+        ):
+            raise PacketError("worker contract does not match the graph manifest")
+        graph_acceptance_ids = [
+            record["id"] for record in graph_contract["contract"]["acceptance"]
+        ]
+        if graph_acceptance_ids != acceptance_ids(fields["ACCEPTANCE_IDS"]):
+            raise PacketError("worker acceptance IDs do not match the graph manifest")
+    except (KeyError, TypeError, ProtocolHashError) as error:
+        raise PacketError("worker acceptance chain is invalid") from error
+
+
+def validate_worker_followup_acceptance_chain(
+    fields: dict[str, str], binding: dict[str, Any]
+) -> None:
+    chain = parse_canonical_object(
+        fields["ACCEPTANCE_CHAIN_JSON"], "acceptance chain JSON"
+    )
+    try:
+        current_sha256 = protocol_digest("acceptance_chain", chain)
+        if current_sha256 != fields["ACCEPTANCE_CHAIN_SHA256"]:
+            raise PacketError("acceptance chain hash does not match its preimage")
+        if chain["graph_manifest_sha256"] != binding["graph_manifest_sha256"]:
+            raise PacketError("follow-up graph manifest does not match its binding")
+        decisions = chain["decisions"]
+        if decisions[-1]["decision"]["mode"] != "independent":
+            raise PacketError("worker follow-up requires independent acceptance")
+        bound_chain_sha256 = binding["acceptance_chain_sha256"]
+        if bound_chain_sha256 != current_sha256:
+            if len(decisions) != 2 or "worker_followup" not in decisions[-1][
+                "decision"
+            ]["reasons"]:
+                raise PacketError("worker follow-up lacks its one-way acceptance upgrade")
+            prior_chain = {
+                "decisions": decisions[:1],
+                "graph_manifest": chain["graph_manifest"],
+                "graph_manifest_sha256": chain["graph_manifest_sha256"],
+                "protocol": "cco.v4",
+            }
+            if protocol_digest("acceptance_chain", prior_chain) != bound_chain_sha256:
+                raise PacketError("worker follow-up acceptance history is not append-only")
+        matching = [
+            record
+            for record in chain["graph_manifest"]["contracts"]
+            if record["contract"]["node"] == fields["NODE"]
+        ]
+        if len(matching) != 1:
+            raise PacketError("worker contract is not uniquely declared by the graph")
+        graph_contract = matching[0]
+        if graph_contract["contract_sha256"] != fields["CONTRACT_SHA256"]:
+            raise PacketError("worker contract hash does not match the graph manifest")
+        if [item["id"] for item in graph_contract["contract"]["acceptance"]] != acceptance_ids(
+            fields["ACCEPTANCE_IDS"]
+        ):
+            raise PacketError("worker acceptance IDs do not match the graph manifest")
+    except (IndexError, KeyError, TypeError, ProtocolHashError) as error:
+        raise PacketError("worker follow-up acceptance chain is invalid") from error
+
+
 def parse_passing_evidence(
     evidence_json: str,
     evidence_sha256: str,
     current_state: str,
     expected_ids: list[str],
+    expected_graph_manifest_sha256: str,
+    expected_acceptance_chain_sha256: str,
+    expected_contracts: list[dict[str, object]],
+    expected_acceptance: list[dict[str, str]] | None = None,
+    expected_interfaces: list[str] | None = None,
+    expected_paths: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     evidence = parse_canonical_object(evidence_json, "evidence JSON")
     try:
@@ -506,10 +702,66 @@ def parse_passing_evidence(
         if (
             evidence["acceptance_ids"] != expected_ids
             or evidence["current_state"] != current_state
+            or evidence["acceptance_chain_sha256"]
+            != expected_acceptance_chain_sha256
         ):
             raise PacketError("review evidence does not match the review closure")
         if any(record["outcome"] != "passed" for record in evidence["records"]):
             raise PacketError("review evidence is not fully passing")
+        chain = evidence["acceptance_chain"]
+        if chain["graph_manifest_sha256"] != expected_graph_manifest_sha256:
+            raise PacketError("review graph manifest does not match the review closure")
+        if chain["decisions"][-1]["decision"]["mode"] != "independent":
+            raise PacketError(
+                "review requires an independent acceptance decision"
+            )
+        bundled_contracts = chain["graph_manifest"]["contracts"]
+        contract_references = [
+            {
+                "contract_rev": record["contract"]["contract_rev"],
+                "contract_sha256": record["contract_sha256"],
+                "node": record["contract"]["node"],
+            }
+            for record in bundled_contracts
+        ]
+        if contract_references != expected_contracts:
+            raise PacketError("review contract references do not match the graph manifest")
+        if expected_acceptance is not None:
+            bundled_acceptance = sorted(
+                (
+                    acceptance
+                    for record in bundled_contracts
+                    for acceptance in record["contract"]["acceptance"]
+                ),
+                key=lambda record: record["id"].encode("utf-8"),
+            )
+            if bundled_acceptance != expected_acceptance:
+                raise PacketError("review acceptance does not match the graph manifest")
+        if expected_interfaces is not None:
+            bundled_interfaces = sorted(
+                {
+                    interface
+                    for record in bundled_contracts
+                    for interface in record["contract"]["interfaces"]
+                },
+                key=lambda item: item.encode("utf-8"),
+            )
+            if bundled_interfaces != expected_interfaces:
+                raise PacketError("review interfaces do not match the graph manifest")
+        if expected_paths is not None:
+            bundled_paths = sorted(
+                (
+                    scope
+                    for record in bundled_contracts
+                    for scope in record["contract"]["write"]
+                ),
+                key=lambda item: (
+                    item["path"].encode("utf-8"),
+                    item["kind"].encode("utf-8"),
+                ),
+            )
+            if bundled_paths != expected_paths:
+                raise PacketError("review paths do not match the graph manifest")
     except (KeyError, TypeError, ProtocolHashError) as error:
         raise PacketError("review evidence preimage is invalid") from error
     return evidence
@@ -546,11 +798,20 @@ def validate_worker_followup(tool_input: dict[str, Any]) -> None:
     target = canonical_target(fields["TARGET"])
     if tool_input.get("target") != target:
         raise PacketError("worker follow-up target does not match its envelope")
-    attempt = parse_counter(fields["ATTEMPT"], minimum_current=1)
-    followup = parse_counter(fields["FOLLOWUP"], minimum_current=1)
+    attempt = parse_counter(
+        fields["ATTEMPT"],
+        minimum_current=1,
+        maximum_limit=MAX_WORKER_ATTEMPTS,
+    )
+    followup = parse_counter(
+        fields["FOLLOWUP"],
+        minimum_current=1,
+        maximum_limit=MAX_WORKER_FOLLOWUPS,
+    )
     expected_acceptance_ids = acceptance_ids(fields["ACCEPTANCE_IDS"])
     verify = parse_verification_records(fields["VERIFY"], allow_none=True)
     preimage: dict[str, object] = {
+        "acceptance_chain_sha256": fields["ACCEPTANCE_CHAIN_SHA256"],
         "binding": binding,
         "delta": bullet_values(fields["DELTA"]),
         "followup": followup,
@@ -566,6 +827,7 @@ def validate_worker_followup(tool_input: dict[str, Any]) -> None:
             raise PacketError("worker follow-up hash does not match its packet")
     except ProtocolHashError as error:
         raise PacketError("worker follow-up preimage is invalid") from error
+    validate_worker_followup_acceptance_chain(fields, binding)
 
     comparisons = {
         "acceptance_ids": expected_acceptance_ids,
@@ -604,11 +866,20 @@ def validate_review_delta(tool_input: dict[str, Any]) -> None:
     target = canonical_target(fields["TARGET"])
     if tool_input.get("target") != target:
         raise PacketError("review delta target does not match its envelope")
-    attempt = parse_counter(fields["ATTEMPT"], minimum_current=1)
-    followup = parse_counter(fields["FOLLOWUP"], minimum_current=1)
+    attempt = parse_counter(
+        fields["ATTEMPT"],
+        minimum_current=1,
+        maximum_limit=MAX_REVIEW_ATTEMPTS,
+    )
+    followup = parse_counter(
+        fields["FOLLOWUP"],
+        minimum_current=1,
+        maximum_limit=MAX_REVIEW_FOLLOWUPS,
+    )
     expected = acceptance_ids(fields["ACCEPTANCE_IDS"])
     preimage: dict[str, object] = {
         "acceptance_ids": expected,
+        "acceptance_chain_sha256": fields["ACCEPTANCE_CHAIN_SHA256"],
         "attempt": attempt,
         "contract_status": fields["CONTRACT_STATUS"],
         "contracts": parse_contract_references(fields["CONTRACTS"]),
@@ -617,6 +888,7 @@ def validate_review_delta(tool_input: dict[str, Any]) -> None:
         "epoch": fields["EPOCH"],
         "evidence_sha256": fields["EVIDENCE_SHA256"],
         "followup": followup,
+        "graph_manifest_sha256": fields["GRAPH_MANIFEST_SHA256"],
         "kind": "review_delta",
         "open_risks": bullet_values(fields["OPEN_RISKS"], allow_none=True),
         "previous_input_closure_sha256": fields["PREVIOUS_INPUT_CLOSURE_SHA256"],
@@ -635,6 +907,9 @@ def validate_review_delta(tool_input: dict[str, Any]) -> None:
         fields["EVIDENCE_SHA256"],
         fields["CURRENT_STATE"],
         expected,
+        fields["GRAPH_MANIFEST_SHA256"],
+        fields["ACCEPTANCE_CHAIN_SHA256"],
+        parse_contract_references(fields["CONTRACTS"]),
     )
     expected_task = f"review_{fields['EPOCH']}_r{attempt['current']:02d}"
     if target.rsplit("/", 1)[-1] != expected_task:
@@ -656,6 +931,11 @@ def validate_policy(fields: dict[str, str], tool_input: dict[str, Any]) -> None:
         elif policy in {"user", "route_default"}:
             if requested == "none" or not present or actual != requested:
                 raise PacketError("routing request does not match spawn")
+            if (
+                policy == "route_default"
+                and requested not in ROUTE_DEFAULT_VALUES[fields["LANE"]][input_field]
+            ):
+                raise PacketError("route default is outside the declared lane sequence")
         else:
             raise PacketError("routing policy is invalid")
 
@@ -674,24 +954,39 @@ def validate_worker(tool_input: dict[str, Any], role: str) -> None:
     if NODE_VALUE.fullmatch(fields["NODE"]) is None:
         raise PacketError("node is invalid")
     integer(fields["CONTRACT_REV"], minimum=1)
-    for name in ("CONTRACT_SHA256", "INPUT_CLOSURE_SHA256", "BASELINE"):
+    for name in (
+        "CONTRACT_SHA256",
+        "INPUT_CLOSURE_SHA256",
+        "GRAPH_MANIFEST_SHA256",
+        "ACCEPTANCE_CHAIN_SHA256",
+        "BASELINE",
+    ):
         if SHA256_VALUE.fullmatch(fields[name]) is None:
             raise PacketError("hash is invalid")
-    counter(fields["ATTEMPT"], minimum_current=1)
-    counter(fields["FOLLOWUP"], expected_current=0)
+    counter(
+        fields["ATTEMPT"],
+        minimum_current=1,
+        maximum_limit=MAX_WORKER_ATTEMPTS,
+    )
+    counter(
+        fields["FOLLOWUP"],
+        expected_current=0,
+        maximum_limit=MAX_WORKER_FOLLOWUPS,
+    )
     integer(fields["LEASE_GENERATION"], minimum=1)
     integer(fields["STOP_GENERATION"], minimum=0)
     validate_acceptance_and_verify(fields)
-    validate_repository_paths(fields["WRITE"], "WRITE", allow_none=True)
+    write_paths = validate_repository_paths(fields["WRITE"], "WRITE", allow_none=True)
     validate_policy(fields, tool_input)
 
     fork = validate_fork_turns(tool_input.get("fork_turns"))
     if fields["FORK_TURNS"] != fork:
         raise PacketError("fork closure does not match spawn")
     try:
-        contract = worker_contract_preimage(fields)
+        contract = worker_contract_preimage(fields, write_paths=write_paths)
         if protocol_digest("contract", contract) != fields["CONTRACT_SHA256"]:
             raise PacketError("contract hash does not match the work packet")
+        validate_worker_acceptance_chain(fields, contract)
         input_preimage = worker_input_preimage(fields)
         if protocol_digest("input_closure", input_preimage) != fields["INPUT_CLOSURE_SHA256"]:
             raise PacketError("input hash does not match the work packet")
@@ -719,9 +1014,24 @@ def validate_reviewer(tool_input: dict[str, Any]) -> None:
     )
     if EPOCH_VALUE.fullmatch(fields["EPOCH"]) is None or fields["MODE"] != "fresh":
         raise PacketError("review epoch is invalid")
-    attempt, _limit = counter(fields["ATTEMPT"], minimum_current=1)
-    counter(fields["FOLLOWUP"], expected_current=0)
-    for name in ("INPUT_CLOSURE_SHA256", "BASELINE", "CURRENT_STATE", "EVIDENCE_SHA256"):
+    attempt, _limit = counter(
+        fields["ATTEMPT"],
+        minimum_current=1,
+        maximum_limit=MAX_REVIEW_ATTEMPTS,
+    )
+    counter(
+        fields["FOLLOWUP"],
+        expected_current=0,
+        maximum_limit=MAX_REVIEW_FOLLOWUPS,
+    )
+    for name in (
+        "INPUT_CLOSURE_SHA256",
+        "GRAPH_MANIFEST_SHA256",
+        "ACCEPTANCE_CHAIN_SHA256",
+        "BASELINE",
+        "CURRENT_STATE",
+        "EVIDENCE_SHA256",
+    ):
         if SHA256_VALUE.fullmatch(fields[name]) is None:
             raise PacketError("review hash is invalid")
     expected = acceptance_ids(fields["ACCEPTANCE_IDS"])
@@ -734,11 +1044,13 @@ def validate_reviewer(tool_input: dict[str, Any]) -> None:
     if len(criteria) != len(acceptance_lines) or criteria != expected:
         raise PacketError("review acceptance closure is incomplete")
     parse_contract_references(fields["CONTRACTS"])
-    validate_repository_paths(fields["ALLOWED_PATHS"], "ALLOWED_PATHS", allow_none=True)
+    allowed_paths = validate_repository_paths(
+        fields["ALLOWED_PATHS"], "ALLOWED_PATHS", allow_none=True
+    )
     if fields["FORK_TURNS"] != "none" or tool_input.get("fork_turns") != "none":
         raise PacketError("review fork policy is invalid")
     try:
-        input_preimage = review_input_preimage(fields)
+        input_preimage = review_input_preimage(fields, allowed_paths=allowed_paths)
         if protocol_digest("input_closure", input_preimage) != fields["INPUT_CLOSURE_SHA256"]:
             raise PacketError("review input hash does not match its packet")
     except ProtocolHashError as error:
@@ -748,10 +1060,16 @@ def validate_reviewer(tool_input: dict[str, Any]) -> None:
         fields["EVIDENCE_SHA256"],
         fields["CURRENT_STATE"],
         expected,
+        fields["GRAPH_MANIFEST_SHA256"],
+        fields["ACCEPTANCE_CHAIN_SHA256"],
+        parse_contract_references(fields["CONTRACTS"]),
+        parse_acceptance_records(fields["ACCEPTANCE"]),
+        bullet_values(fields["INTERFACES"], allow_none=True),
+        allowed_paths,
     )
     if tool_input.get("task_name") != f"review_{fields['EPOCH']}_r{attempt:02d}":
         raise PacketError("review task name is invalid")
-    if tool_input.get("model") is not None or tool_input.get("reasoning_effort") is not None:
+    if "model" in tool_input or "reasoning_effort" in tool_input:
         raise PacketError("reviewer override is invalid")
 
 

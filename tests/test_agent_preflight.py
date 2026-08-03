@@ -1,10 +1,12 @@
 import json
+import ctypes
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -17,6 +19,9 @@ HOOK = (
 )
 HOOKS_CONFIG = HOOK.parent / "hooks.json"
 HASH_HELPER = HOOK.parent.parent / "scripts" / "protocol_hash.py"
+sys.path.insert(0, str(HOOK.parent))
+sys.path.insert(0, str(HASH_HELPER.parent))
+import agent_preflight as preflight_module  # noqa: E402
 
 
 def payload(**overrides: object) -> dict[str, object]:
@@ -39,7 +44,12 @@ def worker_message(
     requested_effort: str = "max",
     fork_turns: str = "none",
     objective: str = "Implement the closed authentication behavior.",
+    write_path: str = "src/auth.py",
+    write_kind: str = "exact",
+    manifest_node: str = "n01_auth",
 ) -> str:
+    write_scope: object = {"kind": write_kind, "path": write_path}
+    write_line = f"{write_kind}:{write_path}"
     contract: dict[str, object] = {
         "acceptance": [
             {"criterion": "Authentication behavior passes.", "id": "A01"}
@@ -53,6 +63,7 @@ def worker_message(
         "node": "n01_auth",
         "objective": objective,
         "protocol": "cco.v4",
+        "risk_flags": [],
         "verification": [
             {
                 "acceptance_ids": ["A01"],
@@ -61,10 +72,52 @@ def worker_message(
                 "operation": "python -m unittest tests.test_auth",
             }
         ],
-        "write": ["src/auth.py"],
+        "write": [write_scope],
     }
     contract_sha256 = protocol_hash("contract", contract)
+    manifest_contract = json.loads(json.dumps(contract))
+    manifest_contract["node"] = manifest_node
+    graph_manifest: dict[str, object] = {
+        "acceptance_owners": [
+            {"acceptance_id": "A01", "implementation_owner": manifest_node}
+        ],
+        "contracts": [
+            {
+                "contract": manifest_contract,
+                "contract_sha256": protocol_hash("contract", manifest_contract),
+            }
+        ],
+        "protocol": "cco.v4",
+    }
+    graph_manifest_sha256 = protocol_hash("graph_manifest", graph_manifest)
+    acceptance_mode = "primary" if lane == "routine" else "independent"
+    acceptance_decision: dict[str, object] = {
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "mode": acceptance_mode,
+        "previous_decision_sha256": None,
+        "protocol": "cco.v4",
+        "reasons": [] if acceptance_mode == "primary" else ["complex_lane"],
+        "revision": 1,
+    }
+    acceptance_chain: dict[str, object] = {
+        "decisions": [
+            {
+                "decision": acceptance_decision,
+                "decision_sha256": protocol_hash(
+                    "acceptance_decision", acceptance_decision
+                ),
+            }
+        ],
+        "graph_manifest": graph_manifest,
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "protocol": "cco.v4",
+    }
+    acceptance_chain_sha256 = protocol_hash("acceptance_chain", acceptance_chain)
+    acceptance_chain_json = json.dumps(
+        acceptance_chain, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
     input_preimage: dict[str, object] = {
+        "acceptance_chain_sha256": acceptance_chain_sha256,
         "attempt": {"current": 1, "limit": 2},
         "acceptance_ids": ["A01"],
         "baseline": "sha256:" + "c" * 64,
@@ -77,6 +130,7 @@ def worker_message(
         "effort_policy": effort_policy,
         "followup": {"current": 0, "limit": 1},
         "fork_turns": fork_turns,
+        "graph_manifest_sha256": graph_manifest_sha256,
         "kind": "worker_initial",
         "lease": "wl_n01_auth_r01",
         "lease_generation": 1,
@@ -95,6 +149,9 @@ NODE: n01_auth
 CONTRACT_REV: 1
 CONTRACT_SHA256: {contract_sha256}
 INPUT_CLOSURE_SHA256: {input_sha256}
+GRAPH_MANIFEST_SHA256: {graph_manifest_sha256}
+ACCEPTANCE_CHAIN_SHA256: {acceptance_chain_sha256}
+ACCEPTANCE_CHAIN_JSON: {acceptance_chain_json}
 LANE: {lane}
 ROLE: {role}
 RUN: run_n01_auth_r01
@@ -111,7 +168,7 @@ EFFORT_POLICY: {effort_policy}
 REQUESTED_EFFORT: {requested_effort}
 ACCEPTANCE_IDS: [A01]
 WRITE:
-- src/auth.py
+- {write_line}
 OBJECTIVE: {objective}
 INTERFACES:
 - Preserve the public authenticate interface.
@@ -121,6 +178,8 @@ CONSTRAINTS:
 - Preserve unrelated work.
 EXCLUSIONS:
 - No architecture changes.
+RISK_FLAGS:
+- none
 DEPENDENCIES:
 - none
 INPUTS:
@@ -146,8 +205,68 @@ def protocol_hash(domain: str, value: dict[str, object]) -> str:
 
 
 def reviewer_evidence() -> dict[str, object]:
+    contract: dict[str, object] = {
+        "acceptance": [
+            {"criterion": "Authentication behavior passes.", "id": "A01"}
+        ],
+        "constraints": ["Preserve unrelated work."],
+        "contract_rev": 1,
+        "discretion": ["Choose local mechanics only."],
+        "exclusions": ["No architecture changes."],
+        "interfaces": ["Preserve the public authenticate interface."],
+        "lane": "routine",
+        "node": "n01_auth",
+        "objective": "Implement the closed authentication behavior.",
+        "protocol": "cco.v4",
+        "risk_flags": [],
+        "verification": [
+            {
+                "acceptance_ids": ["A01"],
+                "expected": "passed",
+                "id": "V01",
+                "operation": "python -m unittest tests.test_auth",
+            }
+        ],
+        "write": [{"kind": "exact", "path": "src/auth.py"}],
+    }
+    graph_manifest: dict[str, object] = {
+        "acceptance_owners": [
+            {"acceptance_id": "A01", "implementation_owner": "n01_auth"}
+        ],
+        "contracts": [
+            {
+                "contract": contract,
+                "contract_sha256": protocol_hash("contract", contract),
+            }
+        ],
+        "protocol": "cco.v4",
+    }
+    graph_manifest_sha256 = protocol_hash("graph_manifest", graph_manifest)
+    decision: dict[str, object] = {
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "mode": "independent",
+        "previous_decision_sha256": None,
+        "protocol": "cco.v4",
+        "reasons": ["explicit_independent_review"],
+        "revision": 1,
+    }
+    acceptance_chain: dict[str, object] = {
+        "decisions": [
+            {
+                "decision": decision,
+                "decision_sha256": protocol_hash("acceptance_decision", decision),
+            }
+        ],
+        "graph_manifest": graph_manifest,
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "protocol": "cco.v4",
+    }
     return {
         "acceptance_ids": ["A01"],
+        "acceptance_chain": acceptance_chain,
+        "acceptance_chain_sha256": protocol_hash(
+            "acceptance_chain", acceptance_chain
+        ),
         "current_state": "sha256:" + "d" * 64,
         "protocol": "cco.v4",
         "records": [
@@ -173,19 +292,25 @@ def reviewer_message(
         evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
     evidence_sha256 = protocol_hash("evidence", evidence)
+    acceptance_chain = evidence["acceptance_chain"]
+    acceptance_chain_sha256 = evidence["acceptance_chain_sha256"]
+    graph_manifest = acceptance_chain["graph_manifest"]
+    graph_manifest_sha256 = acceptance_chain["graph_manifest_sha256"]
+    contract_record = graph_manifest["contracts"][0]
     input_preimage: dict[str, object] = {
         "acceptance": [
             {"criterion": "Authentication behavior passes.", "id": "A01"}
         ],
         "acceptance_ids": ["A01"],
+        "acceptance_chain_sha256": acceptance_chain_sha256,
         "accumulated_delta": ["D01#sha256:" + "e" * 64],
-        "allowed_paths": ["src/auth.py"],
+        "allowed_paths": [{"kind": "exact", "path": "src/auth.py"}],
         "attempt": {"current": attempt, "limit": 2},
         "baseline": "sha256:" + "c" * 64,
         "contracts": [
             {
                 "contract_rev": 1,
-                "contract_sha256": "sha256:" + "b" * 64,
+                "contract_sha256": contract_record["contract_sha256"],
                 "node": "n01_auth",
             }
         ],
@@ -195,6 +320,7 @@ def reviewer_message(
         "followup": {"current": 0, "limit": 1},
         "fork_turns": "none",
         "goal": "Ship the fixed authentication behavior.",
+        "graph_manifest_sha256": graph_manifest_sha256,
         "interfaces": ["Preserve the public authenticate interface."],
         "kind": "review_fresh",
         "open_risks": [],
@@ -208,8 +334,10 @@ ATTEMPT: {attempt}/2
 FOLLOWUP: 0/1
 FORK_TURNS: none
 INPUT_CLOSURE_SHA256: {input_sha256}
+GRAPH_MANIFEST_SHA256: {graph_manifest_sha256}
+ACCEPTANCE_CHAIN_SHA256: {acceptance_chain_sha256}
 CONTRACTS:
-- n01_auth@1#sha256:{"b" * 64}
+- n01_auth@1#{contract_record["contract_sha256"]}
 GOAL: Ship the fixed authentication behavior.
 ACCEPTANCE_IDS: [A01]
 ACCEPTANCE:
@@ -219,7 +347,7 @@ INTERFACES:
 BASELINE: sha256:{"c" * 64}
 CURRENT_STATE: sha256:{"d" * 64}
 ALLOWED_PATHS:
-- src/auth.py
+- exact:src/auth.py
 ACCUMULATED_DELTA:
 - D01#sha256:{"e" * 64}
 EVIDENCE_SHA256: {evidence_sha256}
@@ -230,7 +358,87 @@ OPEN_RISKS:
 
 
 def worker_followup_message() -> str:
+    contract: dict[str, object] = {
+        "acceptance": [
+            {"criterion": "Authentication behavior passes.", "id": "A01"}
+        ],
+        "constraints": ["Preserve unrelated work."],
+        "contract_rev": 1,
+        "discretion": ["Choose local mechanics only."],
+        "exclusions": ["No architecture changes."],
+        "interfaces": ["Preserve the public authenticate interface."],
+        "lane": "routine",
+        "node": "n01_auth",
+        "objective": "Implement the closed authentication behavior.",
+        "protocol": "cco.v4",
+        "risk_flags": [],
+        "verification": [
+            {
+                "acceptance_ids": ["A01"],
+                "expected": "passed",
+                "id": "V01",
+                "operation": "python -m unittest tests.test_auth",
+            }
+        ],
+        "write": [{"kind": "exact", "path": "src/auth.py"}],
+    }
+    contract_sha256 = protocol_hash("contract", contract)
+    graph_manifest: dict[str, object] = {
+        "acceptance_owners": [
+            {"acceptance_id": "A01", "implementation_owner": "n01_auth"}
+        ],
+        "contracts": [
+            {"contract": contract, "contract_sha256": contract_sha256}
+        ],
+        "protocol": "cco.v4",
+    }
+    graph_manifest_sha256 = protocol_hash("graph_manifest", graph_manifest)
+    initial_decision: dict[str, object] = {
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "mode": "primary",
+        "previous_decision_sha256": None,
+        "protocol": "cco.v4",
+        "reasons": [],
+        "revision": 1,
+    }
+    initial_decision_sha256 = protocol_hash(
+        "acceptance_decision", initial_decision
+    )
+    initial_chain: dict[str, object] = {
+        "decisions": [
+            {
+                "decision": initial_decision,
+                "decision_sha256": initial_decision_sha256,
+            }
+        ],
+        "graph_manifest": graph_manifest,
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "protocol": "cco.v4",
+    }
+    initial_chain_sha256 = protocol_hash("acceptance_chain", initial_chain)
+    upgraded_decision: dict[str, object] = {
+        "graph_manifest_sha256": graph_manifest_sha256,
+        "mode": "independent",
+        "previous_decision_sha256": initial_decision_sha256,
+        "protocol": "cco.v4",
+        "reasons": ["worker_followup"],
+        "revision": 2,
+    }
+    upgraded_chain = json.loads(json.dumps(initial_chain))
+    upgraded_chain["decisions"].append(
+        {
+            "decision": upgraded_decision,
+            "decision_sha256": protocol_hash(
+                "acceptance_decision", upgraded_decision
+            ),
+        }
+    )
+    upgraded_chain_sha256 = protocol_hash("acceptance_chain", upgraded_chain)
+    upgraded_chain_json = json.dumps(
+        upgraded_chain, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
     binding: dict[str, object] = {
+        "acceptance_chain_sha256": initial_chain_sha256,
         "attempt": {"current": 1, "limit": 2},
         "acceptance_ids": ["A01"],
         "baseline": "sha256:" + "c" * 64,
@@ -238,10 +446,11 @@ def worker_followup_message() -> str:
             {"content_sha256": "sha256:" + "d" * 64, "id": "I01"}
         ],
         "contract_rev": 1,
-        "contract_sha256": "sha256:" + "a" * 64,
+        "contract_sha256": contract_sha256,
         "dependencies": [],
         "effort_policy": "route_default",
         "fork_turns": "none",
+        "graph_manifest_sha256": graph_manifest_sha256,
         "lease": "wl_n01_auth_r01",
         "lease_generation": 1,
         "model_policy": "route_default",
@@ -261,6 +470,7 @@ def worker_followup_message() -> str:
         }
     ]
     preimage: dict[str, object] = {
+        "acceptance_chain_sha256": upgraded_chain_sha256,
         "binding": binding,
         "delta": ["Correct the bounded authentication behavior."],
         "followup": {"current": 1, "limit": 1},
@@ -278,9 +488,11 @@ def worker_followup_message() -> str:
     return f"""CCO_WORK_FOLLOWUP cco.v4
 NODE: n01_auth
 CONTRACT_REV: 1
-CONTRACT_SHA256: sha256:{"a" * 64}
+CONTRACT_SHA256: {contract_sha256}
 PREVIOUS_INPUT_CLOSURE_SHA256: sha256:{"b" * 64}
 INPUT_CLOSURE_SHA256: {input_sha256}
+ACCEPTANCE_CHAIN_SHA256: {upgraded_chain_sha256}
+ACCEPTANCE_CHAIN_JSON: {upgraded_chain_json}
 BINDING_JSON: {binding_json}
 TARGET: /root/work_n01_auth_routine_r01
 RUN: run_n01_auth_r01
@@ -304,14 +516,20 @@ def review_delta_message() -> str:
         evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
     evidence_sha256 = protocol_hash("evidence", evidence)
+    acceptance_chain = evidence["acceptance_chain"]
+    acceptance_chain_sha256 = evidence["acceptance_chain_sha256"]
+    graph_manifest = acceptance_chain["graph_manifest"]
+    graph_manifest_sha256 = acceptance_chain["graph_manifest_sha256"]
+    contract_record = graph_manifest["contracts"][0]
     preimage: dict[str, object] = {
         "acceptance_ids": ["A01"],
+        "acceptance_chain_sha256": acceptance_chain_sha256,
         "attempt": {"current": 1, "limit": 2},
         "contract_status": "preserved",
         "contracts": [
             {
                 "contract_rev": 1,
-                "contract_sha256": "sha256:" + "b" * 64,
+                "contract_sha256": contract_record["contract_sha256"],
                 "node": "n01_auth",
             }
         ],
@@ -320,6 +538,7 @@ def review_delta_message() -> str:
         "epoch": "e01",
         "evidence_sha256": evidence_sha256,
         "followup": {"current": 1, "limit": 1},
+        "graph_manifest_sha256": graph_manifest_sha256,
         "kind": "review_delta",
         "open_risks": [],
         "previous_input_closure_sha256": "sha256:" + "a" * 64,
@@ -340,8 +559,10 @@ TARGET: /root/review_e01_r01
 PRIOR_REVIEWED_STATE: sha256:{"c" * 64}
 CURRENT_STATE: sha256:{"d" * 64}
 CONTRACT_STATUS: preserved
+GRAPH_MANIFEST_SHA256: {graph_manifest_sha256}
+ACCEPTANCE_CHAIN_SHA256: {acceptance_chain_sha256}
 CONTRACTS:
-- n01_auth@1#sha256:{"b" * 64}
+- n01_auth@1#{contract_record["contract_sha256"]}
 ACCEPTANCE_IDS: [A01]
 EVIDENCE_SHA256: {evidence_sha256}
 RESOLVES:
@@ -377,6 +598,58 @@ def run_hook_utf8(value: dict[str, object]) -> subprocess.CompletedProcess[bytes
 
 
 class AgentPreflightBehaviorTests(unittest.TestCase):
+    def test_counter_caps_fail_before_repository_preflight(self) -> None:
+        tool_input = {
+            "task_name": "work_n01_auth_routine_r01",
+            "agent_type": "cost_orchestrator_routine_worker",
+            "fork_turns": "none",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "message": worker_message().replace("ATTEMPT: 1/2", "ATTEMPT: 1/4"),
+        }
+        with mock.patch.object(
+            preflight_module,
+            "repository_root",
+            side_effect=AssertionError("repository preflight should not run"),
+        ):
+            result = preflight_module.evaluate(payload(tool_input=tool_input))
+
+        self.assertEqual(result["decision"], "block")
+
+    def test_worker_path_preflight_reuses_one_repository_context(self) -> None:
+        tool_input = {
+            "task_name": "work_n01_auth_routine_r01",
+            "agent_type": "cost_orchestrator_routine_worker",
+            "fork_turns": "none",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "message": worker_message(),
+        }
+        with (
+            mock.patch.object(
+                preflight_module,
+                "repository_root",
+                wraps=preflight_module.repository_root,
+            ) as root_probe,
+            mock.patch.object(
+                preflight_module,
+                "repository_control_roots",
+                wraps=preflight_module.repository_control_roots,
+            ) as control_probe,
+            mock.patch.object(
+                preflight_module,
+                "validate_repository_lease_path",
+                wraps=preflight_module.validate_repository_lease_path,
+            ) as path_probe,
+        ):
+            preflight_module.validate_worker(
+                tool_input, "cost_orchestrator_routine_worker"
+            )
+
+        self.assertEqual(root_probe.call_count, 1)
+        self.assertEqual(control_probe.call_count, 1)
+        self.assertEqual(path_probe.call_count, 1)
+
     def test_hook_config_registers_one_agent_preflight(self) -> None:
         config = json.loads(HOOKS_CONFIG.read_text(encoding="utf-8"))
         groups = config["hooks"]["PreToolUse"]
@@ -426,6 +699,13 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                     "message": worker_followup_message().replace(
                         "FOLLOWUP: 1/1", "FOLLOWUP: 999/1"
                     ),
+                },
+            ),
+            (
+                "send_message",
+                {
+                    "target": "/root/work_n01_auth_routine_r001",
+                    "message": worker_followup_message().replace("r01", "r001"),
                 },
             ),
             (
@@ -544,6 +824,21 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
+    def test_standalone_continuation_headers_are_reserved_on_spawn(self) -> None:
+        for message in (worker_followup_message(), review_delta_message()):
+            with self.subTest(header=message.splitlines()[0]):
+                result = run_hook(
+                    payload(
+                        tool_input={
+                            "task_name": "ordinary",
+                            "message": message,
+                        }
+                    )
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
     def test_valid_explicit_and_native_worker_routes_are_allowed(self) -> None:
         cases = (
             (
@@ -577,6 +872,10 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 ),
                 {"reasoning_effort": "high"},
             ),
+            (
+                worker_message(requested_model="gpt-5.6-terra"),
+                {"model": "gpt-5.6-terra", "reasoning_effort": "max"},
+            ),
         )
         for message, overrides in cases:
             with self.subTest(overrides=overrides):
@@ -590,6 +889,56 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 result = run_hook(payload(tool_input=tool_input))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
+
+    def test_worker_contract_must_be_declared_by_the_full_graph_manifest(self) -> None:
+        tool_input = {
+            "task_name": "work_n01_auth_routine_r01",
+            "agent_type": "cost_orchestrator_routine_worker",
+            "fork_turns": "none",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "message": worker_message(manifest_node="n02_other"),
+        }
+
+        result = run_hook(payload(tool_input=tool_input), cwd=REPO)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"decision":"block"', result.stdout)
+
+    def test_worker_packet_preserves_hashed_prefix_scope_kind(self) -> None:
+        tool_input = {
+            "task_name": "work_n01_auth_routine_r01",
+            "agent_type": "cost_orchestrator_routine_worker",
+            "fork_turns": "none",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "message": worker_message(
+                write_path="generated",
+                write_kind="prefix",
+            ),
+        }
+
+        result = run_hook(payload(tool_input=tool_input))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_worker_packet_rejects_an_untyped_scope_line(self) -> None:
+        tool_input = {
+            "task_name": "work_n01_auth_routine_r01",
+            "agent_type": "cost_orchestrator_routine_worker",
+            "fork_turns": "none",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "max",
+            "message": worker_message().replace(
+                "- exact:src/auth.py", "- src/auth.py"
+            ),
+        }
+
+        result = run_hook(payload(tool_input=tool_input))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
     def test_native_policy_requires_override_key_omission(self) -> None:
         message = worker_message(
@@ -611,6 +960,44 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                         }
                     )
                 )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    def test_route_defaults_stay_inside_the_declared_lane_sequence(self) -> None:
+        cases = (
+            {
+                "task_name": "work_n01_auth_routine_r01",
+                "agent_type": "cost_orchestrator_routine_worker",
+                "fork_turns": "none",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "max",
+                "message": worker_message(requested_model="gpt-5.6-sol"),
+            },
+            {
+                "task_name": "work_n01_auth_complex_r01",
+                "agent_type": "cost_orchestrator_complex_worker",
+                "fork_turns": "none",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "max",
+                "message": worker_message(
+                    role="cost_orchestrator_complex_worker",
+                    lane="complex",
+                    requested_model="gpt-5.6-luna",
+                ),
+            },
+            {
+                "task_name": "work_n01_auth_routine_r01",
+                "agent_type": "cost_orchestrator_routine_worker",
+                "fork_turns": "none",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "high",
+                "message": worker_message(requested_effort="high"),
+            },
+        )
+        for tool_input in cases:
+            with self.subTest(task_name=tool_input["task_name"], model=tool_input["model"]):
+                result = run_hook(payload(tool_input=tool_input))
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["decision"], "block")
@@ -718,13 +1105,17 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 "fork_turns": "none",
                 "model": "gpt-5.6-luna",
                 "reasoning_effort": "max",
-                "message": worker_message().replace("- src/auth.py", "- ../escape.py"),
+                "message": worker_message().replace(
+                    "- exact:src/auth.py", "- exact:../escape.py"
+                ),
             },
             {
                 "task_name": "review_e01_r01",
                 "agent_type": "cost_orchestrator_reviewer",
                 "fork_turns": "none",
-                "message": reviewer_message().replace("- src/auth.py", "- src/../escape.py"),
+                "message": reviewer_message().replace(
+                    "- exact:src/auth.py", "- exact:src/../escape.py"
+                ),
             },
         )
         for tool_input in cases:
@@ -733,6 +1124,224 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    def test_preflight_treats_each_gitlink_as_one_atomic_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            initialized = subprocess.run(
+                ["git", "init"], cwd=repo, text=True, capture_output=True, check=False
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            committed = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=CCO Tests",
+                    "-c",
+                    "user.email=cco-tests@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(head.returncode, 0, head.stderr)
+            gitlink = subprocess.run(
+                [
+                    "git",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"160000,{head.stdout.strip()},vendor/child",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(gitlink.returncode, 0, gitlink.stderr)
+
+            base = {
+                "task_name": "work_n01_auth_routine_r01",
+                "agent_type": "cost_orchestrator_routine_worker",
+                "fork_turns": "none",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "max",
+            }
+            nested = run_hook(
+                payload(
+                    tool_input={
+                        **base,
+                        "message": worker_message(
+                            write_path="vendor/child/src/owned.txt"
+                        ),
+                    }
+                ),
+                cwd=repo,
+            )
+            atomic = run_hook(
+                payload(
+                    tool_input={
+                        **base,
+                        "message": worker_message(write_path="vendor/child"),
+                    }
+                ),
+                cwd=repo,
+            )
+            prefix = run_hook(
+                payload(
+                    tool_input={
+                        **base,
+                        "message": worker_message(
+                            write_path="vendor/child",
+                            write_kind="prefix",
+                        ),
+                    }
+                ),
+                cwd=repo,
+            )
+
+            self.assertEqual(nested.returncode, 0, nested.stderr)
+            self.assertEqual(json.loads(nested.stdout)["decision"], "block")
+            self.assertEqual(atomic.returncode, 0, atomic.stderr)
+            self.assertEqual(atomic.stdout, "")
+            self.assertEqual(prefix.returncode, 0, prefix.stderr)
+            self.assertEqual(json.loads(prefix.stdout)["decision"], "block")
+
+    @unittest.skipUnless(os.name == "nt", "case aliases are Windows-specific")
+    def test_preflight_rejects_a_case_alias_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "init"],
+                    cwd=repo,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            (repo / "src").mkdir()
+            (repo / "src" / "auth.py").write_text("pass\n", encoding="utf-8")
+            added = subprocess.run(
+                ["git", "add", "src/auth.py"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(added.returncode, 0, added.stderr)
+            tool_input = {
+                "task_name": "work_n01_auth_routine_r01",
+                "agent_type": "cost_orchestrator_routine_worker",
+                "fork_turns": "none",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "max",
+                "message": worker_message(write_path="SRC/AUTH.PY"),
+            }
+
+            result = run_hook(payload(tool_input=tool_input), cwd=repo)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    @unittest.skipUnless(os.name == "nt", "8.3 aliases are Windows-specific")
+    def test_preflight_rejects_a_short_name_alias_to_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            initialized = subprocess.run(
+                ["git", "init"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            buffer = ctypes.create_unicode_buffer(32_768)
+            length = ctypes.windll.kernel32.GetShortPathNameW(
+                str(repo / ".git"), buffer, len(buffer)
+            )
+            if length == 0 or length >= len(buffer):
+                self.skipTest("the test volume did not expose an 8.3 alias for .git")
+            short_name = Path(buffer.value).name
+            if not short_name or short_name.lower() == ".git":
+                self.skipTest("the test volume did not expose an 8.3 alias for .git")
+
+            result = run_hook(
+                payload(
+                    tool_input={
+                        "task_name": "work_n01_auth_routine_r01",
+                        "agent_type": "cost_orchestrator_routine_worker",
+                        "fork_turns": "none",
+                        "model": "gpt-5.6-luna",
+                        "reasoning_effort": "max",
+                        "message": worker_message(
+                            write_path=f"{short_name}/config"
+                        ),
+                    }
+                ),
+                cwd=repo,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
+    def test_preflight_rejects_a_junction_into_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "repo"
+            repo.mkdir()
+            initialized = subprocess.run(
+                ["git", "init"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            junction = repo / "leased"
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(repo / ".git")],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+
+            result = run_hook(
+                payload(
+                    tool_input={
+                        "task_name": "work_n01_auth_routine_r01",
+                        "agent_type": "cost_orchestrator_routine_worker",
+                        "fork_turns": "none",
+                        "model": "gpt-5.6-luna",
+                        "reasoning_effort": "max",
+                        "message": worker_message(
+                            write_path="leased/hooks/post-checkout"
+                        ),
+                    }
+                ),
+                cwd=repo,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
     def test_initial_worker_and_reviewer_attempts_start_at_one(self) -> None:
         cases = (
@@ -758,6 +1367,23 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
+    def test_initial_worker_rejects_a_noncanonical_run_alias(self) -> None:
+        result = run_hook(
+            payload(
+                tool_input={
+                    "task_name": "work_n01_auth_routine_r001",
+                    "agent_type": "cost_orchestrator_routine_worker",
+                    "fork_turns": "none",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "max",
+                    "message": worker_message().replace("r01", "r001"),
+                }
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
     def test_valid_fresh_reviewer_is_allowed(self) -> None:
         cases = (
             ("review_e01_r01", reviewer_message()),
@@ -779,6 +1405,30 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, "")
 
+    def test_primary_acceptance_bundle_does_not_spawn_a_redundant_reviewer(self) -> None:
+        evidence = reviewer_evidence()
+        chain = evidence["acceptance_chain"]
+        decision = chain["decisions"][0]["decision"]
+        decision["mode"] = "primary"
+        decision["reasons"] = []
+        chain["decisions"][0]["decision_sha256"] = protocol_hash(
+            "acceptance_decision", decision
+        )
+        evidence["acceptance_chain_sha256"] = protocol_hash(
+            "acceptance_chain", chain
+        )
+        tool_input = {
+            "task_name": "review_e01_r01",
+            "agent_type": "cost_orchestrator_reviewer",
+            "fork_turns": "none",
+            "message": reviewer_message(evidence),
+        }
+
+        result = run_hook(payload(tool_input=tool_input))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
     def test_reviewer_override_or_delta_spawn_is_blocked(self) -> None:
         base = {
             "task_name": "review_e01_r01",
@@ -789,6 +1439,8 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
         cases = (
             {**base, "model": "gpt-5.6-sol"},
             {**base, "reasoning_effort": "high"},
+            {**base, "model": None},
+            {**base, "reasoning_effort": None},
             {**base, "sandbox_mode": "danger-full-access"},
             {**base, "fork_turns": "1"},
             {**base, "message": reviewer_message().replace("MODE: fresh", "MODE: delta")},
@@ -850,7 +1502,11 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
     def test_review_contract_and_acceptance_closure_is_exact(self) -> None:
-        contract = f"- n01_auth@1#sha256:{'b' * 64}"
+        evidence = reviewer_evidence()
+        contract_record = evidence["acceptance_chain"]["graph_manifest"][
+            "contracts"
+        ][0]
+        contract = f"- n01_auth@1#{contract_record['contract_sha256']}"
         cases = (
             reviewer_message().replace(
                 "- A01: Authentication behavior passes.",

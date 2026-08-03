@@ -1,6 +1,9 @@
 import json
+import ctypes
+import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -77,7 +80,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                     "--baseline",
                     str(baseline),
                     "--allow",
-                    "src/owned.txt",
+                    "exact:src/owned.txt",
                 ],
                 text=True,
                 capture_output=True,
@@ -102,6 +105,142 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                 "pre-existing untracked\n",
             )
 
+    def test_explicit_exact_and_prefix_scopes_have_distinct_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "src" / "owned.txt").write_text("changed\n", encoding="utf-8")
+
+            exact = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:src",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            prefix = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "prefix:src",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(exact.returncode, 1, exact.stderr)
+            self.assertEqual(
+                json.loads(exact.stdout)["violations"],
+                ["outside_lease:src/owned.txt"],
+            )
+            self.assertEqual(prefix.returncode, 0, prefix.stderr)
+            self.assertEqual(json.loads(prefix.stdout)["violations"], [])
+
+    def test_passing_verify_can_emit_the_next_serial_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            baseline = root / "baseline.json"
+            capture = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "capture",
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            (repo / "src" / "owned.txt").write_text("next state\n", encoding="utf-8")
+            next_baseline = root / "next.json"
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:src/owned.txt",
+                    "--next-baseline",
+                    str(next_baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 0, verify.stderr)
+            result = json.loads(verify.stdout)
+            emitted = json.loads(next_baseline.read_text(encoding="utf-8"))
+            self.assertEqual(emitted["state_id"], result["current_state"])
+
+    def test_verify_rejects_a_legacy_untyped_allow_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "src/owned.txt",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 2)
+            self.assertIn("exact:<path> or prefix:<path>", verify.stderr)
+
     def test_capture_writes_utf8_baseline_only_outside_the_repository(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -124,7 +263,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
 
             self.assertEqual(capture.returncode, 0, capture.stderr)
             self.assertEqual(capture.stdout, "")
-            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["schema"], "cco.workspace-state.v1")
+            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["schema"], "cco.workspace-state.v2")
 
             inside = repo / "baseline.json"
             refused = subprocess.run(
@@ -143,6 +282,64 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(refused.returncode, 2)
             self.assertFalse(inside.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Win32 device paths are Windows-specific")
+    def test_capture_rejects_device_aliases_that_resolve_inside_the_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            direct = repo / ".git" / "cco-device-baseline.json"
+            device_alias = "\\\\?\\" + str(direct)
+
+            capture = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "capture",
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    device_alias,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(capture.returncode, 2)
+            self.assertIn("outside the repository", capture.stderr)
+            self.assertFalse(direct.exists())
+
+    @unittest.skipUnless(os.name == "nt", "UNC aliases are Windows-specific")
+    def test_capture_rejects_unc_aliases_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            direct = repo / ".git" / "cco-unc-baseline.json"
+            drive = direct.drive.rstrip(":")
+            if not drive:
+                self.skipTest("the temporary directory is not on a drive-letter volume")
+            relative = str(direct)[len(direct.anchor) :].replace("/", "\\")
+            unc_alias = f"\\\\localhost\\{drive}$\\{relative}"
+
+            capture = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "capture",
+                    "--repo",
+                    str(repo),
+                    "--output",
+                    unc_alias,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(capture.returncode, 2)
+            self.assertIn("outside the repository", capture.stderr)
+            self.assertFalse(direct.exists())
 
     def test_rejects_an_out_of_lease_path_without_cleaning_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -170,7 +367,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                     "--baseline",
                     str(baseline),
                     "--allow",
-                    "src/",
+                    "prefix:src",
                 ],
                 text=True,
                 capture_output=True,
@@ -215,7 +412,50 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                     "--baseline",
                     str(baseline),
                     "--allow",
-                    ".git/config",
+                    "exact:.git/config",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 2)
+            self.assertIn("invalid lease path", verify.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
+    def test_refuses_a_junction_that_resolves_into_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            junction = repo / "leased"
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(repo / ".git")],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "prefix:leased",
                 ],
                 text=True,
                 capture_output=True,
@@ -225,6 +465,137 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 2)
             self.assertIn("invalid lease path", verify.stderr)
             self.assertEqual(verify.stdout, "")
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
+    def test_prefix_scope_rejects_a_reparse_descendant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            junction = repo / "src" / "control"
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(repo / ".git")],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "prefix:src",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 2)
+            self.assertIn("invalid lease path", verify.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
+    def test_git_control_reparse_topology_changes_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            hooks = repo / ".git" / "hooks"
+            outside = root / "outside-hooks"
+            shutil.copytree(hooks, outside)
+            shutil.rmtree(hooks)
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(hooks), str(outside)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
+
+    @unittest.skipUnless(os.name == "nt", "8.3 aliases are Windows-specific")
+    def test_refuses_an_existing_short_name_alias_to_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            buffer = ctypes.create_unicode_buffer(32_768)
+            length = ctypes.windll.kernel32.GetShortPathNameW(
+                str(repo / ".git"), buffer, len(buffer)
+            )
+            if length == 0 or length >= len(buffer):
+                self.skipTest("the test volume did not expose an 8.3 alias for .git")
+            short_name = Path(buffer.value).name
+            if not short_name or short_name.lower() == ".git":
+                self.skipTest("the test volume did not expose an 8.3 alias for .git")
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    f"exact:{short_name}/config",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 2)
+            self.assertIn("invalid lease path", verify.stderr)
 
     def test_rejects_noncanonical_lease_path_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -263,7 +634,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                             "--baseline",
                             str(baseline),
                             "--allow",
-                            path,
+                            f"exact:{path}",
                         ],
                         text=True,
                         capture_output=True,
@@ -272,11 +643,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                     self.assertEqual(verify.returncode, 2)
                     self.assertIn("invalid lease path", verify.stderr)
 
-    @unittest.skipUnless(
-        os.path.normcase("A") == os.path.normcase("a"),
-        "case aliases are distinct on this host",
-    )
-    def test_case_insensitive_host_compares_lease_aliases_by_casefold(self) -> None:
+    def test_every_host_requires_exact_existing_git_spelling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -301,15 +668,127 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                     "--baseline",
                     str(baseline),
                     "--allow",
-                    "SRC/OWNED.TXT",
+                    "exact:SRC/OWNED.TXT",
                 ],
                 text=True,
                 capture_output=True,
                 check=False,
             )
 
-            self.assertEqual(verify.returncode, 0, verify.stderr)
-            self.assertEqual(json.loads(verify.stdout)["violations"], [])
+            self.assertEqual(verify.returncode, 2)
+            self.assertIn("invalid lease path", verify.stderr)
+            self.assertEqual(verify.stdout, "")
+
+    @unittest.skipUnless(
+        os.path.normcase("A") == os.path.normcase("a"),
+        "Unicode lease comparison regression is Windows-specific",
+    )
+    def test_windows_lease_comparison_preserves_distinct_unicode_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            (repo / "strasse.txt").write_text("ascii baseline\n", encoding="utf-8")
+            (repo / "straße.txt").write_text("unicode baseline\n", encoding="utf-8")
+            self.assertEqual(self.git(repo, "add", ".").returncode, 0)
+            commit = self.git(
+                repo,
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-m",
+                "add distinct names",
+            )
+            self.assertEqual(commit.returncode, 0, commit.stderr)
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "strasse.txt").write_text("changed\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:straße.txt",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertEqual(
+                json.loads(verify.stdout)["violations"],
+                ["outside_lease:strasse.txt"],
+            )
+
+    @unittest.skipIf(os.name == "nt", "backslash filenames are unavailable on Windows")
+    def test_posix_backslash_filename_never_aliases_a_directory_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            (repo / "a").mkdir()
+            (repo / "a" / "b.txt").write_text("slash baseline\n", encoding="utf-8")
+            (repo / "a\\b.txt").write_text("backslash baseline\n", encoding="utf-8")
+            self.assertEqual(self.git(repo, "add", ".").returncode, 0)
+            committed = self.git(
+                repo,
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-m",
+                "add distinct slash spellings",
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "a\\b.txt").write_text("changed\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:a/b.txt",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertEqual(result["changed_paths"], ["a\\b.txt"])
+            self.assertEqual(result["violations"], ["outside_lease:a\\b.txt"])
 
     def test_rejects_staging_even_when_the_file_is_in_the_lease(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -337,7 +816,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                     "--baseline",
                     str(baseline),
                     "--allow",
-                    "src/owned.txt",
+                    "exact:src/owned.txt",
                 ],
                 text=True,
                 capture_output=True,
@@ -349,7 +828,691 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertIn("index_changed", result["violations"])
             self.assertNotIn("outside_lease:src/owned.txt", result["violations"])
 
-    def test_empty_lease_rejects_every_workspace_mutation(self) -> None:
+    def test_symbolic_head_is_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            self.assertEqual(self.git(repo, "branch", "same-commit").returncode, 0)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            switched = self.git(repo, "switch", "same-commit")
+            self.assertEqual(switched.returncode, 0, switched.stderr)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertIn("symbolic_head_changed", result["violations"])
+            self.assertNotEqual(result["baseline_state"], result["current_state"])
+
+    def test_git_config_is_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            configured = self.git(repo, "config", "core.hooksPath", ".cco-hooks")
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("git_config_changed", json.loads(verify.stdout)["violations"])
+
+    def test_git_refs_are_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            branched = self.git(repo, "branch", "unreferenced-by-head")
+            self.assertEqual(branched.returncode, 0, branched.stderr)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("refs_changed", json.loads(verify.stdout)["violations"])
+
+    def test_git_hooks_are_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            hook = repo / ".git" / "hooks" / "post-checkout"
+            hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
+
+    def test_git_info_metadata_is_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            attributes = repo / ".git" / "info" / "attributes"
+            attributes.write_text("*.txt -diff\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("git_info_changed", json.loads(verify.stdout)["violations"])
+
+    def test_git_administrative_state_is_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            head = self.git(repo, "rev-parse", "HEAD")
+            self.assertEqual(head.returncode, 0, head.stderr)
+            (repo / ".git" / "shallow").write_text(head.stdout, encoding="ascii")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertIn("git_admin_changed", result["violations"])
+            self.assertNotEqual(result["baseline_state"], result["current_state"])
+
+    def test_git_lock_files_are_part_of_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / ".git" / "index.lock").write_bytes(b"")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("git_admin_changed", json.loads(verify.stdout)["violations"])
+
+    def test_git_admin_digest_covers_alternates_sequences_and_worktree_registry(self) -> None:
+        mutations = (
+            ("objects/info/alternates", "{alternate}\n"),
+            ("sequencer/todo", "pick deadbeef test\n"),
+            ("worktrees/ghost/gitdir", "{repo}/ghost/.git\n"),
+        )
+        for relative, template in mutations:
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                repo = self.make_repo(root)
+                alternate = root / "alternate-objects"
+                alternate.mkdir()
+                capture = subprocess.run(
+                    [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(capture.returncode, 0, capture.stderr)
+                baseline = root / "baseline.json"
+                baseline.write_text(capture.stdout, encoding="utf-8")
+                target = repo / ".git" / Path(relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    template.format(alternate=alternate, repo=repo), encoding="utf-8"
+                )
+
+                verify = subprocess.run(
+                    [
+                        sys.executable,
+                        str(STATE_TOOL),
+                        "verify",
+                        "--repo",
+                        str(repo),
+                        "--baseline",
+                        str(baseline),
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+                self.assertEqual(verify.returncode, 1, verify.stderr)
+                self.assertIn(
+                    "git_admin_changed", json.loads(verify.stdout)["violations"]
+                )
+
+    def test_physical_repository_identity_is_bound_to_the_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+
+            original = root / "original-repo"
+            repo.rename(original)
+            shutil.copytree(original, repo, symlinks=True)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertIn("repository_identity_changed", result["violations"])
+            self.assertIn("git_control_identity_changed", result["violations"])
+
+    def test_tracked_content_is_observed_despite_assume_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            marked = self.git(
+                repo, "update-index", "--assume-unchanged", "src/owned.txt"
+            )
+            self.assertEqual(marked.returncode, 0, marked.stderr)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "src" / "owned.txt").write_text("hidden change\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertEqual(result["changed_paths"], ["src/owned.txt"])
+            self.assertEqual(
+                result["violations"], ["outside_lease:src/owned.txt"]
+            )
+
+    def test_tracked_content_is_observed_despite_skip_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            marked = self.git(repo, "update-index", "--skip-worktree", "src/owned.txt")
+            self.assertEqual(marked.returncode, 0, marked.stderr)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "src" / "owned.txt").write_text(
+                "skip-worktree hidden change\n", encoding="utf-8"
+            )
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertEqual(result["changed_paths"], ["src/owned.txt"])
+            self.assertEqual(
+                result["violations"], ["outside_lease:src/owned.txt"]
+            )
+
+    def test_v2_baseline_requires_every_security_identity_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            snapshot = json.loads(capture.stdout)
+            snapshot.pop("repo_identity")
+            unsigned = {key: value for key, value in snapshot.items() if key != "state_id"}
+            canonical = json.dumps(
+                unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+            snapshot["state_id"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+            baseline = root / "baseline.json"
+            baseline.write_text(json.dumps(snapshot), encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 2)
+            self.assertIn("required fields", verify.stderr)
+
+    def test_already_dirty_submodule_content_remains_observed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            child_container = root / "child-container"
+            parent_container = root / "parent-container"
+            child_container.mkdir()
+            parent_container.mkdir()
+            child = self.make_repo(child_container)
+            repo = self.make_repo(parent_container)
+            added = self.git(
+                repo,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(child),
+                "vendor/child",
+            )
+            self.assertEqual(added.returncode, 0, added.stderr)
+            committed = self.git(
+                repo,
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-am",
+                "add submodule",
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            nested_file = repo / "vendor" / "child" / "src" / "owned.txt"
+            nested_file.write_text("first dirty state\n", encoding="utf-8")
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            nested_file.write_text("second dirty state\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertEqual(result["changed_paths"], ["vendor/child"])
+            self.assertEqual(
+                result["violations"], ["outside_lease:vendor/child"]
+            )
+
+            child_lease = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:vendor/child/src/owned.txt",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(child_lease.returncode, 2)
+            self.assertIn("invalid lease path", child_lease.stderr)
+
+            if os.path.normcase("A") == os.path.normcase("a"):
+                case_alias = subprocess.run(
+                    [
+                        sys.executable,
+                        str(STATE_TOOL),
+                        "verify",
+                        "--repo",
+                        str(repo),
+                        "--baseline",
+                        str(baseline),
+                        "--allow",
+                        "exact:VENDOR/CHILD/src/owned.txt",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(case_alias.returncode, 2)
+                self.assertIn("invalid lease path", case_alias.stderr)
+
+            atomic_lease = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:vendor/child",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(atomic_lease.returncode, 0, atomic_lease.stderr)
+            self.assertEqual(json.loads(atomic_lease.stdout)["violations"], [])
+
+            ancestor_prefix = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "prefix:vendor",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(ancestor_prefix.returncode, 2)
+            self.assertIn("invalid lease path", ancestor_prefix.stderr)
+
+            staged = self.git(repo / "vendor" / "child", "add", "src/owned.txt")
+            self.assertEqual(staged.returncode, 0, staged.stderr)
+            protected = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:vendor/child",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(protected.returncode, 1, protected.stderr)
+            self.assertTrue(
+                any(
+                    item.startswith("submodule_control_changed:vendor/child:")
+                    for item in json.loads(protected.stdout)["violations"]
+                )
+            )
+
+    def test_exact_submodule_lease_rejects_removing_its_git_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            child_container = root / "child-container"
+            parent_container = root / "parent-container"
+            child_container.mkdir()
+            parent_container.mkdir()
+            child = self.make_repo(child_container)
+            repo = self.make_repo(parent_container)
+            added = self.git(
+                repo,
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(child),
+                "vendor/child",
+            )
+            self.assertEqual(added.returncode, 0, added.stderr)
+            committed = self.git(
+                repo,
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-am",
+                "add submodule",
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            (repo / "vendor" / "child" / ".git").unlink()
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                    "--allow",
+                    "exact:vendor/child",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            result = json.loads(verify.stdout)
+            self.assertIn(
+                "submodule_control_changed:vendor/child:kind",
+                result["violations"],
+            )
+
+    def test_empty_lease_rejects_an_observed_tracked_workspace_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -383,7 +1546,8 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
 
             self.assertEqual(verify.returncode, 1, verify.stderr)
             result = json.loads(verify.stdout)
-            self.assertEqual(result["allowed_paths"], [])
+            self.assertEqual(result["schema"], "cco.workspace-verification.v2")
+            self.assertEqual(result["allowed_scopes"], [])
             self.assertEqual(
                 result["violations"], ["outside_lease:src/owned.txt"]
             )

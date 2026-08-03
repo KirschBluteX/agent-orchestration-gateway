@@ -7,9 +7,9 @@ Cost-aware, contract-driven orchestration for native Codex agents.
 Codex Cost Orchestrator (CCO v4) keeps the user goal, architecture, decomposition, and
 final acceptance in a primary Sol session. It routes closed contracts to model-neutral
 leaf roles with user-selectable model and reasoning effort, verifies the actual
-repository state and primary evidence in Sol, and gates orchestrated completion through
-an exact-state review epoch. Read-only requests and guarded atomic edits avoid that
-delegation overhead.
+repository state and primary evidence in Sol, and structurally chooses primary-Sol
+acceptance or an exact-state independent review epoch. Read-only requests, guarded
+atomic edits, and eligible single-routine graphs avoid unnecessary agent turns.
 
 The goal is not to make every turn cheap. It is to move well-specified implementation
 volume to the least costly adequate worker while keeping expensive planning and
@@ -31,7 +31,7 @@ request by uncertainty, coupling, impact, and verification needs:
   requested fix stay in Sol without a work graph;
 - a confidently atomic low-risk implementation may use the direct fast path; and
 - every other implementation uses the full CCO work graph, worker lanes, primary
-  verification, and review epoch.
+  verification, and a pre-dispatch hashed acceptance mode.
 
 This repository's root [AGENTS.md](AGENTS.md) makes that routing policy the default
 while developing CCO itself. In another repository, installed-skill matching can
@@ -43,10 +43,14 @@ user choices still win.
 
 Sol may implement directly only when the result is unambiguous, mechanically
 determined, small, atomic, confined to one bounded area, and adequately covered by one
-focused verification. It must not affect public interfaces, schemas, migrations,
-dependency boundaries, authentication, authorization, security controls, concurrency,
-build or release behavior, or destructive data paths. Worktree ownership must also be
-clear, and delegation or independent review must offer no material value.
+deterministic verification; no enumerated `RISK_FLAGS` apply:
+`authentication_authorization`, `build_release`, `concurrency`,
+`dependency_boundary`, `destructive_data`, `external_side_effect`, `migration`,
+`nondeterministic_verification`, `public_interface`, `schema`, or `security`. It must
+not affect public interfaces, schemas, migrations, dependency boundaries,
+authentication, authorization, security controls, concurrency, build or release
+behavior, or destructive data paths. Worktree ownership must also be clear, and
+delegation or independent review must offer no material value.
 
 File count is evidence, not the definition: a one-file authentication change may need
 full orchestration, while a mechanical edit can occasionally touch several tightly
@@ -62,11 +66,12 @@ bounded area, a material interface or ownership decision appears, initial verifi
 fails for a non-trivial reason, diagnosis becomes systemic, regression risk grows, or
 independent review becomes useful.
 
-The original `DIRECT_BASELINE` remains the final review baseline. Sol freezes and
-inspects its existing delta, registers it as an exact Sol-owned change set, and uses
+The original `DIRECT_BASELINE` remains the final acceptance baseline. Sol freezes and
+inspects its existing delta, registers it as an explicit `sol` contract node, and uses
 the current state only as the baseline for later worker leases. The final review spans
 the original baseline through the finished state, including both the Sol-owned delta
-and every worker delta; no early edit can disappear behind a rebased lease.
+and every worker delta; no early edit can disappear behind a rebased lease. A
+Sol-owned node forces independent acceptance.
 
 ### User override
 
@@ -78,7 +83,8 @@ and forbids delegation, Codex stops before writing and asks for resolution. No o
 removes focused verification or permits unsupported claims about tests, review, or
 isolation.
 
-For a full flow, CCO requires its reviewer plus each worker role used by the graph. A
+CCO requires each worker role used by the graph and requires the reviewer only when
+the acceptance chain ends in independent mode. A
 missing or mismatched role fails closed before delegated writes. CCO reports the role
 and recovery command; it does not edit `CODEX_HOME` or silently substitute a generic
 agent.
@@ -88,9 +94,10 @@ agent.
 - A no-write result answers the request without implementation or review claims.
 - A direct result compares the final state with `DIRECT_BASELINE`, inspects every
   task-owned path, runs focused checks, and explicitly reports that no review epoch ran.
-- An orchestrated result requires all Sol-owned and worker-owned changes to be covered,
-  acceptance-critical checks to pass, and a `ship` verdict bound to the exact final
-  state.
+- An orchestrated result requires all Sol-owned and worker-owned changes to be covered
+  and acceptance-critical checks to pass at the exact final state. An eligible
+  single-routine graph may finish with primary-Sol acceptance; every independently
+  gated graph additionally requires a matching `ship` verdict.
 
 ## Roles and worker selection
 
@@ -99,7 +106,7 @@ agent.
 | Control plane | Primary Codex task | Sol; effort selected by the user | Resolve ambiguity, design, decompose, route, verify, and accept |
 | Routine lane | `cost_orchestrator_routine_worker` | User-selected per node; route order starts Luna / Max, then Terra / Max | Fully determined, mechanical, independently verifiable work |
 | Complex lane | `cost_orchestrator_complex_worker` | User-selected per node; Terra / Max is the route recommendation | Bounded algorithms, debugging, compatibility, security, or wider implementation judgment |
-| Review lane | `cost_orchestrator_reviewer` | GPT-5.6 Sol / High; requests read-only | Fresh epoch review and contract-preserving delta review |
+| Review lane | `cost_orchestrator_reviewer` | GPT-5.6 Sol / High; requests read-only | Structurally required fresh epoch review and contract-preserving delta review |
 
 Routine and complex describe contract closure, not fixed models. Worker TOMLs omit
 `model` and `model_reasoning_effort`; native spawn carries the selected dimensions.
@@ -132,12 +139,14 @@ flowchart TD
     C -->|"Bounded complex"| T["Complex role + selected model/effort"]
     L --> V["Sol verifies actual state + evidence"]
     T --> V
-    V --> R["Fresh Sol review epoch"]
+    V --> A{"Independent acceptance required?"}
+    A -->|"No: one clean routine node"| D["Primary Sol accepts exact state"]
+    A -->|"Yes"| R["Fresh Sol review epoch"]
     R -->|"fix-first"| F["Same owner fixes; same reviewer checks delta"]
     F --> R
     R -->|"rethink"| N["Revise contract and start a fresh epoch"]
     N --> S
-    R -->|"ship exact state"| D["Done"]
+    R -->|"ship exact state"| Z["Done"]
 ```
 
 ## What the protocol changes
@@ -147,7 +156,7 @@ flowchart TD
 Every delegated node uses a `cco.v4` packet with a stable `NODE`, material
 `CONTRACT_REV`, canonical `CONTRACT_SHA256`, chained `INPUT_CLOSURE_SHA256`, unique
 agent-thread `RUN`, finite `ATTEMPT` and `FOLLOWUP`, bound `fork_turns`, baseline-bound `LEASE`,
-`LEASE_GENERATION`, `STOP_GENERATION`, exact write paths, stable acceptance IDs, and
+`LEASE_GENERATION`, `STOP_GENERATION`, hashed `exact`/`prefix` write scopes, stable acceptance IDs, and
 expected verification evidence. The initial work packet plus the latest valid chained
 live in-turn steer supersedes inherited conversational assumptions.
 
@@ -155,6 +164,24 @@ The control plane also maintains a single-flight ledger for each
 `NODE@CONTRACT_REV`. One active owner is allowed. A contract-preserving steer may
 continue the recorded canonical task path only while that worker is still running; a
 completed worker receives a new run, attempt, explicit route, and lease generation.
+
+Before the first worker spawn, Sol builds an immutable graph manifest and append-only
+acceptance chain. It recomputes every contract/manifest/decision hash, requires each acceptance owner to equal
+the node that declares it, rejects globally duplicated acceptance/verification IDs,
+rejects overlapping exact/prefix and portable case-alias scopes, and limits the
+graph-wide distinct scope union to 128. A bounded generated directory should use one
+hashed prefix scope instead of enumerating hundreds of files.
+
+`primary` acceptance is limited to one clean routine contract with deterministic
+verification and no public, security, concurrency, build/release, migration,
+destructive-data, Sol-owned, concurrent-Multi, or explicit-review risk flag/trigger. Complex or
+multi-node work starts as `independent`. Any retry, correction, deviation, scope
+surprise, routing mismatch, verification failure, partial result, blocked result, or material implementation judgment
+appends a hash-linked primary-to-independent upgrade. If that upgrade makes the
+reviewer necessary and it is absent from the cached checked set, Sol runs the reviewer
+profile check before any corrective fix or review. This removes a redundant reviewer turn
+only where workflow structure already makes primary Sol acceptance sufficient; it is
+not a predicted cost or quality score.
 
 ### Per-node model and effort
 
@@ -172,8 +199,9 @@ worker exists, an unobservable or mismatched route is fenced and rejected.
 Full orchestration does not automatically mean concurrent fan-out. Multi dispatch
 requires at least two dependency-ready nodes, closed contract and input hashes,
 pairwise-disjoint write leases, complete acceptance ownership, and a planned
-independent review epoch, plus native capacity for at least two worker threads.
-Otherwise CCO serializes, merges an artificial split, or
+acceptance chain ending in `independent`, plus native capacity for at least two worker threads.
+Otherwise CCO serializes still-disjoint nodes, merges overlapping or artificial nodes
+under one owner, or
 keeps unresolved work in Sol. Price, tokens, latency, request count, file count, and
 predicted quality are advice, not hard gates.
 
@@ -185,14 +213,16 @@ an `INPUT_CLOSURE_SHA256`; follow-ups also bind
 while `STOP_GENERATION` is incremented before interrupt to fence late results. It does
 not prevent late writes, so Sol still checks the actual workspace delta.
 
-The spawn guardrail rebuilds the canonical contract and initial input preimages from
+The spawn guardrail rebuilds the canonical contract, full graph/decision chain, and initial input preimages from
 the readable packet, including `fork_turns` and the complete acceptance-ID set, and
-recomputes both hashes. Live worker steers carry canonical `BINDING_JSON` and bind the
+recomputes all applicable protocol hashes: contract, graph manifest, acceptance
+decision, acceptance chain, input closure, and evidence. Live worker steers carry canonical `BINDING_JSON` and bind the
 full canonical native `TARGET`; reviewer deltas do the same before the native
 continuation call.
 
 Attempts are finite across input, role, model, and effort changes for one
-`NODE@CONTRACT_REV`; follow-ups are finite and consecutive per run. Sol recomputes a
+`NODE@CONTRACT_REV` (three runs maximum); each run permits at most two live follow-ups.
+An epoch permits two fresh reviewer threads, each with at most two delta turns. Sol recomputes a
 stable `FAILURE_SIGNATURE` from the structured failure ID, class, exit status, and
 bounded diagnostics for failed verification or blocked work. A recurring signature
 requires a materially different intervention, not another unchanged prompt.
@@ -202,13 +232,22 @@ Build each checksum from the exact JSON preimage defined in
 
 ```text
 python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain contract
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain graph_manifest
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain acceptance_decision
+python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain acceptance_chain
 python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain input_closure
 python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain failure
 python plugins/codex-cost-orchestrator/scripts/protocol_hash.py hash --domain evidence
 ```
 
+These SHA-256 values are integrity checks, not encryption. CCO does not encrypt
+prompts, source code, or native Agent transport. Hashing compact protocol JSON is
+negligible beside a model turn; full workspace-state hashing is the separate operation
+that can become noticeable on a large repository.
+
 The helper validates the complete cco.v4 schema before hashing: exact keys and nested
-types, policy/null pairing, identifier coverage, NFC text, and canonical set ordering.
+types, explicit scope kinds, graph-wide scope limits/collisions, acceptance mode and
+owner closure, policy/null pairing, identifier coverage, NFC text, and canonical set ordering.
 It does not turn hashes into authentication, a content store, or proof that omitted
 inputs were complete. `INPUTS` entries are fingerprints, not content transport or
 locators: each one must correspond to bounded material already included in the packet
@@ -219,9 +258,9 @@ or to an exact repository location named in the packet and readable by the worke
 Custom roles use `fork_turns: none` when the packet plus repository anchors are
 sufficient. When inherited conversation is indispensable, the orchestrator selects
 the smallest positive turn count that contains the earliest still-binding decision.
-It never uses `fork_turns: all` with a custom role. The pinned Codex source permits a
-full-history fork with model/effort overrides alone; CCO's custom role is the reason
-that combination remains unavailable here.
+It never uses `fork_turns: all` with a custom role. CCO uses only `none` or a positive
+bounded fork; other full-history and override combinations vary by Codex surface and
+are outside this protocol's compatibility contract.
 
 Stable policy lives in the role profiles; changing task facts live in compact packets.
 This avoids repeatedly sending tool schemas, environment descriptions, full histories,
@@ -231,7 +270,8 @@ correctness and token-control rule, not a promise of a provider cache hit.
 ### Behavioral write leases and baseline verification
 
 The Sol control plane issues one non-overlapping behavioral write `LEASE` per active
-node and serializes shared paths. Before accepting a result, Sol compares the current
+node. Overlapping graph scopes are rejected before dispatch rather than assigned to
+different owners. Before accepting a result, Sol compares the current
 state with the recorded baseline, checks that changed paths are inside the lease,
 inspects the actual diff, preserves pre-existing work, and reruns acceptance-critical
 verification.
@@ -245,22 +285,39 @@ against exact allowed paths:
 
 ```text
 python plugins/codex-cost-orchestrator/scripts/workspace_state.py capture --repo <repository> --output <external-baseline.json>
-python plugins/codex-cost-orchestrator/scripts/workspace_state.py verify --repo <repository> --baseline <external-utf8-baseline.json> [--allow <path> ...]
+python plugins/codex-cost-orchestrator/scripts/workspace_state.py verify --repo <repository> --baseline <external-utf8-baseline.json> [--allow exact:<path> ...] [--allow prefix:<directory> ...] [--next-baseline <next.json>]
 ```
 
-The capture command writes UTF-8 JSON atomically and refuses an output path inside the
-repository. The verifier fails if `HEAD` or the Git index changed, lists
-baseline-relative paths, and rejects paths outside the lease. It never stages, cleans,
-resets, or rewrites files. Ignored files remain outside its observation surface, and
-concurrent writers can still race the capture/check window.
-Omit `--allow` to reject every mutation during a behaviorally read-only review.
+Capture emits `cco.workspace-state.v2`; verify emits
+`cco.workspace-verification.v2` with `allowed_scopes`. Capture atomically writes UTF-8 JSON outside the
+repository, rejects local repository/control-directory identities and Win32 UNC/device
+spellings, hashes all tracked worktree files independently of status shortcuts,
+recursively binds initialized submodules plus their marker/protected control state, and binds symbolic/commit HEAD, the index,
+refs, effective Git config, hooks, `info`, selected administrative state, and physical
+worktree/control-directory identities. Administrative coverage includes shallow state,
+`objects/info` such as alternates, linked-worktree registry data, reflogs, and
+merge/rebase/cherry-pick/revert/bisect/sequencer pseudo-state. It never stages, cleans,
+resets, or rewrites files. Prefix scopes reject reparse descendants and ancestor
+submodule scopes; Git lock files are bound. A passing serialized verify can reuse its
+computed snapshot through `--next-baseline`. Omit `--allow` for behavioral read-only review.
 
+Protocol scopes carry `{kind, path}` in canonical JSON and use `exact:<path>` or
+`prefix:<directory>` in readable packets and the workspace helper. Scope kind is part
+of `CONTRACT_SHA256`; untyped values and post-hash prefix derivation are rejected.
 Protocol paths use exact NFC Git spelling, forward slashes, and repository-relative
 segments without aliases such as absolute paths, drives, UNC forms, backslashes,
-`.`/`..`, empty segments, or trailing slashes. On a case-insensitive host, Sol compares
-active leases by case-folded spelling before dispatch. A documented trailing slash is
-used only when deriving an intentional directory-prefix argument for the workspace
-helper.
+`.`/`..`, empty segments, Git-control names, Win32 reserved names, or trailing
+dot/space spellings. Existing prefixes are rejected when they are reparse traversals
+or resolve into Git control directories. Existing case and 8.3 aliases are rejected
+before dispatch, including on Windows. Each indexed submodule is one atomic lease: its
+exact root may be owned, while child paths and a prefix scope at its root are rejected.
+
+The helper is detect-only and deliberately conservative; hashing all tracked files,
+recursive initialized submodules, and documented administrative paths may be
+noticeable on large repositories. Ignored
+files, NTFS alternate data streams, hardlink content aliases, aliases created after
+validation, hook fail-open, and capture/verify races remain residual boundaries. Use an
+observed read-only sandbox when hard isolation is required.
 
 ### Live corrections and completed-worker recovery
 
@@ -307,18 +364,24 @@ Command hooks run with ambient OS permissions rather than the reviewer sandbox; 
 shipped hooks are read-only and their workspace non-mutation behavior is tested, but
 their source should still be inspected before trust is granted.
 
-### Review epochs
+### Primary acceptance and review epochs
 
-Sol maps the complete sorted acceptance-ID array to primary evidence at one
-`CURRENT_STATE`; each record includes operation, normalized outcome, exit status,
-observed result, implementation owner, and artifact hashes. Sol hashes the bundle as
-`EVIDENCE_SHA256` and supplies its exact compact canonical preimage as `EVIDENCE_JSON`.
-Every record must be `passed` before a fresh or delta review is eligible. The reviewer
-recomputes the evidence hash and checks that its acceptance IDs and current state match
-the review packet. The first review of every
+Sol builds and validates the graph manifest and acceptance chain before the first worker spawn. At
+one `CURRENT_STATE`, Sol records exactly one
+primary evidence record for every contract-required verification; its operation,
+acceptance IDs, and implementation owner must exactly match the graph. Sol embeds the
+canonical chain and `ACCEPTANCE_CHAIN_SHA256` in `EVIDENCE_JSON`, and hashes
+that complete evidence as `EVIDENCE_SHA256`. Missing, extra, duplicate, forged, failed,
+or unavailable verification evidence cannot reach either acceptance mode.
+
+When the chain remains eligible for `primary`, Sol confirms all structural conditions
+still hold and accepts only the unchanged evidenced state without spawning another
+Sol. When it ends in `independent`, the reviewer recomputes
+every contract, manifest, decision, chain, and evidence hash, then matches contract
+references, acceptance IDs, and current state. The first review of every
 epoch uses a fresh Sol reviewer with no inherited turns. Its input closure binds every
-contract hash, the acceptance IDs, current state, evidence hash, accumulated delta,
-and risks.
+contract hash, `GRAPH_MANIFEST_SHA256`, `ACCEPTANCE_CHAIN_SHA256`, the acceptance IDs, current state, evidence
+hash, accumulated delta, and risks.
 
 If the reviewer returns `fix-first` and the contract remains unchanged, the owning
 worker implements the bounded fix, Sol refreshes evidence for the new state, and the
@@ -335,8 +398,8 @@ Requirements:
 
 - a current Codex CLI or desktop build with plugins, native subagents, and custom
   agents available;
-- access to the reviewer model and whichever worker model/effort combinations the user
-  or route selects;
+- access to whichever worker model/effort combinations the user or route selects,
+  plus the reviewer model when independent acceptance is required;
 - Git and Python 3.11 or newer.
 
 Clone the public repository, register that checkout as a marketplace, install the
@@ -363,8 +426,18 @@ shadowed by a differing same-name profile in the target config home or active pr
 
 ```text
 python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace>
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace> --upgrade
 python plugins/codex-cost-orchestrator/scripts/install_agents.py --target-dir <agents-directory> --workspace <active-workspace> --check
 ```
+
+`--upgrade` replaces only byte-exact profiles from known published CCO templates. It
+prepares all replacements and backups first, fails before writing if any selected file
+is unknown or user-modified, and rolls the selected batch back if a later replacement
+or exactness check fails. Same-directory hardlink backups restore the original file
+identity, bytes, mode, and mtime; rollback refuses to overwrite a destination whose
+identity or content changed. POSIX ctime and the final check/replace race are not
+claimed. A filesystem without same-directory hardlink support fails
+preparation before mutation.
 
 Repeat `--profile routine`, `--profile complex`, or `--profile reviewer` to install or
 check only the roles required by a particular graph. With no `--profile`, all three
@@ -415,19 +488,24 @@ environment variables, or arbitrary rollout payloads. Omit an expectation only f
 
 ## Update
 
-Version 0.3.0 introduces schema-checked CCO v4 packets, model-neutral worker templates,
-availability-aware route preferences, and pre-/post-dispatch hook guardrails. For a
-clean existing checkout:
+Version 0.4.0 closes every worker and evidence record over an immutable graph manifest
+and append-only primary/independent decision chain, adds hash-bound exact/prefix scopes with graph-wide
+collision and 128-scope gates, exact Git spelling and administrative-state coverage,
+treats submodules as atomic leases, enforces small run/follow-up caps, and makes
+known-template upgrades metadata-preserving and batch-rollback safe. For a clean existing
+checkout:
 
 ```text
 git pull --ff-only
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --upgrade
 python plugins/codex-cost-orchestrator/scripts/install_agents.py --check
 ```
 
-If a shipped profile changed, the exactness check fails rather than overwriting the
-installed copy. Inspect and deliberately reconcile the installed profile with the new
-template, rerun `--check`, and then start a new Codex task.
+The upgrade accepts only an exact known prior template, refuses unknown or
+user-modified profiles, and rolls back runtime I/O failures without retaining a partial
+profile set or changing original metadata. Inspect any refusal, reconcile it deliberately, rerun `--check`, and then
+start a new Codex task.
 
 ## Local verification
 

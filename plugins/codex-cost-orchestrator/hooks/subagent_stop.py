@@ -38,6 +38,8 @@ WORK_RESULT_FIELDS = (
     "CONTRACT_REV",
     "CONTRACT_SHA256",
     "INPUT_CLOSURE_SHA256",
+    "GRAPH_MANIFEST_SHA256",
+    "ACCEPTANCE_CHAIN_SHA256",
     "RUN",
     "ATTEMPT",
     "FOLLOWUP",
@@ -64,6 +66,8 @@ REVIEW_RESULT_FIELDS = (
     "ATTEMPT",
     "FOLLOWUP",
     "INPUT_CLOSURE_SHA256",
+    "GRAPH_MANIFEST_SHA256",
+    "ACCEPTANCE_CHAIN_SHA256",
     "ACCEPTANCE_IDS",
     "EVIDENCE_SHA256",
     "REVIEWED_STATE",
@@ -81,7 +85,7 @@ REVIEW_RESULT_ENUMS = {
 }
 SHA256_VALUE = re.compile(r"^sha256:[0-9a-f]{64}$")
 WORK_IDENTITY = re.compile(r"^[a-z0-9][a-z0-9_]*$")
-RUN_IDENTITY = re.compile(r"^run_([a-z0-9][a-z0-9_]*)_(r[0-9]{2,})$")
+RUN_IDENTITY = re.compile(r"^run_([a-z0-9][a-z0-9_]*)_(r0[1-3])$")
 EPOCH_IDENTITY = re.compile(r"^e[0-9]{2,}$")
 FAILURE_ID = re.compile(r"^[AV][0-9]{2,}$")
 FAILURE_CLASS = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -89,9 +93,12 @@ DIAGNOSTIC_ID = re.compile(r"^D[A-Z0-9_]{1,63}$")
 VERIFIED_LINE = re.compile(
     r"^- (V[0-9]{2,}) (\[A[0-9]{2,}(?:,A[0-9]{2,})*\]): (.+) => (.+)$"
 )
+FINDING_LINE = re.compile(r"^- (F[0-9]{2,}): .+$")
 WORK_RESULT_PATTERNS = {
     "CONTRACT_SHA256": SHA256_VALUE,
     "INPUT_CLOSURE_SHA256": SHA256_VALUE,
+    "GRAPH_MANIFEST_SHA256": SHA256_VALUE,
+    "ACCEPTANCE_CHAIN_SHA256": SHA256_VALUE,
     "NODE": WORK_IDENTITY,
     "RUN": WORK_IDENTITY,
     "LEASE": WORK_IDENTITY,
@@ -99,11 +106,17 @@ WORK_RESULT_PATTERNS = {
 REVIEW_RESULT_PATTERNS = {
     "EPOCH": EPOCH_IDENTITY,
     "INPUT_CLOSURE_SHA256": SHA256_VALUE,
+    "GRAPH_MANIFEST_SHA256": SHA256_VALUE,
+    "ACCEPTANCE_CHAIN_SHA256": SHA256_VALUE,
     "EVIDENCE_SHA256": SHA256_VALUE,
     "REVIEWED_STATE": SHA256_VALUE,
 }
 MAX_SAFE_INTEGER = (1 << 53) - 1
 MAX_SAFE_INTEGER_DIGITS = len(str(MAX_SAFE_INTEGER))
+MAX_WORKER_ATTEMPTS = 3
+MAX_WORKER_FOLLOWUPS = 2
+MAX_REVIEW_ATTEMPTS = 2
+MAX_REVIEW_FOLLOWUPS = 2
 WORK_LIST_FIELDS = frozenset(
     {"CHANGED", "VERIFIED", "JUDGMENT", "DEVIATIONS", "BLOCKERS"}
 )
@@ -119,7 +132,9 @@ def _integer_in_range(value: str, *, minimum: int) -> bool:
     return minimum <= parsed <= MAX_SAFE_INTEGER
 
 
-def _counter_in_range(value: str, *, minimum: int) -> bool:
+def _counter_in_range(
+    value: str, *, minimum: int, maximum_limit: int
+) -> bool:
     match = re.fullmatch(r"(0|[1-9][0-9]*)/([1-9][0-9]*)", value)
     if match is None:
         return False
@@ -127,7 +142,7 @@ def _counter_in_range(value: str, *, minimum: int) -> bool:
     if any(len(part) > MAX_SAFE_INTEGER_DIGITS for part in parts):
         return False
     current, limit = (int(part) for part in parts)
-    return minimum <= current <= limit <= MAX_SAFE_INTEGER
+    return minimum <= current <= limit <= maximum_limit
 
 
 def _optional_exit_status(value: str) -> bool:
@@ -185,10 +200,29 @@ def _valid_verified(value: str, status: str, accepted: str) -> bool:
     return covered == accepted_ids if status == "complete" else covered <= accepted_ids
 
 
+def _valid_findings(value: str, verdict: str) -> bool:
+    lines = value.split("\n")
+    if lines == ["- none"]:
+        return verdict not in {"fix-first", "rethink"}
+    identifiers: list[str] = []
+    for line in lines:
+        match = FINDING_LINE.fullmatch(line)
+        if match is None:
+            return False
+        identifiers.append(match.group(1))
+    if identifiers != sorted(set(identifiers)):
+        return False
+    return verdict != "ship"
+
+
 WORK_RESULT_VALIDATORS: dict[str, Callable[[str], bool]] = {
     "CONTRACT_REV": lambda value: _integer_in_range(value, minimum=1),
-    "ATTEMPT": lambda value: _counter_in_range(value, minimum=1),
-    "FOLLOWUP": lambda value: _counter_in_range(value, minimum=0),
+    "ATTEMPT": lambda value: _counter_in_range(
+        value, minimum=1, maximum_limit=MAX_WORKER_ATTEMPTS
+    ),
+    "FOLLOWUP": lambda value: _counter_in_range(
+        value, minimum=0, maximum_limit=MAX_WORKER_FOLLOWUPS
+    ),
     "LEASE_GENERATION": lambda value: _integer_in_range(value, minimum=1),
     "STOP_GENERATION": lambda value: _integer_in_range(value, minimum=0),
     "ACCEPTANCE_IDS": _valid_acceptance_ids,
@@ -196,8 +230,12 @@ WORK_RESULT_VALIDATORS: dict[str, Callable[[str], bool]] = {
     "FAILURE_DIAGNOSTIC_IDS": _valid_diagnostic_ids,
 }
 REVIEW_RESULT_VALIDATORS: dict[str, Callable[[str], bool]] = {
-    "ATTEMPT": lambda value: _counter_in_range(value, minimum=1),
-    "FOLLOWUP": lambda value: _counter_in_range(value, minimum=0),
+    "ATTEMPT": lambda value: _counter_in_range(
+        value, minimum=1, maximum_limit=MAX_REVIEW_ATTEMPTS
+    ),
+    "FOLLOWUP": lambda value: _counter_in_range(
+        value, minimum=0, maximum_limit=MAX_REVIEW_FOLLOWUPS
+    ),
     "ACCEPTANCE_IDS": _valid_acceptance_ids,
 }
 
@@ -228,6 +266,18 @@ def _valid_failure(fields: dict[str, str]) -> bool:
         or SHA256_VALUE.fullmatch(signature) is None
     ):
         return False
+    accepted_ids = set(_acceptance_ids(fields.get("ACCEPTANCE_IDS", "[]")))
+    if failure_id.startswith("A"):
+        if failure_id not in accepted_ids:
+            return False
+    else:
+        verification_ids = {
+            match.group(1)
+            for line in fields.get("VERIFIED", "").split("\n")
+            if (match := VERIFIED_LINE.fullmatch(line)) is not None
+        }
+        if failure_id not in verification_ids:
+            return False
     diagnostics = [] if diagnostics_value == "[]" else diagnostics_value[1:-1].split(",")
     payload = {
         "acceptance_or_verification_id": failure_id,
@@ -280,13 +330,32 @@ def _missing_fields(
             missing.append(name)
     if header == WORK_RESULT_HEADER:
         run_match = RUN_IDENTITY.fullmatch(fields.get("RUN", ""))
+        attempt_match = re.fullmatch(
+            r"(0|[1-9][0-9]*)/[1-9][0-9]*", fields.get("ATTEMPT", "")
+        )
+        attempt_current = (
+            int(attempt_match.group(1))
+            if attempt_match is not None
+            and len(attempt_match.group(1)) <= MAX_SAFE_INTEGER_DIGITS
+            else None
+        )
+        run_number = (
+            int(run_match.group(2)[1:])
+            if run_match is not None
+            and len(run_match.group(2)[1:]) <= MAX_SAFE_INTEGER_DIGITS
+            else None
+        )
         if (
             run_match is None
             or run_match.group(1) != fields.get("NODE")
             or fields.get("LEASE")
             != f"wl_{fields.get('NODE')}_{run_match.group(2)}"
+            or run_number != attempt_current
+            or run_match.group(2) != f"r{attempt_current:02d}"
         ):
-            missing.extend(name for name in ("RUN", "LEASE") if name not in missing)
+            missing.extend(
+                name for name in ("RUN", "ATTEMPT", "LEASE") if name not in missing
+            )
         if not _valid_failure(fields) and "FAILURE_SIGNATURE" not in missing:
             missing.append("FAILURE_SIGNATURE")
         verified = fields.get("VERIFIED")
@@ -300,6 +369,12 @@ def _missing_fields(
             and "VERIFIED" not in missing
         ):
             missing.append("VERIFIED")
+        blockers = fields.get("BLOCKERS", "")
+        if (
+            (status == "complete" and blockers != "- none")
+            or (status == "blocked" and blockers == "- none")
+        ) and "BLOCKERS" not in missing:
+            missing.append("BLOCKERS")
     else:
         followup = fields.get("FOLLOWUP", "")
         match = re.fullmatch(r"(0|[1-9][0-9]*)/[1-9][0-9]*", followup)
@@ -315,6 +390,10 @@ def _missing_fields(
             or (mode == "delta" and (current is None or current < 1))
         ) and "FOLLOWUP" not in missing:
             missing.append("FOLLOWUP")
+        if not _valid_findings(
+            fields.get("FINDINGS", ""), fields.get("VERDICT", "")
+        ) and "FINDINGS" not in missing:
+            missing.append("FINDINGS")
     return missing
 
 

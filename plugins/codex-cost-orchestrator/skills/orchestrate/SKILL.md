@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: "Default cost-aware implementation router for Codex. Use implicitly for medium or large features, bug fixes, refactors, multi-file or cross-module changes, risky code changes, or work needing delegated implementation and independent acceptance. Keep read-only requests and confidently atomic low-risk edits in Sol, and upgrade as soon as scope, uncertainty, or verification risk expands. Uses a Sol control plane, user-selectable worker model and effort, hash-bound contracts and inputs, bounded native subagents, generation-fenced leases, primary evidence, and fresh/delta review epochs."
+description: "Default cost-aware implementation router for Codex. Use implicitly for medium or large features, bug fixes, refactors, multi-file or cross-module changes, risky code changes, or work needing delegated implementation. Keep read-only requests and confidently atomic low-risk edits in Sol, and upgrade as soon as scope, uncertainty, or verification risk expands. Uses a Sol control plane, user-selectable worker model and effort, hash-bound contracts and inputs, bounded native subagents, generation-fenced leases, primary evidence, and structurally gated fresh/delta review epochs."
 ---
 
 # Codex Cost Orchestrator
@@ -11,9 +11,12 @@ closed implementation volume to the selected routine or complex leaf role. Let t
 user select each worker model and reasoning effort; apply cost-aware route defaults
 only when the user has not selected or requested native resolution.
 
-Read [references/runtime-gates.md](references/runtime-gates.md) before the first spawn
-in a task. Read [references/contracts-v4.md](references/contracts-v4.md) before creating
-the work graph or a review epoch. Do not repeat those references in worker messages.
+Read [references/worker-core.md](references/worker-core.md) before the first
+orchestrated spawn. Read [references/runtime-gates.md](references/runtime-gates.md)
+only for runtime/profile mismatch, route mismatch, permission/isolation concern, or
+workspace recovery. Read [references/contracts-v4.md](references/contracts-v4.md) only
+before concurrent Multi, a retry/live follow-up, or an independent review epoch. Do not
+repeat reference prose in worker messages.
 
 ## Default routing decision
 
@@ -35,8 +38,14 @@ Keep an implementation in the primary Sol session only when every condition hold
 - it does not alter a public interface, schema, migration, dependency boundary,
   authentication, authorization, security control, concurrency behavior, build,
   release, or destructive data path;
+- deterministic verification is contract-defined;
+- no enumerated `RISK_FLAGS` apply: `authentication_authorization`, `build_release`,
+  `concurrency`, `dependency_boundary`, `destructive_data`, `external_side_effect`,
+  `migration`, `nondeterministic_verification`, `public_interface`, `schema`, or
+  `security`;
 - no independent parallel node or specialist implementation judgment is useful;
-- one focused verification can provide proportionate acceptance evidence; and
+- one deterministic focused verification can provide proportionate acceptance evidence;
+  and
 - the worktree state and ownership are clear enough to avoid lease coordination.
 
 State the direct-route reason briefly, inspect the actual delta, and run focused
@@ -61,11 +70,13 @@ appears, the first verification fails for a non-trivial reason, diagnosis become
 systemic, the regression surface grows, or independent review becomes valuable.
 
 Retain the original `DIRECT_BASELINE`. Freeze and inspect the existing Sol delta,
-register it as a Sol-owned change set with exact paths and a state identifier, then
-use the current state as each new worker lease baseline. The final accumulated review
-must compare the finished state with `DIRECT_BASELINE` and include both the frozen Sol
-delta and every later worker delta. Do not let already-written work disappear behind
-a rebased lease or quietly continue under the old direct-route assumption.
+register it as an explicit `sol` contract node with hashed exact/prefix write scopes
+and a state identifier, then use the current state as each new worker lease baseline.
+The final accumulated review
+or primary acceptance closure must compare the finished state with `DIRECT_BASELINE`
+and include both the frozen Sol delta and every later worker delta. A Sol-owned node
+forces independent acceptance. Do not let already-written work disappear behind a
+rebased lease or quietly continue under the old direct-route assumption.
 
 ### User override
 
@@ -80,20 +91,30 @@ about review, isolation, tests, or acceptance evidence.
 
 ## Gate the session once
 
-This gate applies only to the orchestrated path. Require a primary Sol session, the
-reviewer, and each worker lane actually used by the work graph:
+This gate applies only to the orchestrated path. Require a primary Sol session, each
+worker lane actually used by the work graph, and the reviewer only when the latest
+acceptance decision is `independent`:
 
 - `cost_orchestrator_routine_worker`
 - `cost_orchestrator_complex_worker`
-- `cost_orchestrator_reviewer`
+- `cost_orchestrator_reviewer` when independent acceptance is required
 
 Run the companion-profile exactness check for the active workspace once per Codex task,
 not before every node. It must reject visible differing same-name roles in user or
 project config layers.
-Cache that result for the task unless a role is missing, runtime evidence conflicts, or
-the installed profiles change. Worker templates must be model-neutral; the reviewer
-remains pinned to Sol High and requests read-only. Require native spawn to expose the
-exact `agent_type` and every model/effort override field needed by the selected policy.
+Cache successful profile checks in a task-local checked set unless a role is missing,
+runtime evidence conflicts, or the installed profiles change. Worker templates must be
+model-neutral; the reviewer remains pinned to Sol High and requests read-only. Require
+native spawn to expose the exact `agent_type` and every model/effort override field
+needed by the selected policy.
+
+When a primary-to-independent upgrade occurs, check whether
+`cost_orchestrator_reviewer` is already in that cached checked set. If it is not, run
+the non-mutating
+`python scripts/install_agents.py --workspace <repo> --check --profile reviewer`
+check and record success before any fix or review. A failed reviewer profile check stops
+both actions until the reviewer profile is available; do not defer this check to the
+fresh reviewer spawn.
 
 Record `MODEL_POLICY` and `EFFORT_POLICY` independently as `user`, `route_default`, or
 `native`. User values win. The finite route-default order is Luna Max then Terra Max
@@ -124,18 +145,34 @@ verifiable nodes, each with:
 
 - a stable `NODE`, `CONTRACT_REV`, and canonical `CONTRACT_SHA256`;
 - a chained `INPUT_CLOSURE_SHA256` covering dispatch identity and bounded inputs;
-- dependencies and one lane;
+- dependencies and one `routine`, `complex`, or explicit Sol-owned lane;
 - a baseline-bound behavioral `LEASE`, `LEASE_GENERATION`, and `STOP_GENERATION`;
-- exact write paths, interfaces, discretion, exclusions, and stable acceptance IDs;
+- explicit hashed `exact` or `prefix` write scopes, interfaces, discretion,
+  exclusions, enumerated `RISK_FLAGS`, and stable acceptance IDs;
 - one implementation owner per acceptance ID and primary-Sol verification IDs;
 - finite attempt and follow-up limits fixed before dispatch; and
 - focused verification with concrete expected evidence.
 
-Construct both canonical JSON preimages with the protocol helper before formatting the
-readable packet. The trusted PreToolUse guardrail will rebuild the canonical contract
-and initial input preimages from the readable packet and recompute both hashes before
-native spawn. Include the exact `fork_turns` value in the input preimage; a different
-context fork is a different authority closure.
+Cap each worker contract revision at three runs; cap each individual worker run at two
+live follow-ups. Cap each review epoch at two fresh attempts; cap each reviewer thread
+at two delta follow-ups. Smaller limits are valid; never raise a cap to continue.
+
+Before the first worker spawn, build and validate an immutable full graph manifest and
+an append-only acceptance chain. Recompute every contract and manifest hash, require
+each acceptance owner to equal the node that declares it, reject duplicate global
+acceptance or verification IDs, reject overlapping or portable case-alias scopes, and
+limit the graph-wide distinct scope union to 128. Bind `GRAPH_MANIFEST_SHA256`, the
+canonical `ACCEPTANCE_CHAIN_JSON`, and `ACCEPTANCE_CHAIN_SHA256` into every worker
+initial closure. Use a `prefix` scope for one bounded
+generated directory instead of enumerating more than 128 files. Never derive exact
+versus prefix authority after hashing.
+
+Construct each canonical JSON preimage in Sol before formatting the readable packet;
+`protocol_hash.py` validates and hashes the submitted preimage, but does not construct
+it. The trusted PreToolUse guardrail will rebuild the canonical contract and initial
+input preimages from the readable packet and recompute every applicable protocol hash
+before native spawn. Include the exact `fork_turns` value in the input preimage; a
+different context fork is a different authority closure.
 
 Treat a lease as a control-plane promise, not an OS filesystem lock. Do not issue
 overlapping active leases. Preserve pre-existing dirty and untracked work. If an owned
@@ -149,6 +186,26 @@ every spawn, confirm that the same revision has one owner at most and is not alr
 accepted. A contract-preserving follow-up continues the recorded canonical task path;
 a new run consumes an attempt and must first fence and retire the old owner. Only the
 primary Sol session updates this ledger.
+
+## Select acceptance mode structurally
+
+Record revision 1 in the acceptance chain before dispatch. `primary` is eligible only
+for one routine contract with deterministic contract-defined verification, no public
+interface/schema, security, authorization, concurrency, build, release, migration, or
+destructive-data impact as enumerated contract risk flags, no Sol-owned change set, no concurrent Multi, and no explicit
+request for independent review. Primary Sol still inspects the actual delta, reruns
+acceptance-critical verification, builds complete passing evidence, and accepts only
+the unchanged exact state.
+
+Use `independent` before dispatch for every multi-node or complex graph, concurrent
+Multi, Sol-owned node, public or safety-sensitive boundary, non-deterministic/manual
+acceptance, or explicit review request. Monotonically upgrade `primary` to
+`independent` if a retry, live follow-up, deviation, scope surprise, routing mismatch,
+verification failure, partial result, blocked result, or material judgment appears. Append a
+revision-2 decision whose previous hash names revision 1; bind the resulting chain in
+all later packets and evidence. Never erase history or downgrade after the first worker
+spawn. This is a structural gate, not a cost,
+token, latency, or predicted-quality score.
 
 ## Route by contract closure
 
@@ -167,10 +224,10 @@ per-node model and effort policy only after the lane is structurally selected.
 Do not split tightly coupled work merely to create more cheap turns. Spawn workers
 concurrently only when at least two nodes are dependency-ready, every contract and
 input closure exists, leases are pairwise disjoint, acceptance ownership is complete,
-an independent review epoch is planned for the accumulated state, and native capacity
+the acceptance chain already ends in independent mode, and native capacity
 for at least two worker threads is observable and available. Otherwise use a
-single worker, serialize nodes, merge an artificial split, or keep unresolved work in
-Sol. File count, diff size, price, tokens, latency, request count, and predicted quality
+single worker, serialize still-disjoint nodes, merge overlapping or artificial nodes
+under one owner, or keep unresolved work in Sol. File count, diff size, price, tokens, latency, request count, and predicted quality
 are advisory signals, never hard Multi gates.
 
 ## Compile bounded context
@@ -181,10 +238,10 @@ binding parent turn. The initial cco.v4 work packet and latest valid hash-chaine
 follow-up supersede conversational history. A follow-up is a same-thread delta and is
 never sent as a standalone packet to a new or cold worker.
 
-Never use `fork_turns: all` with these custom roles. The pinned Codex source rejects
-the `agent_type` override on a full-history fork; model and effort overrides alone are
-valid there, but CCO always keeps its custom leaf role. A positive partial fork
-rebuilds child context, so use it for correctness rather than claiming a cache hit.
+Never use `fork_turns: all` with these custom roles. CCO uses only `none` or the
+smallest positive integer needed for correctness; other full-history and override
+combinations vary by Codex surface and are outside this contract. A positive partial
+fork rebuilds child context, so never claim that it produced a cache hit.
 
 Keep stable policy in role TOMLs and variable facts in packets. Do not restate the
 environment, permissions, plugin list, tool schema, role description, or complete diff.
@@ -214,6 +271,8 @@ or omit only the native-policy dimension. If the first route-default proposal is
 rejected before a thread exists, use only the next predeclared candidate; do not count
 that proposal as a worker run. Use `cost_orchestrator_complex_worker` for the complex
 lane. Record the returned canonical task path and address that exact path thereafter.
+Native V2 wait is targetless: after a mailbox update, identify the source against the
+single-flight ledger before accepting a result or issuing any target-bound operation.
 
 ## Continue live; respawn after completion
 
@@ -226,6 +285,8 @@ For a contract-preserving correction, verification request, or completion reques
   `PREVIOUS_INPUT_CLOSURE_SHA256` for the `CCO_WORK_FOLLOWUP cco.v4` delta; and
 - include compact canonical `BINDING_JSON` for the still-binding worker object so the
   continuation hook can recompute the new closure; and
+- include the current canonical acceptance chain; a follow-up from primary must append
+  the hash-linked `worker_followup` upgrade before dispatch; and
 - bind the complete acceptance-ID set and exact canonical native `TARGET`, then address
   that same target with `send_message`.
 
@@ -267,23 +328,32 @@ Treat worker reports as claims. Before integrating a node:
 5. Inspect the actual diff and material judgment calls.
 6. Run or directly observe acceptance-critical verification in the primary session;
    record its operation, exit status, observed outcome, and exact artifact hashes.
-7. Map every stable acceptance ID to that primary evidence at one `CURRENT_STATE`, then
-   compute `EVIDENCE_SHA256`.
+7. Revalidate the immutable graph manifest and complete append-only acceptance chain.
+8. Record exactly one primary evidence record for every globally unique required
+   verification, matching its contract-defined operation, acceptance IDs, and owner at
+   one `CURRENT_STATE`; then compute `GRAPH_MANIFEST_SHA256`,
+   `ACCEPTANCE_CHAIN_SHA256`, and `EVIDENCE_SHA256`.
 
 Do not accept a node from report text alone. Hooks and behavioral leases are
 detect-only controls; stop generations reject stale reports but cannot prevent late
 writes. Recheck the workspace even for a rejected result.
 
-## Run a review epoch
+## Run an independent review epoch when required
 
-After the accumulated implementation passes primary verification, start a fresh
-review epoch with a new reviewer, `fork_turns: none`, and `MODE: fresh`. Supply the
-fixed contract hashes, complete acceptance-ID array, baseline/current state, allowed
-paths, actual delta reference, `EVIDENCE_SHA256`, the exact compact canonical
-`EVIDENCE_JSON` preimage, and risks. Require the reviewer to recompute the evidence
-hash and match its acceptance IDs and current state before judgment. Hash this review
-input closure. Require `ship`, `fix-first`, or `rethink` for the exact closure and
-reviewed state.
+When the acceptance chain ends in `primary`, skip the reviewer spawn and accept only if
+all primary-mode eligibility remains true, every evidence record passes, and the
+workspace still equals the evidenced `CURRENT_STATE`.
+
+When the chain ends in `independent`, after the accumulated implementation passes
+primary verification, start a fresh review epoch with a new reviewer,
+`fork_turns: none`, and `MODE: fresh`. Supply the
+fixed contract references, `GRAPH_MANIFEST_SHA256`, `ACCEPTANCE_CHAIN_SHA256`, complete acceptance-ID array,
+baseline/current state, allowed paths, actual delta reference, `EVIDENCE_SHA256`, the
+exact compact canonical `EVIDENCE_JSON` preimage containing the full graph and decision history,
+and risks. Require the reviewer to recompute every contract hash, the manifest, every decision and chain hash, and
+the evidence hash, and to match its contract references, acceptance IDs, and current
+state before judgment. Hash this review input closure. Require `ship`, `fix-first`, or
+`rethink` for the exact closure and reviewed state.
 
 Count each fresh reviewer thread as a bounded `ATTEMPT` inside the fixed epoch and
 each delta turn as a bounded `FOLLOWUP`. A cold reviewer uses another fresh attempt;
@@ -312,9 +382,11 @@ Call a review OS-enforced read-only only when observed runtime sandbox metadata 
 - Direct: compare the final state with `DIRECT_BASELINE`, inspect every task-owned
   path, run focused verification, and report that no worker or review epoch was used.
 - Orchestrated: report completion only when every Sol-owned and worker-owned change set
-  is integrated, every acceptance ID has passing primary evidence in the exact current
-  evidence closure, and that unchanged state has a matching valid `ship` verdict.
-  Summarize changed paths, decisive verification, review mode, observed worker routing,
-  reviewer isolation, and residual risk.
+  is integrated, every contract-required verification has exactly one passing primary
+  evidence record in the exact current contract/evidence closure, and that unchanged
+  state either remains eligible for hashed `primary` acceptance or has a matching
+  independent `ship` verdict. Summarize changed paths, decisive verification,
+  acceptance mode, observed worker routing, reviewer isolation when used, and residual
+  risk.
 
 Never apply orchestrated-path acceptance claims to a no-write or direct result.

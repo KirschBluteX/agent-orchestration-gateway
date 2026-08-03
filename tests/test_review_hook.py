@@ -100,11 +100,14 @@ def complete_work_result(status: str = "complete") -> str:
     failure_id, failure_class, exit_status, diagnostics, signature = failure_fields(
         status
     )
+    blockers = "- Worker could not complete the closed contract" if status == "blocked" else "- none"
     return f"""CCO_WORK_RESULT cco.v4
 NODE: n01_auth
 CONTRACT_REV: 1
 CONTRACT_SHA256: sha256:{"a" * 64}
 INPUT_CLOSURE_SHA256: sha256:{"b" * 64}
+GRAPH_MANIFEST_SHA256: sha256:{"c" * 64}
+ACCEPTANCE_CHAIN_SHA256: sha256:{"d" * 64}
 RUN: run_n01_auth_r01
 ATTEMPT: 1/2
 FOLLOWUP: 0/1
@@ -127,24 +130,27 @@ JUDGMENT:
 DEVIATIONS:
 - none
 BLOCKERS:
-- none
+{blockers}
 """
 
 
 def complete_review_result(verdict: str = "ship") -> str:
+    findings = "- none" if verdict == "ship" else "- F01: Contract-preserving fix required"
     return f"""CCO_REVIEW_RESULT cco.v4
 EPOCH: e01
 MODE: fresh
 ATTEMPT: 1/2
 FOLLOWUP: 0/1
 INPUT_CLOSURE_SHA256: sha256:{"c" * 64}
+GRAPH_MANIFEST_SHA256: sha256:{"a" * 64}
+ACCEPTANCE_CHAIN_SHA256: sha256:{"b" * 64}
 ACCEPTANCE_IDS: [A01]
 EVIDENCE_SHA256: sha256:{"d" * 64}
 REVIEWED_STATE: sha256:{"e" * 64}
 VERDICT: {verdict}
 REASON: Acceptance evidence matches the reviewed state.
 FINDINGS:
-- none
+{findings}
 RESIDUAL_RISK:
 - none
 """
@@ -217,7 +223,7 @@ class ReviewHookBehaviorTests(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertEqual(output["decision"], "block")
         self.assertIn("missing:", output["reason"])
-        self.assertIn("RUN", output["reason"])
+        self.assertIn("GRAPH_MANIFEST_SHA256", output["reason"])
 
     def test_worker_result_without_run_identity_is_incomplete(self) -> None:
         message = complete_work_result().replace("RUN: run_n01_auth_r01\n", "")
@@ -271,6 +277,41 @@ class ReviewHookBehaviorTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_result_status_and_verdict_require_coherent_issue_lists(self) -> None:
+        cases = (
+            (
+                "cost_orchestrator_routine_worker",
+                complete_work_result().replace(
+                    "BLOCKERS:\n- none", "BLOCKERS:\n- required work remains"
+                ),
+            ),
+            (
+                "cost_orchestrator_reviewer",
+                complete_review_result().replace(
+                    "FINDINGS:\n- none", "FINDINGS:\n- F01: release blocker"
+                ),
+            ),
+            (
+                "cost_orchestrator_reviewer",
+                complete_review_result("fix-first").replace(
+                    "FINDINGS:\n- F01: Contract-preserving fix required",
+                    "FINDINGS:\n- none",
+                ),
+            ),
+        )
+        for agent_type, message in cases:
+            with self.subTest(agent_type=agent_type, message=message[-120:]):
+                result = run_hook(
+                    {
+                        "hook_event_name": "SubagentStop",
+                        "stop_hook_active": False,
+                        "agent_type": agent_type,
+                        "last_assistant_message": message,
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
     def test_hook_decodes_outer_json_as_utf8_before_result_validation(self) -> None:
         message = complete_work_result().replace(
@@ -348,6 +389,42 @@ class ReviewHookBehaviorTests(unittest.TestCase):
                 self.assertEqual(output["decision"], "block")
                 self.assertIn(field, output["reason"])
 
+    def test_result_counters_are_small_and_run_suffix_is_canonical(self) -> None:
+        cases = (
+            (
+                "cost_orchestrator_routine_worker",
+                complete_work_result().replace("ATTEMPT: 1/2", "ATTEMPT: 1/4"),
+            ),
+            (
+                "cost_orchestrator_routine_worker",
+                complete_work_result().replace("FOLLOWUP: 0/1", "FOLLOWUP: 0/3"),
+            ),
+            (
+                "cost_orchestrator_routine_worker",
+                complete_work_result().replace("r01", "r001"),
+            ),
+            (
+                "cost_orchestrator_reviewer",
+                complete_review_result().replace("ATTEMPT: 1/2", "ATTEMPT: 1/3"),
+            ),
+            (
+                "cost_orchestrator_reviewer",
+                complete_review_result().replace("FOLLOWUP: 0/1", "FOLLOWUP: 0/3"),
+            ),
+        )
+        for agent_type, message in cases:
+            with self.subTest(agent_type=agent_type, message=message[:160]):
+                result = run_hook(
+                    {
+                        "hook_event_name": "SubagentStop",
+                        "stop_hook_active": False,
+                        "agent_type": agent_type,
+                        "last_assistant_message": message,
+                    }
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
     def test_acceptance_ids_must_be_nonempty_sorted_and_unique(self) -> None:
         for acceptance_ids in ("[]", "[A02,A01]", "[A01,A01]", "[acceptance]"):
             with self.subTest(acceptance_ids=acceptance_ids):
@@ -402,6 +479,37 @@ class ReviewHookBehaviorTests(unittest.TestCase):
                 output = json.loads(result.stdout)
                 self.assertEqual(output["decision"], "block")
                 self.assertIn("FAILURE_SIGNATURE", output["reason"])
+
+    def test_failure_id_must_belong_to_the_result_acceptance_or_verification_closure(self) -> None:
+        original_signature = failure_fields("blocked")[-1]
+        for failure_id in ("A99", "V99"):
+            with self.subTest(failure_id=failure_id):
+                payload_value: dict[str, object] = {
+                    "acceptance_or_verification_id": failure_id,
+                    "contract_sha256": "sha256:" + "a" * 64,
+                    "diagnostic_ids": ["D_TEST_FAILED"],
+                    "exit_status": 1,
+                    "failure_class": "verification_failed",
+                    "node": "n01_auth",
+                    "protocol": "cco.v4",
+                }
+                message = complete_work_result("blocked").replace(
+                    "FAILURE_ACCEPTANCE_OR_VERIFICATION_ID: V01",
+                    f"FAILURE_ACCEPTANCE_OR_VERIFICATION_ID: {failure_id}",
+                ).replace(
+                    f"FAILURE_SIGNATURE: {original_signature}",
+                    f"FAILURE_SIGNATURE: {protocol_hash('failure', payload_value)}",
+                )
+
+                result = run_hook(
+                    subagent_stop_payload(
+                        agent_type="cost_orchestrator_routine_worker",
+                        last_assistant_message=message,
+                    )
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
     def test_verified_requires_verification_and_acceptance_ids(self) -> None:
         cases = (
@@ -495,6 +603,9 @@ class ReviewHookBehaviorTests(unittest.TestCase):
             complete_work_result().replace(
                 "LEASE: wl_n01_auth_r01", "LEASE: wl_n01_auth_r02"
             ),
+            complete_work_result()
+            .replace("RUN: run_n01_auth_r01", "RUN: run_n01_auth_r99")
+            .replace("LEASE: wl_n01_auth_r01", "LEASE: wl_n01_auth_r99"),
         )
         for message in cases:
             with self.subTest(message=message.splitlines()[5:9]):

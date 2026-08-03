@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Install role-bounded Codex agent profiles without overwriting user files."""
+"""Install role-bounded Codex profiles without overwriting user-owned files."""
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
+import secrets
+import stat
 import sys
 import tempfile
 import tomllib
@@ -21,6 +25,47 @@ PROFILE_AGENT_NAMES = {
     "complex": "cost_orchestrator_complex_worker",
     "reviewer": "cost_orchestrator_reviewer",
 }
+LEGACY_PROFILE_SHA256 = {
+    "codex-cost-orchestrator-routine-worker.toml": frozenset(
+        {
+            "2c5b1716312ad7be52eaec26676b52c1a5168cb1d3c602d39a82f907b4afa93d",
+            "c9b2187367ab1c167cae594bf589c74adb3b8959c3c4292751117aec820cdc21",
+            "bc8ce4bfb9b58b0fac32272f60456b3b327f1d21427dd8e01dff5fd22ac5ceb5",
+        }
+    ),
+    "codex-cost-orchestrator-complex-worker.toml": frozenset(
+        {
+            "881c3b606c1e9092a96e79ad85bd5b57fef97156f4838a26b18191d18bfee681",
+            "e50aadfd85e83841750cea5af5b076e746e7bfddf63cc3f24c27beddc9b8a851",
+            "cca439e5c44163be360c665c18fbd9a1641fcd3e28d1488ef60e5ce0b58eb884",
+        }
+    ),
+    "codex-cost-orchestrator-reviewer.toml": frozenset(
+        {
+            "015c8fe9da8b92a24f021120e71f6b0e3e0bfb10244ba529f7ff8981ce179e00",
+            "395a35427315e71b37227a79ac38889aa9f102eebf7dbdb78d9ae86b510ee9bc",
+            "1df307612992239960b4dececd79f6f1935b42662983204d350cb7ed519528b8",
+        }
+    ),
+}
+
+
+class InstallTransactionError(Exception):
+    pass
+
+
+@dataclass
+class PreparedChange:
+    filename: str
+    destination: Path
+    template_bytes: bytes
+    kind: str
+    staged_path: Path | None
+    backup_path: Path | None
+    source_identity: tuple[int, int] | None = None
+    source_sha256: str | None = None
+    applied_identity: tuple[int, int] | None = None
+    applied: bool = False
 
 
 def default_target() -> Path:
@@ -29,11 +74,168 @@ def default_target() -> Path:
 
 
 def is_real_file(path: Path) -> bool:
-    return path.is_file() and not path.is_symlink()
+    return path.is_file() and not is_reparse(path)
+
+
+def is_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    is_junction = getattr(path, "is_junction", lambda: False)()
+    return (
+        stat.S_ISLNK(metadata.st_mode)
+        or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+        or is_junction
+    )
 
 
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def stage_bytes(target: Path, contents: bytes, prefix: str) -> Path:
+    with tempfile.NamedTemporaryFile(
+        mode="wb", prefix=prefix, dir=target, delete=False
+    ) as staged:
+        staged.write(contents)
+        staged.flush()
+        os.fsync(staged.fileno())
+        return Path(staged.name)
+
+
+def file_identity(path: Path) -> tuple[int, int]:
+    metadata = path.stat(follow_symlinks=False)
+    return metadata.st_dev, metadata.st_ino
+
+
+def stage_hardlink(target: Path, source: Path, prefix: str) -> Path:
+    """Retain the original inode and metadata under a transaction-only name."""
+    for _attempt in range(100):
+        backup = target / f"{prefix}{secrets.token_hex(16)}"
+        try:
+            os.link(source, backup)
+            return backup
+        except FileExistsError:
+            continue
+    raise InstallTransactionError("could not reserve an upgrade backup path")
+
+
+def cleanup_prepared(changes: list[PreparedChange]) -> None:
+    for change in changes:
+        for path in (change.staged_path, change.backup_path):
+            if path is None:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def prepare_change(
+    target: Path,
+    filename: str,
+    destination: Path,
+    template_bytes: bytes,
+    kind: str,
+    source_identity: tuple[int, int] | None = None,
+    source_sha256: str | None = None,
+) -> PreparedChange:
+    staged_path: Path | None = None
+    backup_path: Path | None = None
+    try:
+        staged_path = stage_bytes(
+            target, template_bytes, ".cost-orchestrator-agent-"
+        )
+        if kind == "upgrade":
+            if (
+                source_identity is None
+                or source_sha256 is None
+                or not is_real_file(destination)
+                or file_identity(destination) != source_identity
+                or file_sha256(destination) != source_sha256
+            ):
+                raise InstallTransactionError(
+                    f"destination changed before upgrade preparation: {destination}"
+                )
+            backup_path = stage_hardlink(
+                target,
+                destination,
+                ".cost-orchestrator-backup-",
+            )
+            if not os.path.samefile(destination, backup_path):
+                raise InstallTransactionError(
+                    f"destination changed during upgrade preparation: {destination}"
+                )
+        return PreparedChange(
+            filename=filename,
+            destination=destination,
+            template_bytes=template_bytes,
+            kind=kind,
+            staged_path=staged_path,
+            backup_path=backup_path,
+            source_identity=source_identity,
+            source_sha256=source_sha256,
+        )
+    except (OSError, InstallTransactionError):
+        for path in (staged_path, backup_path):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise
+
+
+def rollback_prepared(changes: list[PreparedChange]) -> list[str]:
+    errors: list[str] = []
+    for change in reversed(changes):
+        if not change.applied:
+            continue
+        try:
+            if change.kind == "upgrade":
+                if change.backup_path is None:
+                    raise InstallTransactionError("upgrade backup is unavailable")
+                if (
+                    not is_real_file(change.destination)
+                    or change.applied_identity is None
+                    or file_identity(change.destination) != change.applied_identity
+                    or change.destination.read_bytes() != change.template_bytes
+                ):
+                    raise InstallTransactionError(
+                        "upgraded destination changed before rollback"
+                    )
+                os.replace(change.backup_path, change.destination)
+                change.backup_path = None
+            elif (
+                is_real_file(change.destination)
+                and change.applied_identity is not None
+                and file_identity(change.destination) == change.applied_identity
+                and change.destination.read_bytes() == change.template_bytes
+            ):
+                change.destination.unlink()
+            else:
+                raise InstallTransactionError(
+                    "new destination changed before rollback"
+                )
+            change.applied = False
+        except (OSError, InstallTransactionError) as error:
+            errors.append(f"rollback failed for {change.destination}: {error}")
+    return errors
+
+
+def same_path(left: Path, right: Path) -> bool:
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+            os.path.abspath(right)
+        )
 
 
 def template_error(path: Path, profile: str) -> str | None:
@@ -80,6 +282,7 @@ def shadow_errors(
     templates: Path,
     selected_profiles: tuple[str, ...],
     config_home: Path,
+    installed_target: Path,
 ) -> list[str]:
     """Reject active project-layer role files that replace shipped authority."""
     expected = {
@@ -92,6 +295,10 @@ def shadow_errors(
     except ValueError:
         return [f"workspace is not a directory: {workspace}"]
     resolved_home = Path(os.path.abspath(config_home.expanduser()))
+    managed_destinations = {
+        Path(os.path.abspath((installed_target / PROFILE_FILENAMES[profile]).expanduser()))
+        for profile in selected_profiles
+    }
     if resolved_home not in config_folders:
         config_folders.append(resolved_home)
 
@@ -100,6 +307,11 @@ def shadow_errors(
         if agents_dir.is_dir() and not agents_dir.is_symlink():
             for candidate in agents_dir.rglob("*.toml"):
                 if not is_real_file(candidate):
+                    continue
+                if any(
+                    same_path(candidate, destination)
+                    for destination in managed_destinations
+                ):
                     continue
                 try:
                     value = tomllib.loads(candidate.read_text(encoding="utf-8"))
@@ -160,6 +372,11 @@ def parse_args() -> argparse.Namespace:
         help="Verify exact installed copies without creating files.",
     )
     parser.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="Atomically replace only byte-identical profiles from known prior CCO releases.",
+    )
+    parser.add_argument(
         "--profile",
         action="append",
         choices=tuple(PROFILE_FILENAMES),
@@ -172,6 +389,7 @@ def install(
     target: Path,
     *,
     check_only: bool,
+    upgrade: bool = False,
     profiles: list[str] | None = None,
     workspace: Path | None = None,
 ) -> int:
@@ -196,11 +414,15 @@ def install(
             fail(semantic_error)
             return 1
 
-    errors = shadow_errors(workspace, templates, selected_profiles, target.parent)
-    if target.exists() or target.is_symlink():
-        if not target.is_dir() or target.is_symlink():
+    errors = shadow_errors(
+        workspace, templates, selected_profiles, target.parent, target
+    )
+    if target.exists() or is_reparse(target):
+        if not target.is_dir() or is_reparse(target):
             errors.append(f"target directory is not a real directory: {target}")
 
+    upgrade_destinations: set[Path] = set()
+    upgrade_expectations: dict[Path, tuple[tuple[int, int], str]] = {}
     for filename in filenames:
         template = templates / filename
         destination = target / filename
@@ -210,9 +432,18 @@ def install(
                     f"destination is not a regular file and will not be replaced: {destination}"
                 )
             elif destination.read_bytes() != template.read_bytes():
-                errors.append(
-                    f"destination differs from the shipped template and will not be overwritten: {destination}"
-                )
+                if upgrade and file_sha256(destination) in LEGACY_PROFILE_SHA256.get(
+                    filename, frozenset()
+                ):
+                    upgrade_destinations.add(destination)
+                    upgrade_expectations[destination] = (
+                        file_identity(destination),
+                        file_sha256(destination),
+                    )
+                else:
+                    errors.append(
+                        f"destination differs from the shipped template and will not be overwritten: {destination}"
+                    )
         elif check_only:
             errors.append(f"required installed agent file is missing: {destination}")
 
@@ -226,40 +457,99 @@ def install(
         print(f"CHECK PASSED: selected agent profiles ({names}) exactly match {templates}.")
         return 0
 
-    target.mkdir(parents=True, exist_ok=True)
-    for filename in filenames:
-        template = templates / filename
-        destination = target / filename
-        if destination.exists():
-            print(f"ALREADY CURRENT: {destination}")
-            continue
+    target_existed = target.exists()
+    changes: list[PreparedChange] = []
+    current_destinations: list[Path] = []
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        if is_reparse(target) or not target.is_dir():
+            raise InstallTransactionError(
+                f"target directory changed before installation: {target}"
+            )
+        for filename in filenames:
+            template = templates / filename
+            destination = target / filename
+            template_bytes = template.read_bytes()
+            if destination.exists() and destination not in upgrade_destinations:
+                current_destinations.append(destination)
+                continue
+            kind = "upgrade" if destination in upgrade_destinations else "install"
+            expected_identity, expected_sha256 = upgrade_expectations.get(
+                destination, (None, None)
+            )
+            changes.append(
+                prepare_change(
+                    target,
+                    filename,
+                    destination,
+                    template_bytes,
+                    kind,
+                    expected_identity,
+                    expected_sha256,
+                )
+            )
 
-        staged_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", prefix=".cost-orchestrator-agent-", dir=target, delete=False
-            ) as staged:
-                staged.write(template.read_bytes())
-                staged.flush()
-                os.fsync(staged.fileno())
-                staged_path = Path(staged.name)
+        for change in changes:
+            if change.staged_path is None:
+                raise InstallTransactionError("staged profile is unavailable")
+            if change.kind == "upgrade":
+                if (
+                    not is_real_file(change.destination)
+                    or change.backup_path is None
+                    or not os.path.samefile(change.destination, change.backup_path)
+                    or file_identity(change.destination) != change.source_identity
+                    or file_sha256(change.destination) != change.source_sha256
+                ):
+                    raise InstallTransactionError(
+                        f"destination changed during upgrade: {change.destination}"
+                    )
+                change.applied_identity = file_identity(change.staged_path)
+                os.replace(change.staged_path, change.destination)
+                change.staged_path = None
+                change.applied = True
+            else:
+                try:
+                    change.applied_identity = file_identity(change.staged_path)
+                    os.link(change.staged_path, change.destination)
+                    change.applied = True
+                except FileExistsError:
+                    if (
+                        not is_real_file(change.destination)
+                        or change.destination.read_bytes() != change.template_bytes
+                    ):
+                        raise InstallTransactionError(
+                            f"destination changed during installation: {change.destination}"
+                        )
+
+        for filename in filenames:
+            template = templates / filename
+            destination = target / filename
+            if (
+                not is_real_file(destination)
+                or destination.read_bytes() != template.read_bytes()
+            ):
+                raise InstallTransactionError(
+                    f"post-install exactness check failed: {destination}"
+                )
+    except (OSError, InstallTransactionError) as error:
+        rollback_errors = rollback_prepared(changes)
+        cleanup_prepared(changes)
+        if not target_existed:
             try:
-                os.link(staged_path, destination)
-            except FileExistsError:
-                if not is_real_file(destination) or destination.read_bytes() != template.read_bytes():
-                    fail(f"destination changed during installation: {destination}")
-                    return 1
-            print(f"INSTALLED: {destination}")
-        finally:
-            if staged_path is not None:
-                staged_path.unlink(missing_ok=True)
+                target.rmdir()
+            except OSError:
+                pass
+        fail(f"profile batch installation failed: {error}")
+        for rollback_error in rollback_errors:
+            fail(rollback_error)
+        return 1
 
-    for filename in filenames:
-        template = templates / filename
-        destination = target / filename
-        if not is_real_file(destination) or destination.read_bytes() != template.read_bytes():
-            fail(f"post-install exactness check failed: {destination}")
-            return 1
+    cleanup_prepared(changes)
+    for destination in current_destinations:
+        print(f"ALREADY CURRENT: {destination}")
+    for change in changes:
+        action = "UPGRADED" if change.kind == "upgrade" else "INSTALLED"
+        print(f"{action}: {change.destination}")
 
     names = ", ".join(selected_profiles)
     print(f"INSTALL PASSED: selected agent profiles ({names}) exactly match {templates}.")
@@ -268,12 +558,20 @@ def install(
 
 def main() -> int:
     args = parse_args()
-    return install(
-        args.target_dir,
-        check_only=args.check,
-        profiles=args.profile,
-        workspace=args.workspace,
-    )
+    if args.check and args.upgrade:
+        fail("--check and --upgrade are mutually exclusive")
+        return 1
+    try:
+        return install(
+            args.target_dir,
+            check_only=args.check,
+            upgrade=args.upgrade,
+            profiles=args.profile,
+            workspace=args.workspace,
+        )
+    except (OSError, ValueError) as error:
+        fail(f"profile installation could not start: {error}")
+        return 1
 
 
 if __name__ == "__main__":

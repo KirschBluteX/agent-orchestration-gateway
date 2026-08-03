@@ -22,6 +22,8 @@ NODE: <node>
 CONTRACT_REV: <revision>
 CONTRACT_SHA256: <contract-hash>
 INPUT_CLOSURE_SHA256: <latest-input-hash>
+GRAPH_MANIFEST_SHA256: <graph-manifest-hash>
+ACCEPTANCE_CHAIN_SHA256: <latest-acceptance-chain-hash>
 RUN: <run>
 ATTEMPT: <current>/<finite-limit>
 FOLLOWUP: <current>/<finite-limit>

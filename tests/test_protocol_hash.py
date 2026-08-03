@@ -14,6 +14,8 @@ HELPER = (
     / "scripts"
     / "protocol_hash.py"
 )
+sys.path.insert(0, str(HELPER.parent))
+from protocol_hash import ProtocolHashError, digest  # noqa: E402
 
 
 def valid_contract() -> dict[str, object]:
@@ -33,6 +35,7 @@ def valid_contract() -> dict[str, object]:
         "node": "n01_protocol_hash",
         "objective": "Validate canonical CCO v4 preimages",
         "protocol": "cco.v4",
+        "risk_flags": [],
         "verification": [
             {
                 "acceptance_ids": ["A01"],
@@ -42,15 +45,65 @@ def valid_contract() -> dict[str, object]:
             }
         ],
         "write": [
-            "plugins/codex-cost-orchestrator/scripts/protocol_hash.py",
-            "tests/test_protocol_hash.py",
+            {
+                "kind": "exact",
+                "path": "plugins/codex-cost-orchestrator/scripts/protocol_hash.py",
+            },
+            {"kind": "exact", "path": "tests/test_protocol_hash.py"},
         ],
     }
 
 
+def valid_graph_manifest() -> dict[str, object]:
+    contract = valid_contract()
+    return {
+        "acceptance_owners": [
+            {
+                "acceptance_id": "A01",
+                "implementation_owner": "n01_protocol_hash",
+            }
+        ],
+        "contracts": [
+            {
+                "contract": contract,
+                "contract_sha256": digest("contract", contract),
+            }
+        ],
+        "protocol": "cco.v4",
+    }
+
+
+def valid_acceptance_chain(*, mode: str = "primary") -> dict[str, object]:
+    manifest = valid_graph_manifest()
+    manifest_sha256 = digest("graph_manifest", manifest)
+    reasons = [] if mode == "primary" else ["explicit_independent_review"]
+    decision = {
+        "graph_manifest_sha256": manifest_sha256,
+        "mode": mode,
+        "previous_decision_sha256": None,
+        "protocol": "cco.v4",
+        "reasons": reasons,
+        "revision": 1,
+    }
+    return {
+        "decisions": [
+            {
+                "decision": decision,
+                "decision_sha256": digest("acceptance_decision", decision),
+            }
+        ],
+        "graph_manifest": manifest,
+        "graph_manifest_sha256": manifest_sha256,
+        "protocol": "cco.v4",
+    }
+
+
 def valid_evidence() -> dict[str, object]:
+    acceptance_chain = valid_acceptance_chain(mode="independent")
     return {
         "acceptance_ids": ["A01"],
+        "acceptance_chain": acceptance_chain,
+        "acceptance_chain_sha256": digest("acceptance_chain", acceptance_chain),
         "current_state": "sha256:" + "b" * 64,
         "protocol": "cco.v4",
         "records": [
@@ -69,7 +122,10 @@ def valid_evidence() -> dict[str, object]:
 
 
 def valid_worker_initial() -> dict[str, object]:
+    manifest = valid_graph_manifest()
+    chain = valid_acceptance_chain()
     return {
+        "acceptance_chain_sha256": digest("acceptance_chain", chain),
         "attempt": {"current": 1, "limit": 2},
         "acceptance_ids": ["A01"],
         "baseline": "sha256:" + "d" * 64,
@@ -84,6 +140,7 @@ def valid_worker_initial() -> dict[str, object]:
         "effort_policy": "native",
         "fork_turns": "none",
         "followup": {"current": 0, "limit": 1},
+        "graph_manifest_sha256": digest("graph_manifest", manifest),
         "kind": "worker_initial",
         "lease": "wl_n01_protocol_hash_r01",
         "lease_generation": 1,
@@ -106,6 +163,7 @@ def valid_worker_followup() -> dict[str, object]:
         if key not in {"followup", "kind", "protocol"}
     }
     return {
+        "acceptance_chain_sha256": initial["acceptance_chain_sha256"],
         "binding": binding,
         "delta": ["Run the focused protocol-hash test."],
         "followup": {"current": 1, "limit": 1},
@@ -126,25 +184,22 @@ def valid_worker_followup() -> dict[str, object]:
 
 
 def valid_review_fresh() -> dict[str, object]:
+    chain = valid_acceptance_chain(mode="independent")
+    manifest = chain["graph_manifest"]
+    contract_record = manifest["contracts"][0]
+    contract = contract_record["contract"]
     return {
-        "acceptance": [
-            {
-                "criterion": "CLI returns a domain-separated digest",
-                "id": "A01",
-            }
-        ],
+        "acceptance": deepcopy(contract["acceptance"]),
         "acceptance_ids": ["A01"],
         "accumulated_delta": ["protocol hash schema implementation"],
-        "allowed_paths": [
-            "plugins/codex-cost-orchestrator/scripts/protocol_hash.py",
-            "tests/test_protocol_hash.py",
-        ],
+        "allowed_paths": deepcopy(contract["write"]),
         "attempt": {"current": 1, "limit": 2},
+        "acceptance_chain_sha256": digest("acceptance_chain", chain),
         "baseline": "sha256:" + "3" * 64,
         "contracts": [
             {
                 "contract_rev": 1,
-                "contract_sha256": "sha256:" + "4" * 64,
+                "contract_sha256": contract_record["contract_sha256"],
                 "node": "n01_protocol_hash",
             }
         ],
@@ -154,7 +209,8 @@ def valid_review_fresh() -> dict[str, object]:
         "followup": {"current": 0, "limit": 1},
         "fork_turns": "none",
         "goal": "Validate canonical CCO v4 preimages",
-        "interfaces": ["protocol_hash.py hash --domain input_closure"],
+        "graph_manifest_sha256": digest("graph_manifest", manifest),
+        "interfaces": deepcopy(contract["interfaces"]),
         "kind": "review_fresh",
         "open_risks": [],
         "protocol": "cco.v4",
@@ -162,14 +218,18 @@ def valid_review_fresh() -> dict[str, object]:
 
 
 def valid_review_delta() -> dict[str, object]:
+    chain = valid_acceptance_chain(mode="independent")
+    manifest = chain["graph_manifest"]
+    contract_record = manifest["contracts"][0]
     return {
         "acceptance_ids": ["A01"],
+        "acceptance_chain_sha256": digest("acceptance_chain", chain),
         "attempt": {"current": 1, "limit": 2},
         "contract_status": "preserved",
         "contracts": [
             {
                 "contract_rev": 1,
-                "contract_sha256": "sha256:" + "4" * 64,
+                "contract_sha256": contract_record["contract_sha256"],
                 "node": "n01_protocol_hash",
             }
         ],
@@ -178,6 +238,7 @@ def valid_review_delta() -> dict[str, object]:
         "epoch": "e01",
         "evidence_sha256": "sha256:" + "8" * 64,
         "followup": {"current": 1, "limit": 1},
+        "graph_manifest_sha256": digest("graph_manifest", manifest),
         "kind": "review_delta",
         "open_risks": [],
         "previous_input_closure_sha256": "sha256:" + "9" * 64,
@@ -234,14 +295,317 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             result.stdout.strip(),
-            "sha256:1e8288d57193a008be6dfd0a60997ce62bf7e0c8ceb39014aa701062f8f12998",
+            "sha256:1e9af0d5512998e82580f308ab44220d382dd025fb5683d4b975d38ac64cea94",
         )
+
+    def test_exact_and_prefix_scope_kinds_have_distinct_contract_identities(self) -> None:
+        exact = valid_contract()
+        exact["write"] = [{"kind": "exact", "path": "generated"}]
+        prefix = valid_contract()
+        prefix["write"] = [{"kind": "prefix", "path": "generated"}]
+
+        exact_result = self.hash_value(exact)
+        prefix_result = self.hash_value(prefix)
+
+        self.assertEqual(exact_result.returncode, 0, exact_result.stderr)
+        self.assertEqual(prefix_result.returncode, 0, prefix_result.stderr)
+        self.assertNotEqual(exact_result.stdout, prefix_result.stdout)
+
+    def test_contract_rejects_legacy_untyped_write_paths(self) -> None:
+        contract = valid_contract()
+        contract["write"] = ["src/auth.py"]
+
+        result = self.hash_value(contract)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("scope", result.stderr)
 
     def test_contract_domain_rejects_an_object_that_is_not_a_v4_contract(self) -> None:
         result = self.hash_value({"objective": "ship"})
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("contract", result.stderr)
+
+    def test_graph_manifest_recomputes_every_full_contract_hash(self) -> None:
+        result = self.hash_value(valid_graph_manifest(), "graph_manifest")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^sha256:[0-9a-f]{64}$")
+
+        tampered = valid_graph_manifest()
+        tampered["contracts"][0]["contract"]["objective"] = "Tampered objective"
+        result = self.hash_value(tampered, "graph_manifest")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("does not match contract", result.stderr)
+
+        duplicate_verification = valid_graph_manifest()
+        second_contract = deepcopy(valid_contract())
+        second_contract["node"] = "n02_other"
+        second_contract["acceptance"][0]["id"] = "A02"
+        second_contract["verification"][0]["acceptance_ids"] = ["A02"]
+        duplicate_verification["contracts"].append(
+            {
+                "contract": second_contract,
+                "contract_sha256": digest("contract", second_contract),
+            }
+        )
+        duplicate_verification["acceptance_owners"].append(
+            {
+                "acceptance_id": "A02",
+                "implementation_owner": "n02_other",
+            }
+        )
+        result = self.hash_value(duplicate_verification, "graph_manifest")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("globally unique", result.stderr)
+
+    def test_worker_initial_binds_the_full_graph_and_acceptance_chain(self) -> None:
+        manifest = valid_graph_manifest()
+        chain = valid_acceptance_chain()
+        worker = valid_worker_initial()
+        worker["graph_manifest_sha256"] = digest("graph_manifest", manifest)
+        worker["acceptance_chain_sha256"] = digest("acceptance_chain", chain)
+
+        self.assertTrue(digest("input_closure", worker).startswith("sha256:"))
+
+        for missing in ("graph_manifest_sha256", "acceptance_chain_sha256"):
+            with self.subTest(missing=missing):
+                incomplete = deepcopy(worker)
+                del incomplete[missing]
+                with self.assertRaises(ProtocolHashError):
+                    digest("input_closure", incomplete)
+
+    def test_acceptance_chain_records_one_way_primary_to_independent_upgrade(self) -> None:
+        chain = valid_acceptance_chain()
+        initial_sha256 = chain["decisions"][0]["decision_sha256"]
+        upgraded = {
+            "graph_manifest_sha256": chain["graph_manifest_sha256"],
+            "mode": "independent",
+            "previous_decision_sha256": initial_sha256,
+            "protocol": "cco.v4",
+            "reasons": ["verification_failure", "worker_retry"],
+            "revision": 2,
+        }
+        chain["decisions"].append(
+            {
+                "decision": upgraded,
+                "decision_sha256": digest("acceptance_decision", upgraded),
+            }
+        )
+
+        self.assertTrue(digest("acceptance_chain", chain).startswith("sha256:"))
+
+        for mutation in ("drop_history", "downgrade", "break_link"):
+            with self.subTest(mutation=mutation):
+                tampered = deepcopy(chain)
+                with self.assertRaises(ProtocolHashError):
+                    if mutation == "drop_history":
+                        tampered["decisions"] = tampered["decisions"][1:]
+                    elif mutation == "downgrade":
+                        tampered["decisions"][1]["decision"]["mode"] = "primary"
+                        tampered["decisions"][1]["decision_sha256"] = digest(
+                            "acceptance_decision",
+                            tampered["decisions"][1]["decision"],
+                        )
+                    else:
+                        tampered["decisions"][1]["decision"][
+                            "previous_decision_sha256"
+                        ] = "sha256:" + "0" * 64
+                        tampered["decisions"][1]["decision_sha256"] = digest(
+                            "acceptance_decision",
+                            tampered["decisions"][1]["decision"],
+                        )
+                    digest("acceptance_chain", tampered)
+
+    def test_primary_acceptance_rejects_a_declared_risk(self) -> None:
+        chain = valid_acceptance_chain()
+        manifest = chain["graph_manifest"]
+        contract_record = manifest["contracts"][0]
+        contract_record["contract"]["risk_flags"] = ["public_interface"]
+        contract_record["contract_sha256"] = digest(
+            "contract", contract_record["contract"]
+        )
+        manifest_sha256 = digest("graph_manifest", manifest)
+        chain["graph_manifest_sha256"] = manifest_sha256
+        decision = chain["decisions"][0]["decision"]
+        decision["graph_manifest_sha256"] = manifest_sha256
+        chain["decisions"][0]["decision_sha256"] = digest(
+            "acceptance_decision", decision
+        )
+
+        with self.assertRaises(ProtocolHashError):
+            digest("acceptance_chain", chain)
+
+    def test_graph_manifest_owner_must_be_the_node_that_declares_acceptance(self) -> None:
+        manifest = valid_graph_manifest()
+        manifest["acceptance_owners"][0]["implementation_owner"] = "ghost"
+
+        result = self.hash_value(manifest, "graph_manifest")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("declaring contract node", result.stderr)
+
+    def test_single_routine_contract_can_bind_primary_sol_acceptance(self) -> None:
+        result = self.hash_value(valid_acceptance_chain(), "acceptance_chain")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_primary_acceptance_rejects_complex_or_multi_node_graphs(self) -> None:
+        complex_chain = valid_acceptance_chain()
+        complex_manifest = complex_chain["graph_manifest"]
+        complex_contract = complex_manifest["contracts"][0]["contract"]
+        complex_contract["lane"] = "complex"
+        complex_manifest["contracts"][0]["contract_sha256"] = digest(
+            "contract", complex_contract
+        )
+
+        multi_chain = valid_acceptance_chain()
+        multi_manifest = multi_chain["graph_manifest"]
+        second = deepcopy(valid_contract())
+        second["node"] = "n02_other"
+        second["acceptance"][0]["id"] = "A02"
+        second["verification"][0]["id"] = "V02"
+        second["verification"][0]["acceptance_ids"] = ["A02"]
+        second["write"] = [{"kind": "exact", "path": "src/other.py"}]
+        multi_manifest["contracts"].append(
+            {"contract": second, "contract_sha256": digest("contract", second)}
+        )
+        multi_manifest["acceptance_owners"].append(
+            {"acceptance_id": "A02", "implementation_owner": "n02_other"}
+        )
+
+        for chain in (complex_chain, multi_chain):
+            manifest_sha256 = digest("graph_manifest", chain["graph_manifest"])
+            chain["graph_manifest_sha256"] = manifest_sha256
+            decision = chain["decisions"][0]["decision"]
+            decision["graph_manifest_sha256"] = manifest_sha256
+            chain["decisions"][0]["decision_sha256"] = digest(
+                "acceptance_decision", decision
+            )
+            with self.subTest(chain=chain):
+                result = self.hash_value(chain, "acceptance_chain")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("ineligible", result.stderr)
+
+    def test_sol_owned_change_set_is_an_explicit_contract_node(self) -> None:
+        contract = valid_contract()
+        contract["lane"] = "sol"
+        contract["node"] = "sol_n01_protocol_hash"
+        contract_result = self.hash_value(contract)
+        self.assertEqual(contract_result.returncode, 0, contract_result.stderr)
+        manifest = {
+            "acceptance_owners": [
+                {
+                    "acceptance_id": "A01",
+                    "implementation_owner": "sol_n01_protocol_hash",
+                }
+            ],
+            "contracts": [
+                {
+                    "contract": contract,
+                    "contract_sha256": contract_result.stdout.strip(),
+                }
+            ],
+            "protocol": "cco.v4",
+        }
+        manifest_sha256 = digest("graph_manifest", manifest)
+        decision = {
+            "graph_manifest_sha256": manifest_sha256,
+            "mode": "independent",
+            "previous_decision_sha256": None,
+            "protocol": "cco.v4",
+            "reasons": ["sol_owned_change"],
+            "revision": 1,
+        }
+        chain = {
+            "decisions": [
+                {
+                    "decision": decision,
+                    "decision_sha256": digest("acceptance_decision", decision),
+                }
+            ],
+            "graph_manifest": manifest,
+            "graph_manifest_sha256": manifest_sha256,
+            "protocol": "cco.v4",
+        }
+
+        result = self.hash_value(chain, "acceptance_chain")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_graph_manifest_limits_the_graph_wide_write_scope(self) -> None:
+        first = valid_contract()
+        first["write"] = [
+            {"kind": "exact", "path": f"generated/first_{index:03d}.py"}
+            for index in range(65)
+        ]
+        second = deepcopy(valid_contract())
+        second["node"] = "n02_other"
+        second["acceptance"][0]["id"] = "A02"
+        second["verification"][0]["id"] = "V02"
+        second["verification"][0]["acceptance_ids"] = ["A02"]
+        second["write"] = [
+            {"kind": "exact", "path": f"generated/second_{index:03d}.py"}
+            for index in range(65)
+        ]
+        manifest = {
+            "acceptance_owners": [
+                {"acceptance_id": "A01", "implementation_owner": "n01_protocol_hash"},
+                {"acceptance_id": "A02", "implementation_owner": "n02_other"},
+            ],
+            "contracts": [
+                {"contract": first, "contract_sha256": digest("contract", first)},
+                {"contract": second, "contract_sha256": digest("contract", second)},
+            ],
+            "protocol": "cco.v4",
+        }
+
+        result = self.hash_value(manifest, "graph_manifest")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("write scope", result.stderr)
+
+    def test_graph_manifest_rejects_overlapping_and_case_alias_write_scopes(self) -> None:
+        cases = (
+            (
+                {"kind": "prefix", "path": "generated"},
+                {"kind": "exact", "path": "generated/file.py"},
+            ),
+            (
+                {"kind": "prefix", "path": "generated"},
+                {"kind": "prefix", "path": "generated/nested"},
+            ),
+            (
+                {"kind": "exact", "path": "Generated/File.py"},
+                {"kind": "exact", "path": "generated/file.py"},
+            ),
+        )
+        for first_scope, second_scope in cases:
+            with self.subTest(first=first_scope, second=second_scope):
+                first = valid_contract()
+                first["write"] = [first_scope]
+                second = deepcopy(valid_contract())
+                second["node"] = "n02_other"
+                second["acceptance"][0]["id"] = "A02"
+                second["verification"][0]["id"] = "V02"
+                second["verification"][0]["acceptance_ids"] = ["A02"]
+                second["write"] = [second_scope]
+                manifest = {
+                    "acceptance_owners": [
+                        {"acceptance_id": "A01", "implementation_owner": "n01_protocol_hash"},
+                        {"acceptance_id": "A02", "implementation_owner": "n02_other"},
+                    ],
+                    "contracts": [
+                        {"contract": first, "contract_sha256": digest("contract", first)},
+                        {"contract": second, "contract_sha256": digest("contract", second)},
+                    ],
+                    "protocol": "cco.v4",
+                }
+
+                result = self.hash_value(manifest, "graph_manifest")
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("overlapping write scopes", result.stderr)
 
     def test_worker_initial_requires_policy_null_pairings(self) -> None:
         valid = self.hash_value(valid_worker_initial(), "input_closure")
@@ -275,6 +639,50 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("identity", result.stderr)
+
+    def test_worker_run_suffix_matches_the_attempt_counter(self) -> None:
+        value = valid_worker_initial()
+        value["run"] = "run_n01_protocol_hash_r02"
+        value["lease"] = "wl_n01_protocol_hash_r02"
+
+        result = self.hash_value(value, "input_closure")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("attempt", result.stderr)
+
+        aliased = valid_worker_initial()
+        aliased["run"] = "run_n01_protocol_hash_r001"
+        aliased["lease"] = "wl_n01_protocol_hash_r001"
+        result = self.hash_value(aliased, "input_closure")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("canonical", result.stderr)
+
+    def test_worker_attempt_limit_has_a_small_protocol_cap(self) -> None:
+        value = valid_worker_initial()
+        value["attempt"] = {"current": 1, "limit": 4}
+
+        result = self.hash_value(value, "input_closure")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("limit", result.stderr)
+
+        followups = valid_worker_initial()
+        followups["followup"] = {"current": 0, "limit": 3}
+        result = self.hash_value(followups, "input_closure")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("limit", result.stderr)
+
+        reviewer_attempts = valid_review_fresh()
+        reviewer_attempts["attempt"] = {"current": 1, "limit": 3}
+        result = self.hash_value(reviewer_attempts, "input_closure")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("limit", result.stderr)
+
+        reviewer_followups = valid_review_delta()
+        reviewer_followups["followup"] = {"current": 1, "limit": 3}
+        result = self.hash_value(reviewer_followups, "input_closure")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("limit", result.stderr)
 
     def test_input_closure_binds_the_native_fork_policy(self) -> None:
         no_fork = valid_worker_initial()
@@ -373,16 +781,21 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("missing keys", result.stderr)
 
-        conflicting_owner = valid_evidence()
-        records = conflicting_owner["records"]
+        wrong_owner = valid_evidence()
+        records = wrong_owner["records"]
         self.assertIsInstance(records, list)
-        second = deepcopy(records[0])
-        second["verification_id"] = "V02"
-        second["implementation_owner"] = "n02_other_owner"
-        records.append(second)
-        result = self.hash_value(conflicting_owner, "evidence")
+        records[0]["implementation_owner"] = "n02_other_owner"
+        result = self.hash_value(wrong_owner, "evidence")
         self.assertEqual(result.returncode, 2)
         self.assertIn("implementation owner", result.stderr)
+
+        wrong_operation = valid_evidence()
+        records = wrong_operation["records"]
+        self.assertIsInstance(records, list)
+        records[0]["operation"] = "python -m unittest tests.test_unrelated"
+        result = self.hash_value(wrong_operation, "evidence")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("operation", result.stderr)
 
     def test_unordered_values_and_record_ids_must_be_nfc_utf8_sorted(self) -> None:
         unsorted_paths = valid_contract()
@@ -459,7 +872,7 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
         for path in invalid_paths:
             with self.subTest(path=path):
                 value = valid_contract()
-                value["write"] = [path]
+                value["write"] = [{"kind": "exact", "path": path}]
 
                 result = self.hash_value(value)
 
@@ -467,13 +880,62 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
                 self.assertIn("repository-relative path", result.stderr)
 
         unicode_path = valid_contract()
-        unicode_path["write"] = ["src/\u9a8c\u8bc1.py"]
+        unicode_path["write"] = [
+            {"kind": "exact", "path": "src/\u9a8c\u8bc1.py"}
+        ]
         result = self.hash_value(unicode_path)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+        too_many = valid_contract()
+        too_many["write"] = [
+            {"kind": "exact", "path": f"src/generated_{index:03d}.py"}
+            for index in range(129)
+        ]
+        result = self.hash_value(too_many)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("at most 128", result.stderr)
+
+    def test_repository_paths_never_authorize_git_metadata_segments(self) -> None:
+        for path in (".git/config", ".GIT/config", "nested/.git/config"):
+            with self.subTest(path=path):
+                value = valid_contract()
+                value["write"] = [{"kind": "exact", "path": path}]
+
+                result = self.hash_value(value)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("repository-relative path", result.stderr)
+
+    def test_repository_paths_reject_win32_alias_and_device_segments(self) -> None:
+        invalid_paths = (
+            ".git./config",
+            "src/file.",
+            "src/file ",
+            "src/NUL",
+            "src/con.txt",
+            "src/COM1.log",
+            "src/LPT9",
+            'src/a<bad>.txt',
+            'src/a"bad.txt',
+            "src/a|bad.txt",
+            "src/a?bad.txt",
+            "src/a*bad.txt",
+        )
+        for path in invalid_paths:
+            with self.subTest(path=path):
+                value = valid_contract()
+                value["write"] = [{"kind": "exact", "path": path}]
+
+                result = self.hash_value(value)
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("repository-relative path", result.stderr)
+
     def test_review_allowed_paths_use_the_same_canonical_path_identity(self) -> None:
         value = valid_review_fresh()
-        value["allowed_paths"] = ["src/../escape.py"]
+        value["allowed_paths"] = [
+            {"kind": "exact", "path": "src/../escape.py"}
+        ]
 
         result = self.hash_value(value, "input_closure")
 
@@ -498,6 +960,35 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
         result = self.hash_value(wrong_optional_type, "failure")
         self.assertEqual(result.returncode, 2)
         self.assertIn("failure.exit_status", result.stderr)
+
+    def test_evidence_requires_every_contract_verification_record(self) -> None:
+        evidence = valid_evidence()
+        chain = evidence["acceptance_chain"]
+        manifest = chain["graph_manifest"]
+        contract_record = manifest["contracts"][0]
+        contract = contract_record["contract"]
+        contract["verification"].append(
+            {
+                "acceptance_ids": ["A01"],
+                "expected": "A second independent passing observation",
+                "id": "V02",
+                "operation": "python -m unittest tests/test_project_contract.py",
+            }
+        )
+        contract_record["contract_sha256"] = digest("contract", contract)
+        manifest_sha256 = digest("graph_manifest", manifest)
+        chain["graph_manifest_sha256"] = manifest_sha256
+        decision = chain["decisions"][0]["decision"]
+        decision["graph_manifest_sha256"] = manifest_sha256
+        chain["decisions"][0]["decision_sha256"] = digest(
+            "acceptance_decision", decision
+        )
+        evidence["acceptance_chain_sha256"] = digest("acceptance_chain", chain)
+
+        result = self.hash_value(evidence, "evidence")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("every contract verification", result.stderr)
 
         complete_only_marker = valid_failure()
         complete_only_marker["failure_class"] = "none"
@@ -606,6 +1097,15 @@ class ProtocolHashBehaviorTests(unittest.TestCase):
         self.assertEqual(parser_depth.returncode, 2)
         self.assertIn("nesting exceeds 64 levels", parser_depth.stderr)
         self.assertNotIn("Traceback", parser_depth.stderr)
+
+    def test_digest_rejects_an_oversized_canonical_preimage(self) -> None:
+        value = valid_contract()
+        value["objective"] = "\\" * 600_000
+
+        with self.assertRaisesRegex(
+            ProtocolHashError, "canonical input exceeds 1048576 bytes"
+        ):
+            digest("contract", value)
 
 
 if __name__ == "__main__":
