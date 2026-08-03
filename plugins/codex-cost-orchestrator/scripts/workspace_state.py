@@ -477,11 +477,18 @@ def repository_path_spelling_map(
         segments = path.split("/")
         for length in range(1, len(segments) + 1):
             prefix = "/".join(segments[:length])
-            key = ntpath.normcase(prefix).replace("\\", "/")
+            key = repository_path_spelling_key(prefix)
             previous = spellings.setdefault(key, prefix)
             if previous != prefix:
                 raise StateError("Git index contains ambiguous path spellings")
     return spellings
+
+
+def repository_path_spelling_key(value: str) -> str:
+    """Fold case without aliasing a POSIX backslash to a Git separator."""
+    if os.name == "nt":
+        return ntpath.normcase(value).replace("\\", "/")
+    return value.lower()
 
 
 def tracked_entries(
@@ -684,7 +691,7 @@ def validate_repository_lease_path(
     for segment in value.split("/"):
         current_spelling.append(segment)
         prefix = "/".join(current_spelling)
-        spelling_key = ntpath.normcase(prefix).replace("\\", "/")
+        spelling_key = repository_path_spelling_key(prefix)
         tracked = active_spellings.get(spelling_key)
         if tracked is not None and tracked != prefix:
             raise StateError(f"invalid lease path: {value}")

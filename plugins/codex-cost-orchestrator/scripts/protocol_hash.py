@@ -1511,13 +1511,18 @@ def main() -> int:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
             raise ProtocolHashError(f"input exceeds {MAX_INPUT_BYTES} bytes")
-        value = json.loads(
-            raw.decode("utf-8"),
-            object_pairs_hook=object_from_pairs,
-            parse_constant=reject_constant,
-            parse_float=reject_float,
-            parse_int=parse_safe_integer,
-        )
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=object_from_pairs,
+                parse_constant=reject_constant,
+                parse_float=reject_float,
+                parse_int=parse_safe_integer,
+            )
+        except RecursionError as error:
+            raise ProtocolHashError(
+                f"nesting exceeds {MAX_NESTING_LEVELS} levels"
+            ) from error
         result = digest(args.domain, value)
     except (
         OSError,
