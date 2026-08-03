@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Cost Orchestrator"
-  short_description: "Route implementation through cost-aware verified lanes"
-  default_prompt: "Use $orchestrate to choose the appropriate cost-aware route for this implementation and verify it with route-proportionate evidence."
+  short_description: "Route implementation through adaptive verified worker lanes"
+  default_prompt: "Use $orchestrate to choose a user-selected or adaptive cost-aware route for this implementation and verify it with route-proportionate evidence."
 
 policy:
   allow_implicit_invocation: true

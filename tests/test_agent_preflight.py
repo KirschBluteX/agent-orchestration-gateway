@@ -1,5 +1,7 @@
 import json
 import ctypes
+from datetime import datetime, timezone
+from functools import lru_cache
 import os
 from pathlib import Path
 import subprocess
@@ -22,6 +24,7 @@ HASH_HELPER = HOOK.parent.parent / "scripts" / "protocol_hash.py"
 sys.path.insert(0, str(HOOK.parent))
 sys.path.insert(0, str(HASH_HELPER.parent))
 import agent_preflight as preflight_module  # noqa: E402
+import routing_catalog  # noqa: E402
 
 
 def payload(**overrides: object) -> dict[str, object]:
@@ -32,6 +35,55 @@ def payload(**overrides: object) -> dict[str, object]:
     }
     value.update(overrides)
     return value
+
+
+@lru_cache(maxsize=None)
+def adaptive_decision_json(
+    lane: str,
+    model: str,
+    effort: str,
+    fixed_model: str | None,
+    fixed_effort: str | None,
+) -> str:
+    now = datetime.now(timezone.utc)
+    radar = {
+        "schema": 2,
+        "type": "distributed_intelligence_efficiency",
+        "source_updated_at": now.isoformat(),
+        "fingerprint": "a" * 64,
+        "points": [
+            {
+                "model": model,
+                "effort": effort,
+                "iq": 112.5,
+                "passed": 75,
+                "valid_tasks": 100,
+                "average_price_usd": 1.0,
+                "price_samples": 100,
+                "average_minutes": 20.0,
+                "duration_samples": 100,
+                "incomplete_cost_samples": 0,
+            }
+        ],
+    }
+    native = {
+        "models": [
+            {
+                "slug": model,
+                "supported_reasoning_levels": [{"effort": effort}],
+            }
+        ]
+    }
+    recommendation = routing_catalog.resolve_route(
+        radar,
+        native,
+        lane,
+        now=now,
+        fixed_model=fixed_model,
+        fixed_effort=fixed_effort,
+    )
+    decision, _state = routing_catalog.stabilize_route(recommendation, None)
+    return json.dumps(decision, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
 def worker_message(
@@ -48,6 +100,25 @@ def worker_message(
     write_kind: str = "exact",
     manifest_node: str = "n01_auth",
 ) -> str:
+    adaptive = "route_default" in {model_policy, effort_policy}
+    decision_model = (
+        requested_model if requested_model != "none" else "gpt-5.6-luna"
+    )
+    decision_effort = requested_effort if requested_effort != "none" else "max"
+    routing_json = (
+        adaptive_decision_json(
+            lane,
+            decision_model,
+            decision_effort,
+            requested_model if model_policy == "user" else None,
+            requested_effort if effort_policy == "user" else None,
+        )
+        if adaptive
+        else "none"
+    )
+    routing_sha = (
+        json.loads(routing_json)["decision_sha256"] if adaptive else None
+    )
     write_scope: object = {"kind": write_kind, "path": write_path}
     write_line = f"{write_kind}:{write_path}"
     contract: dict[str, object] = {
@@ -116,14 +187,20 @@ def worker_message(
     acceptance_chain_json = json.dumps(
         acceptance_chain, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
+    content_anchors = [
+        {"content_sha256": "sha256:" + "d" * 64, "id": "I01"}
+    ]
+    if routing_sha is not None:
+        content_anchors.append(
+            {"content_sha256": routing_sha, "id": "routing_decision"}
+        )
+    content_anchors.sort(key=lambda item: str(item["id"]).encode("utf-8"))
     input_preimage: dict[str, object] = {
         "acceptance_chain_sha256": acceptance_chain_sha256,
         "attempt": {"current": 1, "limit": 2},
         "acceptance_ids": ["A01"],
         "baseline": "sha256:" + "c" * 64,
-        "content_anchors": [
-            {"content_sha256": "sha256:" + "d" * 64, "id": "I01"}
-        ],
+        "content_anchors": content_anchors,
         "contract_rev": 1,
         "contract_sha256": contract_sha256,
         "dependencies": [],
@@ -166,6 +243,7 @@ MODEL_POLICY: {model_policy}
 REQUESTED_MODEL: {requested_model}
 EFFORT_POLICY: {effort_policy}
 REQUESTED_EFFORT: {requested_effort}
+ROUTING_DECISION_JSON: {routing_json}
 ACCEPTANCE_IDS: [A01]
 WRITE:
 - {write_line}
@@ -184,6 +262,7 @@ DEPENDENCIES:
 - none
 INPUTS:
 - I01#sha256:{"d" * 64}
+{"- routing_decision#" + routing_sha if routing_sha is not None else ""}
 ACCEPTANCE:
 - A01: Authentication behavior passes.
 VERIFY:
@@ -655,7 +734,9 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
         groups = config["hooks"]["PreToolUse"]
 
         self.assertEqual(len(groups), 2)
-        spawn_group = next(group for group in groups if group["matcher"] == "Agent")
+        spawn_group = next(
+            group for group in groups if group["matcher"] == "^(Agent|spawn_agent)$"
+        )
         control_group = next(
             group for group in groups if group["matcher"] == "send_message|followup_task"
         )
@@ -876,6 +957,15 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 worker_message(requested_model="gpt-5.6-terra"),
                 {"model": "gpt-5.6-terra", "reasoning_effort": "max"},
             ),
+            (
+                worker_message(
+                    model_policy="user",
+                    requested_model="gpt-5.6-terra",
+                    effort_policy="route_default",
+                    requested_effort="max",
+                ),
+                {"model": "gpt-5.6-terra", "reasoning_effort": "max"},
+            ),
         )
         for message, overrides in cases:
             with self.subTest(overrides=overrides):
@@ -964,7 +1054,28 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
-    def test_route_defaults_stay_inside_the_declared_lane_sequence(self) -> None:
+    def test_adaptive_policy_cannot_be_mixed_with_a_native_dimension(self) -> None:
+        result = run_hook(
+            payload(
+                tool_input={
+                    "task_name": "work_n01_auth_routine_r01",
+                    "agent_type": "cost_orchestrator_routine_worker",
+                    "fork_turns": "none",
+                    "reasoning_effort": "max",
+                    "message": worker_message(
+                        model_policy="native",
+                        requested_model="none",
+                        effort_policy="route_default",
+                        requested_effort="max",
+                    ),
+                }
+            )
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
+
+    def test_adaptive_route_defaults_are_not_limited_to_hardcoded_models(self) -> None:
         cases = (
             {
                 "task_name": "work_n01_auth_routine_r01",
@@ -998,6 +1109,35 @@ class AgentPreflightBehaviorTests(unittest.TestCase):
         for tool_input in cases:
             with self.subTest(task_name=tool_input["task_name"], model=tool_input["model"]):
                 result = run_hook(payload(tool_input=tool_input))
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_adaptive_route_requires_a_matching_hash_bound_decision(self) -> None:
+        valid = worker_message()
+        routing_line = next(
+            line for line in valid.splitlines() if line.startswith("ROUTING_DECISION_JSON:")
+        )
+        cases = (
+            valid.replace(routing_line, "ROUTING_DECISION_JSON: none"),
+            valid.replace("- routing_decision#sha256:", "- other_decision#sha256:"),
+            valid.replace('"selection_method":"strict_pareto_fixed_anchor_mcda"',
+                          '"selection_method":"cheapest_only"'),
+        )
+        for message in cases:
+            with self.subTest(message_change=message[:80]):
+                result = run_hook(
+                    payload(
+                        tool_input={
+                            "task_name": "work_n01_auth_routine_r01",
+                            "agent_type": "cost_orchestrator_routine_worker",
+                            "fork_turns": "none",
+                            "model": "gpt-5.6-luna",
+                            "reasoning_effort": "max",
+                            "message": message,
+                        }
+                    )
+                )
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout)["decision"], "block")

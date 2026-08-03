@@ -104,8 +104,8 @@ agent.
 | Responsibility | Native role | Runtime selection | Boundary |
 | --- | --- | --- | --- |
 | Control plane | Primary Codex task | Sol; effort selected by the user | Resolve ambiguity, design, decompose, route, verify, and accept |
-| Routine lane | `cost_orchestrator_routine_worker` | User-selected per node; route order starts Luna / Max, then Terra / Max | Fully determined, mechanical, independently verifiable work |
-| Complex lane | `cost_orchestrator_complex_worker` | User-selected per node; Terra / Max is the route recommendation | Bounded algorithms, debugging, compatibility, security, or wider implementation judgment |
+| Routine lane | `cost_orchestrator_routine_worker` | User-selected per node; adaptive default favors cost among IQ > 90 candidates | Fully determined, mechanical, independently verifiable work |
+| Complex lane | `cost_orchestrator_complex_worker` | User-selected per node; adaptive default favors quality among IQ > 90 candidates | Bounded algorithms, debugging, compatibility, security, or wider implementation judgment |
 | Review lane | `cost_orchestrator_reviewer` | GPT-5.6 Sol / High; requests read-only | Structurally required fresh epoch review and contract-preserving delta review |
 
 Routine and complex describe contract closure, not fixed models. Worker TOMLs omit
@@ -120,15 +120,58 @@ Choose values in the task request, independently by lane or node. For example:
 Use CCO for this change. Use <model-a> at high effort for routine nodes, <model-b> at max effort for complex nodes, and keep the reviewer default.
 ```
 
-Use `native` for either dimension when Codex should inherit/resolve it instead. If no
-choice is given, routine uses the finite Luna Max then Terra Max preference order;
-complex uses Terra Max. When Codex exposes a native capability catalog, CCO checks the
-model, supported effort, and task-required capabilities before dispatch. Native spawn
+Use `native` for both dimensions when Codex should inherit/resolve the pair. If no
+choice is given, CCO resolves an adaptive route at work-graph creation. It intersects
+Codex's bundled model/effort catalog with the current validated
+[CodexRadar](https://codexradar.com/) snapshot,
+requires observed IQ strictly above 90 and adequate samples/cohort coverage, then uses
+a Wilson-aware strict Pareto frontier and fixed-anchor quality/cost/time utility.
+Routine weights cost more heavily; complex weights quality more heavily. Native spawn
 validation and observed effective values remain authoritative.
 
-The dimensions remain independent during fallback. CCO overlays them into candidate
-tuples and advances only a dimension whose policy is `route_default`; an explicit user
-value and an omitted `native` dimension remain unchanged.
+One user-selected dimension can constrain the adaptive choice of the other. Do not mix
+`route_default` with an omitted `native` dimension because the pair would be unknown
+before spawn. A pre-thread native rejection may advance only through the decision's
+hash-bound fallback order; explicit user values never fall back.
+
+### Adaptive refresh and privacy
+
+Every new work graph checks a one-hour TTL; the minimum configurable TTL is ten
+minutes. A running graph pins its original routing decision and never changes workers
+mid-run. Radar's raw response is validated in memory and never stored. CCO keeps only
+one normalized last-known-good snapshot (maximum source age 72 hours) and one compact
+hysteresis state, with no history. Atomic staging files are removed on success and
+failure; a later run removes only stale abandoned files so concurrent graph creation
+cannot delete a live writer's temporary.
+
+The selector first removes strictly dominated candidates, then compares conservative
+quality, logarithmic cost burden, linear time burden, and measurement uncertainty on
+fixed policy anchors. Cost/time penalties stay monotonic above the anchors, so an
+extreme price or delay is never treated as free. A slightly dearer/slower model wins
+when its quality gain has greater policy value; a tiny gain with a large premium does
+not. A new winner must persist across two distinct measurement snapshots unless the
+old route is no longer eligible or the user changes policy. Fingerprint-only changes
+do not count.
+
+The default quality/cost/time weights are `0.35/0.55/0.10` for routine and
+`0.70/0.20/0.10` for complex, with a separate `0.05` uncertainty penalty. Policy
+anchors are `$25` and `60 minutes`; they provide stable units rather than renormalizing
+whenever the candidate set changes. These are overridable operating preferences, not
+claims of a universal optimum, while the IQ floor cannot be lowered below 90.
+
+CodexRadar is a third-party advisory source, not an OpenAI model guarantee. Its “IQ”
+field is the site's latest-valid-task pass rate multiplied by 150, not a general
+intelligence measurement. CCO validates that formula and uses it only after the worker
+lane and contract are structurally fixed; it never controls Multi eligibility,
+acceptance mode, verification, or the final review gate.
+
+Normal operation keeps this analysis internal and uses only the selected model and
+effort. The helper prints a compact dispatch result by default; `--explain` is opt-in:
+
+```text
+python plugins/codex-cost-orchestrator/scripts/routing_catalog.py resolve --lane routine
+python plugins/codex-cost-orchestrator/scripts/routing_catalog.py resolve --lane complex --explain
+```
 
 ```mermaid
 flowchart TD
@@ -187,12 +230,14 @@ not a predicted cost or quality score.
 
 The user can select model and effort independently for every worker node. `MODEL_POLICY`
 and `EFFORT_POLICY` each use `user`, `route_default`, or `native`. A user value always
-wins. Route defaults use Luna Max then Terra Max for routine and Terra Max for complex
-without pinning either worker TOML. A native dimension is omitted from spawn so Codex
-resolves it from current defaults or inheritance. A rejected proposal that creates no
-thread consumes no worker attempt or lease generation; a user selection never falls
-back, while a route default may try only its next predeclared candidate. Once a usable
-worker exists, an unobservable or mismatched route is fenced and rejected.
+wins. Route defaults come from the hash-bound adaptive selector without pinning either
+worker TOML. A fully native pair is omitted from spawn so Codex resolves it from current
+defaults or inheritance. `ROUTING_DECISION_JSON` is bound through the existing
+`INPUTS` closure for adaptive routes and checked against the actual spawn overrides.
+A rejected proposal that creates no thread consumes no worker attempt or lease
+generation; a user selection never falls back, while a route default may try only its
+next bound candidate. Once a usable worker exists, an unobservable or mismatched route
+is fenced and rejected.
 
 ### Structural Multi gate
 

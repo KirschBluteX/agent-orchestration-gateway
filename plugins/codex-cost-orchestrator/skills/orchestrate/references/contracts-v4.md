@@ -6,8 +6,10 @@ or live follow-up, or an independent review epoch.
 ## Authority boundary
 
 Codex native spawn/send/follow-up/wait/interrupt tools remain the only Agent runtime.
-CCO adds no coordinator, session host, database, CAS, provider-call layer, or hidden
-cost/quality score. Hashes are integrity identities, not encryption or authorization.
+CCO adds no coordinator, session host, database, CAS, or provider-call layer. Adaptive
+route scores are explicit, hash-bound policy outputs rather than hidden gates; they
+select a model/effort pair only after the structural lane is fixed. Hashes are
+integrity identities, not encryption or authorization.
 
 ## Canonical protocol identities
 
@@ -79,6 +81,16 @@ The acceptance chain embeds the complete immutable graph manifest plus one or tw
 upgrade independently recomputable. This self-contained graph is repeated in worker
 packets; it trades some context for a stateless pre-spawn global authority check. Do
 not repeat surrounding reference prose or unrelated repository content.
+
+`ROUTING_DECISION_JSON` is a packet-only canonical `cco.routing.v1` object. It is not
+another cco.v4 hash domain and is not silently inserted into the worker input object.
+When either worker dimension is `route_default`, the exact existing
+`content_anchors` array contains one record whose ID is `routing_decision` and whose
+`content_sha256` is that object's domain-separated `decision_sha256`. The spawn hook
+recomputes its fixed-anchor scores, strict Pareto frontier, policy/fallback chain, and
+decision hash, then matches its selected pair to native spawn. User/native-only packets
+use `ROUTING_DECISION_JSON: none` and omit the anchor. A graph keeps this decision
+fixed; a pre-thread fallback creates a new canonical decision and a new input closure.
 
 ### Extended canonical input preimages
 

@@ -75,7 +75,7 @@ Once per orchestrated task, after routing the work graph:
 5. When exposed, inspect the native model capability catalog for the requested model,
    supported effort, and any task-required input or tool capability. Otherwise record
    that native spawn validation is the capability probe.
-6. Record the successful profile/template identity, finite route-default preference
+6. Record the successful profile/template identity, hash-bound adaptive fallback
    order, and per-node routing policy.
 
 Repeat only after an availability failure, runtime inconsistency, or profile change.
@@ -97,10 +97,53 @@ decision. Installation requires a new Codex task before the role can be consider
 available.
 
 An unavailable explicit user model or effort always fails closed. A route-default
-proposal may advance only through its predeclared finite preference order. Rejection
-before native spawn returns a usable canonical task path creates no owner and consumes
-no attempt or lease generation; any mismatch observed after a usable worker starts is
-fenced and consumes that run. Native policy remains omission, never a silent fallback.
+proposal may advance only through the canonical routing decision's hash-bound fallback
+order, using `routing_catalog.py advance` to create a new decision and input closure.
+Rejection before native spawn returns a usable canonical task path creates no owner and
+consumes no attempt or lease generation; any mismatch observed after a usable worker
+starts is fenced and consumes that run. Native policy remains omission, never a silent
+fallback. A route-default dimension cannot be mixed with a native dimension because
+the selected model/effort pair would not be closed before spawn.
+
+## Adaptive route catalog
+
+Resolve each adaptive lane once when creating a new work graph:
+
+```text
+python <routing_catalog.py> resolve --lane <routine|complex> --packet \
+  [--fixed-model <user-model>] [--fixed-effort <user-effort>]
+```
+
+The default TTL is 60 minutes and `--refresh-ttl-minutes` rejects values below 10.
+The helper reads the raw HTTPS response only in memory, validates schema, size, source
+age, duplicate keys, samples, task-cohort coverage, and exact IQ formula, then stores
+only one normalized LKG and one compact hysteresis state under the Codex cache. It
+uses a short-lived lock for concurrent graph creation, atomically replaces those two
+files, deletes its own temporary on every exit path, and removes only stale abandoned
+temporaries so one process cannot delete another process's live staging file. It keeps
+no response history. A 304 cannot extend `source_updated_at`; a source older than 72
+hours is ineligible even when `fetched_at` is recent.
+
+Selection intersects `codex debug models --bundled` with Radar pairs, requires
+observed IQ strictly greater than 90, then applies comparable-cohort/sample gates,
+Wilson-aware strict Pareto filtering, and fixed-anchor MCDA. The cost burden is
+logarithmic and monotonic; time burden is linear and monotonic. New winners require
+two distinct point-measurement hashes. Fingerprint-only changes do not count. An
+ineligible active route or an explicit policy/fixed-dimension change switches
+immediately. The graph binds the resulting decision and never refreshes it mid-run.
+
+Normal resolution output is only model, effort, lane, and decision hash. `--packet`
+emits canonical binding JSON; `--explain` is opt-in and must not be surfaced to the
+user unless requested or needed for diagnosis. On a pre-thread native rejection, pipe
+the current decision to:
+
+```text
+python <routing_catalog.py> advance \
+  --rejected-model <model> --rejected-effort <effort>
+```
+
+Use only its next decision. Exhaustion or unavailable Radar plus an over-age LKG fails
+closed and requires an explicit user/native route; it never revives a static model list.
 
 ## Per-spawn evidence
 

@@ -95,8 +95,8 @@ reviewer。角色缺失或内容不匹配时，
 | 职责 | 原生角色 | 运行时选择 | 边界 |
 | --- | --- | --- | --- |
 | 控制平面 | 主 Codex 任务 | Sol；推理强度由用户选择 | 消除歧义、设计、拆分、路由、验证和验收 |
-| 常规通道 | `cost_orchestrator_routine_worker` | 每节点由用户选择；默认顺序为 Luna / Max，再到 Terra / Max | 合同完全决定结果、机械性强、可独立验证的工作 |
-| 复杂通道 | `cost_orchestrator_complex_worker` | 每节点由用户选择；路由建议 Terra / Max | 架构和接口已固定，但算法、调试、兼容性、安全或较广实现仍需有限判断 |
+| 常规通道 | `cost_orchestrator_routine_worker` | 每节点由用户选择；自适应默认在 IQ > 90 的候选中偏重成本 | 合同完全决定结果、机械性强、可独立验证的工作 |
+| 复杂通道 | `cost_orchestrator_complex_worker` | 每节点由用户选择；自适应默认在 IQ > 90 的候选中偏重质量 | 架构和接口已固定，但算法、调试、兼容性、安全或较广实现仍需有限判断 |
 | 审查通道 | `cost_orchestrator_reviewer` | GPT-5.6 Sol / High；请求只读 | 结构门禁要求时的 fresh epoch 与合同不变时的 delta 审查 |
 
 常规与复杂通道描述的是合同闭合度，而不是固定模型。两个 worker TOML 都不写
@@ -109,13 +109,47 @@ reviewer。角色缺失或内容不匹配时，
 这个修改使用 CCO：常规节点使用 <模型A> / high，复杂节点使用 <模型B> / max，reviewer 保持默认配置。
 ```
 
-任一维度也可以写 `native`，让 Codex 继承或解析该值。用户未选择时，常规节点使用有限的
-Luna Max → Terra Max 顺序，复杂节点使用 Terra Max。当前 Codex 若公开原生 capability
-catalog，主控会在派发前检查模型、支持的强度和任务所需能力；原生 spawn 校验与真实运行时
-值仍是最终依据。
+两个维度都可以写 `native`，让 Codex 继承或解析完整组合。用户未选择时，CCO 会在新工作图
+创建时解析自适应路由：先取 Codex bundled 模型/强度能力与当前
+[CodexRadar](https://codexradar.com/) 数据的交集，
+严格要求观测 IQ > 90、样本量与任务 cohort 覆盖达标，再通过 Wilson-aware 严格 Pareto
+前沿和固定锚点的质量/成本/时间效用选择。常规通道更偏重成本，复杂通道更偏重质量；原生
+spawn 校验与真实运行时值仍是最终依据。
 
-回退时两个维度仍保持独立：CCO 将它们叠加成候选组合，只允许策略为 `route_default` 的
-维度沿有限顺序前进；用户显式选择与省略传参的 `native` 维度保持不变。
+用户可以固定一个维度，让算法只选择另一个维度。`route_default` 不与省略传参的 `native`
+混用，否则派发前无法闭合模型/强度组合。原生 spawn 在创建线程前拒绝候选时，只能沿该
+决策中已哈希绑定的 fallback 顺序前进；用户显式值始终不自动回退。
+
+### 自适应刷新与隐私
+
+每个新工作图检查默认一小时 TTL；最小可配置 TTL 为十分钟。运行中的工作图固定原始路由
+决策，不会中途换模型。Radar 原始响应只在内存中校验且不落盘；磁盘仅保留一份 normalized
+LKG（源数据最多 72 小时）与一份精简迟滞状态，不保存历史。原子写入产生的临时文件会在
+成功与失败路径立即清除；下次运行只清理已过期的遗留临时文件，避免并发任务删除仍在使用
+的 staging 文件。
+
+算法先去除严格劣势候选，再依据保守质量、对数成本负担、线性时间负担与测量不确定性进行
+固定锚点比较。成本和时间超过锚点后仍持续增加惩罚，因此极端花费或耗时不会被当成“免费”。
+当少量额外花费/时间能换来明显质量提升时会选择升级；质量只提高一点但代价大幅增加时不会。
+新赢家必须在两个不同的测量快照中连续成立，除非旧候选已不合格或用户更改策略；仅 fingerprint
+变化不计为新测量。
+
+默认质量/成本/时间权重为：常规通道 `0.35/0.55/0.10`，复杂通道
+`0.70/0.20/0.10`，另有独立的 `0.05` 不确定性惩罚；策略锚点为 `$25` 与 `60 分钟`。
+固定锚点用于保持量纲稳定，避免候选集合变化时重新归一化导致选择漂移。这些权重是可覆盖的
+运行偏好，而不是“普适最优”声明；IQ 下限不可降到 90 以下。
+
+CodexRadar 是第三方参考数据，不是 OpenAI 对模型能力的保证。其中的 “IQ” 是该网站“最新
+有效任务通过率 × 150”的指标，并非通用智力测量。CCO 会校验这一公式，并且只在工作通道与
+合同已由结构规则确定后用于选择 worker；它不会决定 Multi 门禁、验收模式、验证或最终审查。
+
+正常任务只使用最终模型与强度，不向用户展示内部评分。CLI 默认只返回精简调度结果，只有
+显式使用 `--explain` 才输出解释：
+
+```text
+python plugins/codex-cost-orchestrator/scripts/routing_catalog.py resolve --lane routine
+python plugins/codex-cost-orchestrator/scripts/routing_catalog.py resolve --lane complex --explain
+```
 
 ```mermaid
 flowchart TD
@@ -164,11 +198,12 @@ reviewer profile check，才能发起任何修复或审查；首次 spawn 后不
 ### 每节点模型与思考强度
 
 用户可为每个 worker 节点分别选择模型与思考强度。`MODEL_POLICY` 与
-`EFFORT_POLICY` 分别支持 `user`、`route_default`、`native`。用户选择始终优先；路由
-默认顺序为常规节点 Luna Max → Terra Max、复杂节点 Terra Max，不写死在 worker TOML 中；
-`native` 维度不传给 spawn，由 Codex 当前默认值或继承规则解析。未创建线程的拒绝提案不
-消耗 worker attempt 或 lease generation；用户选择不可用时不回退，route default 只能尝试
-预先声明的下一个候选。可用 worker 启动后，无法观察或不一致的路由会被 fence 并拒绝。
+`EFFORT_POLICY` 分别支持 `user`、`route_default`、`native`。用户选择始终优先；路由默认
+来自哈希绑定的自适应选择器，不写死在 worker TOML 中；完整 `native` 组合不传给 spawn，
+由 Codex 当前默认值或继承规则解析。自适应路由的 `ROUTING_DECISION_JSON` 通过现有
+`INPUTS` 闭包绑定，并与实际 spawn override 核对。未创建线程的拒绝提案不消耗 worker
+attempt 或 lease generation；用户选择不可用时不回退，route default 只能尝试已绑定的
+下一个候选。可用 worker 启动后，无法观察或不一致的路由会被 fence 并拒绝。
 
 ### 结构型 Multi 门禁
 

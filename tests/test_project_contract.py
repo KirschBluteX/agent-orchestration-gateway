@@ -39,7 +39,7 @@ class ProjectIdentityTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertEqual(manifest["version"], "0.4.0")
+        self.assertEqual(manifest["version"], "0.5.0")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(manifest["license"], "MIT")
         combined = (english + chinese).lower()
@@ -84,6 +84,7 @@ class ProjectIdentityTests(unittest.TestCase):
             "REQUESTED_MODEL",
             "EFFORT_POLICY",
             "REQUESTED_EFFORT",
+            "ROUTING_DECISION_JSON",
             "FORK_TURNS",
             "LEASE_GENERATION",
             "STOP_GENERATION",
@@ -91,6 +92,32 @@ class ProjectIdentityTests(unittest.TestCase):
             self.assertIn(field, core)
         self.assertIn("exact:<path>", core)
         self.assertIn("prefix", core)
+
+    def test_adaptive_routing_is_bounded_auditable_and_quiet_by_default(self) -> None:
+        docs = "\n".join(
+            (
+                text(REPO / "README.md"),
+                text(REPO / "README.zh-CN.md"),
+                text(SKILL),
+                text(RUNTIME),
+            )
+        )
+        normalized_docs = " ".join(docs.split())
+        script = PLUGIN / "scripts" / "routing_catalog.py"
+        self.assertTrue(script.is_file())
+        for phrase in (
+            "strictly above 90",
+            "one-hour TTL",
+            "72 hours",
+            "strict Pareto",
+            "ROUTING_DECISION_JSON",
+            "routing_decision",
+            "--explain",
+            "never changes workers mid-run",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, normalized_docs)
+        self.assertIn("正常任务只使用最终模型与强度", docs)
 
     def test_acceptance_chain_is_one_way_and_structural(self) -> None:
         contracts = " ".join(text(CONTRACTS).split())
@@ -121,7 +148,9 @@ class ProjectIdentityTests(unittest.TestCase):
             self.assertNotIn("model", profile)
             self.assertNotIn("model_reasoning_effort", profile)
             self.assertFalse(profile["features"]["multi_agent"])
-            self.assertFalse(profile["features"]["multi_agent_v2"])
+            self.assertEqual(
+                profile["features"]["multi_agent_v2"], {"enabled": False}
+            )
             instructions = profile["developer_instructions"]
             self.assertIn("GRAPH_MANIFEST_SHA256", instructions)
             self.assertIn("ACCEPTANCE_CHAIN_SHA256", instructions)
@@ -132,6 +161,10 @@ class ProjectIdentityTests(unittest.TestCase):
         self.assertEqual(reviewer["model"], "gpt-5.6-sol")
         self.assertEqual(reviewer["model_reasoning_effort"], "high")
         self.assertEqual(reviewer["sandbox_mode"], "read-only")
+        self.assertFalse(reviewer["features"]["multi_agent"])
+        self.assertEqual(
+            reviewer["features"]["multi_agent_v2"], {"enabled": False}
+        )
         self.assertIn("ACCEPTANCE_CHAIN_SHA256", reviewer["developer_instructions"])
 
     def test_role_result_templates_match_stop_hook_required_fields(self) -> None:

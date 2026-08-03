@@ -553,6 +553,110 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 1, verify.stderr)
             self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
 
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
+    def test_git_control_junction_target_change_updates_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            hooks = repo / ".git" / "hooks"
+            target_a = root / "hooks-a"
+            target_b = root / "hooks-b"
+            shutil.copytree(hooks, target_a)
+            shutil.copytree(hooks, target_b)
+            shutil.rmtree(hooks)
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(hooks), str(target_a)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+
+            os.rmdir(hooks)
+            relinked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(hooks), str(target_b)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(relinked.returncode, 0, relinked.stderr)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
+
+    @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
+    def test_git_control_junction_target_content_change_updates_workspace_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            hooks = repo / ".git" / "hooks"
+            target = root / "hooks-target"
+            shutil.copytree(hooks, target)
+            marker = target / "cco-marker"
+            marker.write_text("baseline\n", encoding="utf-8")
+            shutil.rmtree(hooks)
+            linked = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(hooks), str(target)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(linked.returncode, 0, linked.stderr)
+
+            capture = subprocess.run(
+                [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            baseline = root / "baseline.json"
+            baseline.write_text(capture.stdout, encoding="utf-8")
+            marker.write_text("changed\n", encoding="utf-8")
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(verify.returncode, 1, verify.stderr)
+            self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
+
     @unittest.skipUnless(os.name == "nt", "8.3 aliases are Windows-specific")
     def test_refuses_an_existing_short_name_alias_to_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

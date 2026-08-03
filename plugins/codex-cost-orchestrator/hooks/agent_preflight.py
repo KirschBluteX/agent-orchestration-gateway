@@ -25,6 +25,12 @@ from protocol_hash import (  # noqa: E402
     reject_constant,
     reject_float,
 )
+from routing_catalog import (  # noqa: E402
+    RoutingCatalogError,
+    canonical_bytes as routing_canonical_bytes,
+    load_json_bytes as load_routing_json_bytes,
+    validate_route_decision,
+)
 from workspace_state import (  # noqa: E402
     StateError,
     repository_control_roots,
@@ -39,16 +45,6 @@ from workspace_state import (  # noqa: E402
 WORKER_ROLES = {
     "cost_orchestrator_routine_worker": "routine",
     "cost_orchestrator_complex_worker": "complex",
-}
-ROUTE_DEFAULT_VALUES = {
-    "routine": {
-        "model": frozenset({"gpt-5.6-luna", "gpt-5.6-terra"}),
-        "reasoning_effort": frozenset({"max"}),
-    },
-    "complex": {
-        "model": frozenset({"gpt-5.6-terra"}),
-        "reasoning_effort": frozenset({"max"}),
-    },
 }
 REVIEWER_ROLE = "cost_orchestrator_reviewer"
 WORK_HEADER = "CCO_WORK cco.v4"
@@ -77,6 +73,7 @@ WORK_FIELDS = (
     "REQUESTED_MODEL",
     "EFFORT_POLICY",
     "REQUESTED_EFFORT",
+    "ROUTING_DECISION_JSON",
     "ACCEPTANCE_IDS",
     "WRITE",
     "OBJECTIVE",
@@ -931,13 +928,54 @@ def validate_policy(fields: dict[str, str], tool_input: dict[str, Any]) -> None:
         elif policy in {"user", "route_default"}:
             if requested == "none" or not present or actual != requested:
                 raise PacketError("routing request does not match spawn")
-            if (
-                policy == "route_default"
-                and requested not in ROUTE_DEFAULT_VALUES[fields["LANE"]][input_field]
-            ):
-                raise PacketError("route default is outside the declared lane sequence")
         else:
             raise PacketError("routing policy is invalid")
+
+
+def validate_routing_decision_binding(
+    fields: dict[str, str], tool_input: dict[str, Any]
+) -> None:
+    model_policy = fields["MODEL_POLICY"]
+    effort_policy = fields["EFFORT_POLICY"]
+    adaptive = "route_default" in {model_policy, effort_policy}
+    anchors = parse_anchor_records(fields["INPUTS"], "content_sha256")
+    route_anchors = [item for item in anchors if item["id"] == "routing_decision"]
+    encoded = fields["ROUTING_DECISION_JSON"]
+    if not adaptive:
+        if encoded != "none" or route_anchors:
+            raise PacketError("non-adaptive routing carries an unexpected decision")
+        return
+    if "native" in {model_policy, effort_policy}:
+        raise PacketError("adaptive routing cannot be mixed with a native dimension")
+    if encoded == "none" or len(route_anchors) != 1:
+        raise PacketError("adaptive routing decision is not uniquely bound")
+    try:
+        decision = load_routing_json_bytes(
+            encoded.encode("utf-8"), "routing decision"
+        )
+        if routing_canonical_bytes(decision).decode("ascii") != encoded:
+            raise PacketError("routing decision is not canonical")
+        validated = validate_route_decision(
+            decision,
+            lane=fields["LANE"],
+            model=tool_input.get("model"),
+            effort=tool_input.get("reasoning_effort"),
+        )
+    except (RoutingCatalogError, UnicodeError) as error:
+        raise PacketError("adaptive routing decision is invalid") from error
+    if route_anchors[0]["content_sha256"] != validated["decision_sha256"]:
+        raise PacketError("adaptive routing decision hash is not bound in INPUTS")
+    constraints = validated["constraints"]
+    if model_policy == "user":
+        if constraints["fixed_model"] != fields["REQUESTED_MODEL"]:
+            raise PacketError("adaptive routing does not preserve the user model")
+    elif constraints["fixed_model"] is not None:
+        raise PacketError("adaptive routing has an unexpected fixed model")
+    if effort_policy == "user":
+        if constraints["fixed_effort"] != fields["REQUESTED_EFFORT"]:
+            raise PacketError("adaptive routing does not preserve the user effort")
+    elif constraints["fixed_effort"] is not None:
+        raise PacketError("adaptive routing has an unexpected fixed effort")
 
 
 def validate_worker(tool_input: dict[str, Any], role: str) -> None:
@@ -978,6 +1016,7 @@ def validate_worker(tool_input: dict[str, Any], role: str) -> None:
     validate_acceptance_and_verify(fields)
     write_paths = validate_repository_paths(fields["WRITE"], "WRITE", allow_none=True)
     validate_policy(fields, tool_input)
+    validate_routing_decision_binding(fields, tool_input)
 
     fork = validate_fork_turns(tool_input.get("fork_turns"))
     if fields["FORK_TURNS"] != fork:

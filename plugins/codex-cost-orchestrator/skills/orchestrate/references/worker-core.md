@@ -111,6 +111,7 @@ MODEL_POLICY: user | route_default | native
 REQUESTED_MODEL: <exact value or none>
 EFFORT_POLICY: user | route_default | native
 REQUESTED_EFFORT: <exact value or none>
+ROUTING_DECISION_JSON: <canonical adaptive decision or none>
 ACCEPTANCE_IDS: [A01]
 WRITE:
 - exact:<path>
@@ -128,7 +129,7 @@ RISK_FLAGS:
 DEPENDENCIES:
 - <id>#sha256:<state>, or none
 INPUTS:
-- <id>#sha256:<content>, or none
+- routing_decision#sha256:<decision>, other anchors, or none
 ACCEPTANCE:
 - A01: <criterion>
 VERIFY:
@@ -179,7 +180,12 @@ and dependencies are valid. Nonempty records are exactly
 `followup.current` is exactly 0 and its limit is 1–2. `fork_turns` is `none` or a
 positive integer string. `model_policy` and `effort_policy` are `user`,
 `route_default`, or `native`; only `native` requires its paired requested value to be
-`null`. Hash this object with `--domain input_closure` before formatting the envelope.
+`null`. A packet with either `route_default` dimension carries canonical
+`ROUTING_DECISION_JSON`; its `decision_sha256` is one sorted `content_anchors` record
+with ID `routing_decision`. The hook recomputes the decision, checks the strict IQ and
+sample gates, matches its selected model/effort to spawn, and verifies that anchor.
+Packets with no adaptive dimension use `ROUTING_DECISION_JSON: none` and omit the
+anchor. Hash this object with `--domain input_closure` before formatting the envelope.
 
 ## Primary verification and finish
 

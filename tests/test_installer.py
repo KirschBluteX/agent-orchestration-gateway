@@ -39,6 +39,23 @@ class InstallerBehaviorTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertIn(digest, installer_module.LEGACY_PROFILE_SHA256[filename])
 
+    def test_pre_compatibility_0_4_0_profiles_are_recognized_for_upgrade(self) -> None:
+        prior_hashes = {
+            "codex-cost-orchestrator-routine-worker.toml": (
+                "cf9e6b654c6426717ebf738548cf1b5830615b248bddc9acda2f29428b7f62a1"
+            ),
+            "codex-cost-orchestrator-complex-worker.toml": (
+                "a5937769fe00b99480feb5dcc289b862e4529d9605836d1a62d59de01dfcbb90"
+            ),
+            "codex-cost-orchestrator-reviewer.toml": (
+                "309381c4bb2c009d0f062677b00b6f74ecf788b9eacd018dd344e3f4b0bb20f8"
+            ),
+        }
+
+        for filename, digest in prior_hashes.items():
+            with self.subTest(filename=filename):
+                self.assertIn(digest, installer_module.LEGACY_PROFILE_SHA256[filename])
+
     def test_clean_install_is_exact_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "agents"

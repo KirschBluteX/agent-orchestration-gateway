@@ -1,7 +1,7 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "0.4.0",
-  "description": "Implicit cost-aware Codex routing with selectable workers, schema-checked inputs, generation fencing, contract-closed evidence, and exact-state acceptance.",
+  "version": "0.5.0",
+  "description": "Implicit Codex orchestration with adaptive IQ-gated worker routing, schema-checked inputs, generation fencing, contract-closed evidence, and exact-state acceptance.",
   "author": {
     "name": "KirschQAQ",
     "url": "https://github.com/KirschBluteX"
@@ -13,13 +13,14 @@
     "codex",
     "orchestration",
     "multi-agent",
+    "adaptive-routing",
     "gpt-5.6"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Codex Cost Orchestrator",
-    "shortDescription": "Cost-aware routing with selectable workers and exact-state acceptance.",
-    "longDescription": "Codex Cost Orchestrator implicitly classifies implementation work, verifies atomic low-risk edits directly in Sol, routes schema-checked closed contracts through availability-aware user-selectable model and effort policies, preflights native dispatch, fences stale worker results, preserves the original baseline, and gates exact-state completion through primary Sol evidence or a structurally required independent review epoch.",
+    "shortDescription": "Adaptive cost-aware workers with exact-state acceptance.",
+    "longDescription": "Codex Cost Orchestrator implicitly classifies implementation work, verifies atomic low-risk edits directly in Sol, and routes schema-checked closed contracts through user-selectable or adaptive model/effort policies. Adaptive routes intersect Codex capabilities with validated IQ, sample, cost, and time evidence, pin one decision per graph, preflight native dispatch, fence stale results, preserve the original baseline, and gate exact-state completion through primary Sol evidence or a structurally required independent review epoch.",
     "developerName": "KirschQAQ",
     "category": "Productivity",
     "capabilities": [

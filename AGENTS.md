@@ -49,14 +49,23 @@ risk, useful parallelism, or a need for independent acceptance.
 
 Routine and complex describe contract closure, not fixed model families. The worker
 model and reasoning effort are independently user-selectable per node. A user choice
-wins; either dimension may instead use native Codex resolution. The finite default
-order is Luna Max then Terra Max for routine and Terra Max for complex. Check a public
-native capability catalog when exposed, then let spawn validation remain authoritative.
-Candidate tuples overlay the independent dimensions: only a `route_default` dimension
-may advance, while `user` and `native` dimensions remain fixed.
+wins; either dimension may instead use native Codex resolution. At each new work graph,
+resolve every remaining `route_default` dimension with
+`scripts/routing_catalog.py`: intersect Codex's bundled capability catalog with the
+validated Radar snapshot, require observed IQ strictly greater than 90 and sufficient
+samples/cohort coverage, then select from a Wilson-aware strict Pareto frontier with
+fixed-anchor quality/cost/time utility. The default refresh TTL is one hour; pin the
+result for the whole graph and never switch mid-run. Do not surface the score breakdown
+unless the user asks or routing diagnosis requires it.
+
+User-fixed dimensions constrain the adaptive candidate set. A `route_default`
+dimension cannot be mixed with `native`; use both native or close the other dimension.
+Bind canonical `ROUTING_DECISION_JSON` through the `routing_decision` `INPUTS` anchor.
 Worker templates stay model-neutral and the reviewer stays pinned to Sol High. A
 rejected pre-thread route proposal consumes no worker attempt; an unavailable user
-choice fails closed, while a route default may use only its next predeclared candidate.
+choice fails closed, while a route default may use only the next candidate in its
+hash-bound fallback order. Radar/LKG exhaustion fails closed rather than reviving a
+static model list.
 Fence and reject any mismatch after a usable worker starts.
 
 ### Structural Multi gate

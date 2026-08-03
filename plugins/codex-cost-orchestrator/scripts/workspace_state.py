@@ -209,7 +209,30 @@ def refs_digest(root: Path) -> str:
     )
 
 
-def directory_digest(path: Path) -> str:
+def reparse_target(path: str | os.PathLike[str]) -> str | None:
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def reparse_resolved_record(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_dir():
+            return {
+                "kind": "directory",
+                "sha256": directory_digest(path, follow_reparse_content=False),
+            }
+        if path.is_file():
+            return {"kind": "file", "sha256": sha256_file(path)}
+        if not path.exists():
+            return {"kind": "missing"}
+        return {"kind": "special"}
+    except OSError as error:
+        raise StateError("Git control reparse target inspection failed") from error
+
+
+def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
     if not path.exists():
         return sha256_bytes(b'{"kind":"missing"}')
     records: list[dict[str, Any]] = []
@@ -229,12 +252,17 @@ def directory_digest(path: Path) -> str:
                 attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
             )
             if child.is_symlink() or is_reparse:
-                target = os.readlink(child.path) if child.is_symlink() else None
+                target = reparse_target(child.path)
                 records.append(
                     {
                         "kind": "reparse",
                         "mode": mode,
                         "path": relative,
+                        "resolved": (
+                            reparse_resolved_record(Path(child.path))
+                            if follow_reparse_content
+                            else None
+                        ),
                         "target_sha256": (
                             sha256_bytes(os.fsencode(target)) if target is not None else None
                         ),
@@ -274,10 +302,11 @@ def control_entry_record(path: Path) -> dict[str, Any]:
         attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
     if path.is_symlink() or is_reparse:
-        target = os.readlink(path) if path.is_symlink() else None
+        target = reparse_target(path)
         return {
             "kind": "reparse",
             "mode": mode,
+            "resolved": reparse_resolved_record(path),
             "target_sha256": (
                 sha256_bytes(os.fsencode(target)) if target is not None else None
             ),

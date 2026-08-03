@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: "Default cost-aware implementation router for Codex. Use implicitly for medium or large features, bug fixes, refactors, multi-file or cross-module changes, risky code changes, or work needing delegated implementation. Keep read-only requests and confidently atomic low-risk edits in Sol, and upgrade as soon as scope, uncertainty, or verification risk expands. Uses a Sol control plane, user-selectable worker model and effort, hash-bound contracts and inputs, bounded native subagents, generation-fenced leases, primary evidence, and structurally gated fresh/delta review epochs."
+description: "Default cost-aware implementation router for Codex. Use implicitly for medium or large features, bug fixes, refactors, multi-file or cross-module changes, risky code changes, or work needing delegated implementation. Keep read-only requests and confidently atomic low-risk edits in Sol, and upgrade as soon as scope, uncertainty, or verification risk expands. Uses a Sol control plane, user-selectable or IQ-gated adaptive worker model and effort, hash-bound contracts and inputs, bounded native subagents, generation-fenced leases, primary evidence, and structurally gated fresh/delta review epochs."
 ---
 
 # Codex Cost Orchestrator
@@ -117,20 +117,46 @@ both actions until the reviewer profile is available; do not defer this check to
 fresh reviewer spawn.
 
 Record `MODEL_POLICY` and `EFFORT_POLICY` independently as `user`, `route_default`, or
-`native`. User values win. The finite route-default order is Luna Max then Terra Max
-for routine and Terra Max for complex; a native dimension is omitted from spawn. When
-the current surface exposes a native model catalog, validate model, effort, and any
-task-required capability before dispatch; native spawn validation is still final.
-Build candidate tuples by overlaying dimensions: only a `route_default` dimension may
-advance through its finite sequence, while `user` and `native` dimensions stay fixed.
+`native`. User values win and are never replaced by the adaptive selector. A native
+dimension is omitted from spawn. At each new work-graph creation, resolve every lane
+that still has a `route_default` dimension with the shipped routing helper; do not
+refresh or change that decision while the graph is running:
+
+```text
+python scripts/routing_catalog.py resolve --lane <routine|complex> --packet \
+  [--fixed-model <user-model>] [--fixed-effort <user-effort>]
+```
+
+The helper intersects the current bundled Codex capability catalog with a validated
+CodexRadar snapshot, requires observed IQ strictly above 90 plus sample/cohort
+coverage, computes a Wilson-aware strict Pareto frontier, and selects by fixed-anchor
+quality/cost/time utility. Cost and time penalties remain monotonic above their
+anchors. Routine favors cost; complex favors quality. The default refresh TTL is one
+hour (minimum configurable value ten minutes). Raw responses remain in memory; disk
+keeps only one normalized LKG for at most 72 source-hours and one small hysteresis
+state, with no history. A new winner must persist across two distinct measurement
+snapshots unless the active route becomes ineligible or policy changes. Treat the
+compact score explanation as internal; do not show it unless the user asks or routing
+diagnosis requires it.
+
+Bind the complete canonical route decision in `ROUTING_DECISION_JSON` and its
+`decision_sha256` as the `routing_decision` content anchor in `INPUTS`. If one
+dimension is `user`, pass it as the matching fixed constraint. Do not mix a
+`route_default` dimension with a `native` dimension because the pair cannot be
+validated before spawn. When both dimensions are `user` or `native`, carry
+`ROUTING_DECISION_JSON: none` and no routing-decision anchor. Native spawn validation
+is still final.
+
 Observe every usable worker's role/model/effort before accepting its work. Exact user
 or selected route-default values must match; native values must be observable and
 stable. Never silently substitute a role, model, or effort.
 
 A native spawn rejection before it returns a usable canonical task path creates no
 owner and consumes no worker attempt or lease generation. An explicit user selection
-stops there. A route default may try only the next candidate in its already-recorded
-finite order with a newly hashed input closure. Once a usable worker exists, any
+stops there. A route default may use `routing_catalog.py advance` only for the next
+candidate in the hash-bound fallback order and must build a newly hashed input closure.
+If Radar and a source-age-valid LKG are both unavailable, fail closed instead of using
+an unverified static default. Once a usable worker exists, any
 routing mismatch is fenced, consumes that run, and cannot fall back in place.
 
 If a required role is missing or mismatched, fail closed before delegated writes. Name
@@ -261,15 +287,15 @@ Initial routine example:
 task_name: work_n01_auth_routine_r01
 agent_type: cost_orchestrator_routine_worker
 fork_turns: none
-model: gpt-5.6-luna
-reasoning_effort: max
+model: <selected decision model>
+reasoning_effort: <selected decision effort>
 message: <CCO_WORK cco.v4 packet>
 ```
 
-This example uses route defaults. Replace either value with the user's exact selection
-or omit only the native-policy dimension. If the first route-default proposal is
-rejected before a thread exists, use only the next predeclared candidate; do not count
-that proposal as a worker run. Use `cost_orchestrator_complex_worker` for the complex
+This example uses an adaptive route default. Replace either value with the user's exact
+selection or omit only a fully native pair. If the first route-default proposal is
+rejected before a thread exists, advance only through its bound fallback order; do not
+count that proposal as a worker run. Use `cost_orchestrator_complex_worker` for the complex
 lane. Record the returned canonical task path and address that exact path thereafter.
 Native V2 wait is targetless: after a mailbox update, identify the source against the
 single-flight ledger before accepting a result or issuing any target-bound operation.

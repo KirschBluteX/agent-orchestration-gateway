@@ -31,6 +31,7 @@ LEGACY_PROFILE_SHA256 = {
             "2c5b1716312ad7be52eaec26676b52c1a5168cb1d3c602d39a82f907b4afa93d",
             "c9b2187367ab1c167cae594bf589c74adb3b8959c3c4292751117aec820cdc21",
             "bc8ce4bfb9b58b0fac32272f60456b3b327f1d21427dd8e01dff5fd22ac5ceb5",
+            "cf9e6b654c6426717ebf738548cf1b5830615b248bddc9acda2f29428b7f62a1",
         }
     ),
     "codex-cost-orchestrator-complex-worker.toml": frozenset(
@@ -38,6 +39,7 @@ LEGACY_PROFILE_SHA256 = {
             "881c3b606c1e9092a96e79ad85bd5b57fef97156f4838a26b18191d18bfee681",
             "e50aadfd85e83841750cea5af5b076e746e7bfddf63cc3f24c27beddc9b8a851",
             "cca439e5c44163be360c665c18fbd9a1641fcd3e28d1488ef60e5ce0b58eb884",
+            "a5937769fe00b99480feb5dcc289b862e4529d9605836d1a62d59de01dfcbb90",
         }
     ),
     "codex-cost-orchestrator-reviewer.toml": frozenset(
@@ -45,6 +47,7 @@ LEGACY_PROFILE_SHA256 = {
             "015c8fe9da8b92a24f021120e71f6b0e3e0bfb10244ba529f7ff8981ce179e00",
             "395a35427315e71b37227a79ac38889aa9f102eebf7dbdb78d9ae86b510ee9bc",
             "1df307612992239960b4dececd79f6f1935b42662983204d350cb7ed519528b8",
+            "309381c4bb2c009d0f062677b00b6f74ecf788b9eacd018dd344e3f4b0bb20f8",
         }
     ),
 }
@@ -258,7 +261,12 @@ def template_error(path: Path, profile: str) -> str | None:
     if "agents" in value:
         return f"leaf profile must not declare an agents table: {path}"
     features = value.get("features", {})
-    if features.get("multi_agent") is not False or features.get("multi_agent_v2") is not False:
+    multi_agent_v2 = features.get("multi_agent_v2")
+    if (
+        features.get("multi_agent") is not False
+        or not isinstance(multi_agent_v2, dict)
+        or multi_agent_v2 != {"enabled": False}
+    ):
         return f"leaf profile must disable multi-agent features: {path}"
     return None
 
