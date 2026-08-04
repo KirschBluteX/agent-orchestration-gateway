@@ -18,6 +18,7 @@ from typing import Any
 from protocol_hash import (
     ProtocolHashError,
     parse_repository_scope_text,
+    require_repository_scope,
 )
 
 
@@ -446,12 +447,13 @@ def ignored_entries(
     *,
     max_files: int,
     max_bytes: int,
+    scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Fingerprint ignored paths for strict workspace protection.
+    """Fingerprint ignored paths globally or inside declared graph scopes.
 
-    Strict mode is deliberately bounded.  A repository whose ignored tree is too
-    large must use light mode or reduce that tree; silently sampling would turn a
-    fail-closed boundary into an unverifiable heuristic.
+    The scan is deliberately bounded. Silently sampling would turn a fail-closed
+    boundary into an unverifiable heuristic. Scope filtering happens before file and
+    byte limits so normal prepared graphs pay only for their typed authority.
     """
 
     if max_files < 0 or max_bytes < 0:
@@ -465,9 +467,11 @@ def ignored_entries(
         "-z",
     )
     paths = sorted(decode_path(value) for value in raw.split(b"\0") if value)
+    if scopes is not None:
+        paths = [path for path in paths if is_allowed(path, scopes)]
     if len(paths) > max_files:
         raise StateError(
-            f"strict ignored scan exceeds the {max_files} file limit"
+            f"ignored scan exceeds the {max_files} file limit"
         )
     total_bytes = 0
     entries: dict[str, dict[str, Any]] = {}
@@ -481,7 +485,7 @@ def ignored_entries(
             total_bytes += metadata.st_size
             if total_bytes > max_bytes:
                 raise StateError(
-                    f"strict ignored scan exceeds the {max_bytes} byte limit"
+                    f"ignored scan exceeds the {max_bytes} byte limit"
                 )
         entries[path] = {
             "fingerprint": fingerprint(root, path),
@@ -552,12 +556,18 @@ def tracked_entries(
     ignored_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
+    scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     index_records = (
         repository_index_records(root) if index_records is None else index_records
     )
     entries: dict[str, dict[str, Any]] = {}
-    for path, records in sorted(index_records.items()):
+    selected_records = (
+        index_records
+        if scopes is None
+        else {path: records for path, records in index_records.items() if is_allowed(path, scopes)}
+    )
+    for path, records in sorted(selected_records.items()):
         ordered_records = sorted(
             records,
             key=lambda item: (item["stage"], item["mode"], item["object_id"]),
@@ -599,7 +609,16 @@ def workspace_entries(
     ignored_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
+    scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    normalized_scopes = (
+        [
+            require_repository_scope(scope, f"workspace scope[{index}]")
+            for index, scope in enumerate(scopes)
+        ]
+        if scopes is not None
+        else None
+    )
     status = status_entries(root)
     tracked = tracked_entries(
         root,
@@ -607,14 +626,16 @@ def workspace_entries(
         ignored_mode=ignored_mode,
         ignored_max_files=ignored_max_files,
         ignored_max_bytes=ignored_max_bytes,
+        scopes=normalized_scopes,
     )
     ignored = (
         ignored_entries(
             root,
             max_files=ignored_max_files,
             max_bytes=ignored_max_bytes,
+            scopes=normalized_scopes,
         )
-        if ignored_mode == "strict"
+        if ignored_mode == "strict" or normalized_scopes is not None
         else {}
     )
     entries: dict[str, dict[str, Any]] = {}
@@ -677,6 +698,7 @@ def state_payload(
     ignored_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
+    scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     if ignored_mode not in WORKSPACE_MODES:
         raise StateError("workspace mode must be light or strict")
@@ -712,6 +734,7 @@ def state_payload(
             ignored_mode=ignored_mode,
             ignored_max_files=ignored_max_files,
             ignored_max_bytes=ignored_max_bytes,
+            scopes=scopes,
         ),
     }
     canonical = json.dumps(
@@ -941,6 +964,7 @@ def verify(
     *,
     control_roots: tuple[Path, ...] | None = None,
     index_records: dict[str, list[dict[str, str]]] | None = None,
+    scope_entries: bool = False,
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
     limits = baseline["ignored_limits"]
     current = state_payload(
@@ -950,6 +974,7 @@ def verify(
         ignored_mode=baseline["ignored_mode"],
         ignored_max_files=limits["max_files"],
         ignored_max_bytes=limits["max_bytes"],
+        scopes=allowed if scope_entries else None,
     )
     baseline_entries = baseline["entries"]
     current_entries = current["entries"]

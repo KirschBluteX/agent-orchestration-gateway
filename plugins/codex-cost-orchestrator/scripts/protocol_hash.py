@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Small canonical JSON and repository-scope helpers for CCO v6.
+"""Small canonical JSON and repository-scope helpers for CCO v7.
 
-The v6 dispatch capsule owns protocol identity.  This module intentionally does
+The v7 dispatch capsule owns protocol identity.  This module intentionally does
 not mirror capsule, contract, acceptance, route, or lifecycle schemas.
 """
 
@@ -19,7 +19,7 @@ MAX_NESTING_LEVELS = 64
 SCOPE_KINDS = frozenset({"exact", "prefix"})
 CANONICAL_TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 WIN32_DEVICE_BASENAME = re.compile(
-    r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$",
+    r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$",
     re.IGNORECASE,
 )
 WIN32_FORBIDDEN_PATH_CHARACTERS = frozenset('<>"|?*')

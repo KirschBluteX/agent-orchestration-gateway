@@ -4,15 +4,29 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
+import queue
 import secrets
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
+from typing import Any, Callable
+
+from routing_catalog import (  # noqa: E402
+    RoutingCatalogError,
+    load_native_catalog,
+    resolve_route_plan,
+)
 
 
 PROFILE_FILENAMES = {
@@ -23,7 +37,29 @@ PROFILE_AGENT_NAMES = {
     "read": "cost_orchestrator_read_leaf",
     "write": "cost_orchestrator_write_leaf",
 }
+PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
+PLUGIN_VERSION = "1.0.0"
+REQUIRED_HOOK_EVENTS = Counter(
+    {
+        "sessionStart": 1,
+        "preToolUse": 3,
+        "postToolUse": 1,
+        "subagentStop": 1,
+    }
+)
 LEGACY_PROFILE_SHA256 = {
+    "codex-cost-orchestrator-read-leaf.toml": frozenset(
+        {
+            # Published 0.9.0 model-neutral read leaf.
+            "61429cc3b87befab48353b6a9c8203a364a04dc2e6ddfafa0be61ef03c75af68",
+        }
+    ),
+    "codex-cost-orchestrator-write-leaf.toml": frozenset(
+        {
+            # Published 0.9.0 model-neutral write leaf.
+            "e3759c8092e929e6f1dbde98a08b9b3a2f003304ed244531aa1ea6cd9c1415f1",
+        }
+    ),
     "codex-cost-orchestrator-routine-worker.toml": frozenset(
         {
             "2c5b1716312ad7be52eaec26676b52c1a5168cb1d3c602d39a82f907b4afa93d",
@@ -66,6 +102,23 @@ LEGACY_PROFILE_SHA256 = {
         }
     ),
 }
+OBSOLETE_ROUTE_CACHE_NAMES = frozenset(
+    {
+        "native-catalog-v1.json",
+        "radar-lkg-v1.json",
+        "radar-refresh-request-v1.json",
+        "radar-refresh-v1.lock",
+        "routing-state-v1.json",
+        "routing-state-v2.json",
+        "routing-v1.lock",
+    }
+)
+OBSOLETE_ROUTE_CACHE_GLOBS = (
+    "native-catalog-v1.*.tmp",
+    "radar-lkg-v1.*.tmp",
+    "routing-state-v1.*.tmp",
+    "routing-state-v2.*.tmp",
+)
 
 
 class InstallTransactionError(Exception):
@@ -169,6 +222,27 @@ def removable_legacy_profiles(target: Path) -> list[Path]:
         if is_real_file(candidate) and file_sha256(candidate) in hashes:
             removable.append(candidate)
     return removable
+
+
+def cleanup_obsolete_route_cache(target: Path) -> list[Path]:
+    """Remove only filenames owned by the removed Radar runtime."""
+
+    cache = Path(os.path.abspath(target.expanduser())).parent / "cache" / "codex-cost-orchestrator"
+    if not cache.is_dir() or is_reparse(cache):
+        return []
+    candidates = {cache / name for name in OBSOLETE_ROUTE_CACHE_NAMES}
+    for pattern in OBSOLETE_ROUTE_CACHE_GLOBS:
+        candidates.update(cache.glob(pattern))
+    removed: list[Path] = []
+    for candidate in sorted(candidates, key=lambda path: path.name):
+        if not is_real_file(candidate):
+            continue
+        try:
+            candidate.unlink()
+        except OSError:
+            continue
+        removed.append(candidate)
+    return removed
 
 
 def prepare_change(
@@ -310,11 +384,22 @@ def active_config_folders(workspace: Path) -> list[Path]:
     workspace = Path(os.path.abspath(workspace.expanduser()))
     if not workspace.is_dir():
         raise ValueError("workspace is not a directory")
+    repository: Path | None = None
+    probe = workspace
+    while True:
+        if (probe / ".git").exists():
+            repository = probe
+            break
+        if probe == Path(probe.anchor):
+            break
+        probe = probe.parent
+    if repository is None:
+        return [workspace / ".codex"]
     folders: list[Path] = []
     current = workspace
     while True:
         folders.append(current / ".codex")
-        if (current / ".git").exists() or current == Path(current.anchor):
+        if current == repository:
             break
         current = current.parent
     return folders
@@ -409,15 +494,31 @@ def parse_args() -> argparse.Namespace:
         default=Path.cwd(),
         help="Active workspace whose project config layers must not shadow selected roles.",
     )
-    parser.add_argument(
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
         "--check",
         action="store_true",
         help="Verify exact installed copies without creating files.",
     )
-    parser.add_argument(
+    actions.add_argument(
         "--upgrade",
         action="store_true",
         help="Atomically replace only byte-identical profiles from known prior CCO releases.",
+    )
+    actions.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Install or safely upgrade the two CCO-owned profiles.",
+    )
+    actions.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Check profiles, Python, native capabilities, and static route readiness without changes.",
+    )
+    actions.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove only byte-identical CCO-owned profiles; preserve user changes.",
     )
     parser.add_argument(
         "--profile",
@@ -426,6 +527,333 @@ def parse_args() -> argparse.Namespace:
         help="Limit installation or checking to a required role; repeat as needed.",
     )
     return parser.parse_args()
+
+
+def uninstall(
+    target: Path,
+    *,
+    profiles: list[str] | None = None,
+) -> int:
+    """Remove only files whose bytes are owned by this or a known CCO release."""
+
+    target = Path(os.path.abspath(target.expanduser()))
+    selected_profiles = tuple(dict.fromkeys(profiles or PROFILE_FILENAMES))
+    filenames = tuple(PROFILE_FILENAMES[name] for name in selected_profiles)
+    script_dir = Path(__file__).resolve().parent
+    templates = script_dir.parent / "agents"
+    if target == Path(target.anchor) or has_reparse_ancestor(target):
+        fail(f"refusing to use an unsafe agent target directory: {target}")
+        return 1
+    if not target.exists():
+        print(f"UNINSTALL: no agent directory exists at {target}")
+        return 0
+    if not target.is_dir() or is_reparse(target):
+        fail(f"target directory is not a real directory: {target}")
+        return 1
+
+    errors: list[str] = []
+    changes: list[PreparedChange] = []
+    for profile in selected_profiles:
+        filename = PROFILE_FILENAMES[profile]
+        destination = target / filename
+        template = templates / filename
+        if not destination.exists() and not destination.is_symlink():
+            continue
+        if not is_real_file(destination):
+            errors.append(f"preserved non-regular profile: {destination}")
+            continue
+        destination_hash = file_sha256(destination)
+        if (
+            destination.read_bytes() != template.read_bytes()
+            and destination_hash not in LEGACY_PROFILE_SHA256.get(filename, frozenset())
+        ):
+            errors.append(f"preserved modified profile: {destination}")
+            continue
+        try:
+            changes.append(
+                prepare_change(
+                    target,
+                    filename,
+                    destination,
+                    destination.read_bytes(),
+                    "remove",
+                    file_identity(destination),
+                    file_sha256(destination),
+                )
+            )
+        except (OSError, InstallTransactionError) as error:
+            errors.append(f"preserved profile {destination}: {error}")
+
+    if profiles is None:
+        for destination in removable_legacy_profiles(target):
+            if destination.name in filenames:
+                continue
+            try:
+                changes.append(
+                    prepare_change(
+                        target,
+                        destination.name,
+                        destination,
+                        destination.read_bytes(),
+                        "remove",
+                        file_identity(destination),
+                        file_sha256(destination),
+                    )
+                )
+            except (OSError, InstallTransactionError) as error:
+                errors.append(f"preserved legacy profile {destination}: {error}")
+
+    try:
+        for change in changes:
+            if (
+                not is_real_file(change.destination)
+                or change.source_identity is None
+                or file_identity(change.destination) != change.source_identity
+                or change.source_sha256 is None
+                or file_sha256(change.destination) != change.source_sha256
+            ):
+                raise InstallTransactionError(
+                    f"profile changed during uninstall: {change.destination}"
+                )
+            change.destination.unlink()
+            change.applied = True
+    except (OSError, InstallTransactionError) as error:
+        errors.append(str(error))
+        rollback_errors = rollback_prepared(changes)
+        errors.extend(rollback_errors)
+    finally:
+        cleanup_prepared(changes)
+
+    for change in changes:
+        if change.applied is False and change.destination.exists():
+            continue
+        if not change.destination.exists():
+            print(f"REMOVED: {change.destination}")
+    for error in errors:
+        fail(error)
+    return 1 if errors else 0
+
+
+def load_hook_inventory(
+    workspace: Path,
+    *,
+    executable: Path | None = None,
+    timeout_seconds: float = 10.0,
+) -> dict[str, object]:
+    """Read Codex's authoritative hook trust view without changing config."""
+
+    if timeout_seconds <= 0:
+        raise ValueError("hook inventory timeout must be positive")
+    if executable is None:
+        names = ("codex.cmd", "codex") if os.name == "nt" else ("codex",)
+        resolved = next((shutil.which(name) for name in names if shutil.which(name)), None)
+        executable = Path(resolved) if resolved else None
+    if executable is None:
+        raise OSError("Codex CLI is unavailable for hook trust inspection")
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    process = subprocess.Popen(
+        [str(executable), "app-server", "--listen", "stdio://"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        creationflags=creationflags,
+    )
+    if process.stdin is None or process.stdout is None:
+        process.kill()
+        raise OSError("Codex app-server pipes are unavailable")
+
+    messages: queue.Queue[object] = queue.Queue()
+
+    def read_messages() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            try:
+                messages.put(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        messages.put(None)
+
+    reader = threading.Thread(target=read_messages, daemon=True)
+    reader.start()
+
+    def send(message: dict[str, object]) -> None:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+
+    def response(request_id: int) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OSError("Codex hook trust inspection timed out")
+            try:
+                message = messages.get(timeout=remaining)
+            except queue.Empty as error:
+                raise OSError("Codex hook trust inspection timed out") from error
+            if message is None:
+                raise OSError("Codex app-server closed before returning hook state")
+            if not isinstance(message, dict) or message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise OSError(f"Codex app-server rejected hook inspection: {message['error']}")
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise OSError("Codex app-server returned malformed hook state")
+            return result
+
+    try:
+        send(
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "capabilities": {"experimentalApi": True},
+                    "clientInfo": {
+                        "name": "codex_cost_orchestrator_doctor",
+                        "title": "CCO Doctor",
+                        "version": PLUGIN_VERSION,
+                    },
+                },
+            }
+        )
+        response(1)
+        send({"method": "initialized"})
+        send(
+            {
+                "id": 2,
+                "method": "hooks/list",
+                "params": {"cwds": [str(Path(workspace).resolve())]},
+            }
+        )
+        result = response(2)
+        data = result.get("data")
+        if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            raise OSError("Codex app-server returned no exact workspace hook state")
+        return data[0]
+    finally:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait(timeout=2)
+
+
+def doctor(
+    target: Path,
+    *,
+    workspace: Path,
+    native_loader: Callable[[], dict[str, object]] | None = None,
+    hook_loader: Callable[[Path], dict[str, object]] | None = None,
+) -> int:
+    """Perform read-only installation and static-route readiness checks."""
+
+    errors: list[str] = []
+    if sys.version_info < (3, 11):
+        errors.append("Python 3.11 or newer is required")
+    plugin_root = Path(__file__).resolve().parent.parent
+    hooks_path = plugin_root / "hooks" / "hooks.json"
+    manifest_path = plugin_root / ".codex-plugin" / "plugin.json"
+    skill_path = plugin_root / "skills" / "orchestrate" / "SKILL.md"
+    for path in (hooks_path, manifest_path, skill_path):
+        if not is_real_file(path):
+            errors.append(f"required plugin file is unavailable: {path}")
+    if is_real_file(hooks_path):
+        try:
+            hook_document = json.loads(hooks_path.read_text(encoding="utf-8"))
+            events = set(hook_document.get("hooks", {}))
+            required_events = {"SessionStart", "PreToolUse", "PostToolUse", "SubagentStop"}
+            if not required_events <= events:
+                errors.append("hook lifecycle configuration is incomplete")
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            errors.append("hook lifecycle configuration is unreadable")
+    profile_result = install(
+        target,
+        check_only=True,
+        profiles=None,
+        workspace=workspace,
+    )
+    if profile_result != 0:
+        errors.append("installed CCO profiles are not ready")
+    try:
+        inventory = (hook_loader or load_hook_inventory)(workspace)
+        hooks = inventory.get("hooks")
+        warnings = inventory.get("warnings", [])
+        discovery_errors = inventory.get("errors", [])
+        if not isinstance(hooks, list) or not isinstance(warnings, list) or not isinstance(discovery_errors, list):
+            raise OSError("Codex hook inventory is malformed")
+        plugin_hooks = [
+            hook
+            for hook in hooks
+            if isinstance(hook, dict) and hook.get("pluginId") == PLUGIN_ID
+        ]
+        counts = Counter(
+            hook.get("eventName")
+            for hook in plugin_hooks
+            if isinstance(hook.get("eventName"), str)
+        )
+        if any(counts[event] < count for event, count in REQUIRED_HOOK_EVENTS.items()):
+            errors.append("CCO hooks are not fully discovered by this Codex installation")
+        plugin_root = Path(__file__).resolve().parent.parent
+        for hook in plugin_hooks:
+            source_path = hook.get("sourcePath")
+            source_matches = False
+            if isinstance(source_path, str):
+                try:
+                    source_matches = Path(source_path).resolve() == (plugin_root / "hooks" / "hooks.json").resolve()
+                except OSError:
+                    source_matches = False
+            if not source_matches:
+                errors.append("Codex discovered CCO hooks from a different plugin version")
+                break
+        unready = [
+            hook
+            for hook in plugin_hooks
+            if hook.get("enabled") is not True
+            or str(hook.get("trustStatus", "")).casefold() not in {"managed", "trusted"}
+        ]
+        if unready:
+            errors.append(
+                "CCO hooks are NOT READY; open /hooks, review every CCO hook, and trust the current definitions"
+            )
+        if discovery_errors:
+            errors.append("Codex reported hook discovery errors")
+        if not unready and plugin_hooks and not discovery_errors:
+            print(f"HOOKS READY: {len(plugin_hooks)} current CCO hooks are enabled and trusted.")
+    except (OSError, ValueError) as error:
+        errors.append(f"CCO hook trust could not be verified: {error}")
+    try:
+        catalog = (native_loader or load_native_catalog)()
+        plan = resolve_route_plan(
+            [
+                {
+                    "assurance": "mechanical",
+                    "constraints": {
+                        "fixed_effort": None,
+                        "fixed_model": None,
+                        "source": "automatic",
+                    },
+                    "node": "doctor_worker",
+                    "role": "worker",
+                }
+            ],
+            catalog,
+        )
+        selected = plan["routes"][0]["selected"]
+        print(
+            "STATIC ROUTE READY: "
+            f"{selected['model']}/{selected['effort']} "
+            f"(fallbacks={len(plan['routes'][0]['candidates']) - 1})"
+        )
+    except (OSError, RoutingCatalogError) as error:
+        errors.append(f"static native route is unavailable: {error}")
+    for error in errors:
+        fail(error)
+    return 1 if errors else 0
 
 
 def install(
@@ -537,6 +965,8 @@ def install(
 
         if upgrade:
             for destination in removable_legacy_profiles(target):
+                if destination.name in filenames:
+                    continue
                 changes.append(
                     prepare_change(
                         target,
@@ -642,17 +1072,25 @@ def install(
 
 def main() -> int:
     args = parse_args()
-    if args.check and args.upgrade:
-        fail("--check and --upgrade are mutually exclusive")
-        return 1
     try:
-        return install(
+        if args.doctor:
+            return doctor(args.target_dir, workspace=args.workspace)
+        if args.uninstall:
+            result = uninstall(args.target_dir, profiles=args.profile)
+            for path in cleanup_obsolete_route_cache(args.target_dir):
+                print(f"REMOVED OBSOLETE CACHE: {path}")
+            return result
+        result = install(
             args.target_dir,
             check_only=args.check,
-            upgrade=args.upgrade,
+            upgrade=args.upgrade or args.bootstrap,
             profiles=args.profile,
             workspace=args.workspace,
         )
+        if result == 0 and args.bootstrap:
+            for path in cleanup_obsolete_route_cache(args.target_dir):
+                print(f"REMOVED OBSOLETE CACHE: {path}")
+        return result
     except (OSError, ValueError) as error:
         fail(f"profile installation could not start: {error}")
         return 1

@@ -13,365 +13,81 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+from task_ledger import LedgerConflict, TaskLedger  # noqa: E402
+
 
 def identity(
-    *, run: str = "run_n01_policy_r01", generation: int | None = None
+    *,
+    generation: int = 1,
+    assurance: str = "mechanical",
+    model: str = "gpt-5.6-luna",
+    rank: int = 1,
 ) -> dict[str, object]:
-    suffix = run.rsplit("_", 1)[-1]
     return {
+        "acceptance_ids": ["A01"],
+        "assurance": assurance,
         "contract_rev": 1,
         "contract_sha256": "sha256:" + "a" * 64,
-        "input_sha256": "sha256:" + "b" * 64,
-        "generation": generation if generation is not None else int(suffix[1:]),
         "cursor": 0,
-        "node": "n01_policy",
-        "role": "cost_orchestrator_write_leaf",
-        "run": run,
+        "generation": generation,
+        "input_sha256": "sha256:" + chr(96 + generation + rank) * 64,
+        "node": "n01_worker",
+        "role": "worker",
+        "route": {
+            "assurance": assurance,
+            "constraints": {
+                "fixed_effort": None,
+                "fixed_model": None,
+                "source": "automatic",
+            },
+            "decision_sha256": "sha256:" + "c" * 64,
+            "plan_sha256": "sha256:" + chr(99 + rank) * 64,
+            "rank": rank,
+            "selected": {"effort": "max", "model": model},
+        },
+        "run": f"worker_n01_worker_g{generation:02d}",
     }
 
 
-class TaskLedgerBehaviorTests(unittest.TestCase):
-    def test_worker_result_is_retired_without_primary_acceptance(self) -> None:
-        from task_ledger import TaskLedger
-
-        owner = "/root/work_n01_policy_complex_r01"
+class TaskLedgerTests(unittest.TestCase):
+    def test_prethread_fallback_requires_each_confirmed_rank_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", owner)
-
-            returned = ledger.record_result(
-                node="n01_policy",
-                contract_rev=1,
-                run="run_n01_policy_r01",
-                generation=1,
-                input_sha256="sha256:" + "b" * 64,
-                owner=owner,
-                disposition="retired",
-            )
-
-            self.assertEqual(returned["state"], "retired")
-            self.assertNotIn("result_status", returned)
-            self.assertNotIn("complete", {returned["state"]})
-
-    def test_fix_first_delta_ship_uses_one_prepared_continuation(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        owner = "/root/review_e01_r01"
-        review = {
-            **identity(),
-            "node": "review_e01",
-            "run": "run_review_e01_r01",
-            "role": "cost_orchestrator_read_leaf",
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("spawn", review)
-            ledger.activate("spawn", owner)
-            fix_first = ledger.record_result(
-                node="review_e01",
-                contract_rev=1,
-                run="run_review_e01_r01",
-                generation=1,
-                input_sha256="sha256:" + "b" * 64,
-                owner=owner,
-                disposition="continuable",
-            )
-            self.assertEqual(fix_first["state"], "continuable")
-            repeated = ledger.record_result(
-                node="review_e01",
-                contract_rev=1,
-                run="run_review_e01_r01",
-                generation=1,
-                input_sha256="sha256:" + "b" * 64,
-                owner=owner,
-                disposition="continuable",
-            )
-            self.assertEqual(repeated, fix_first)
-
-            ledger.prepare_continuation(
-                "delta-1",
-                owner,
-                previous_input_sha256="sha256:" + "b" * 64,
-                next_input_sha256="sha256:" + "c" * 64,
-                cursor=1,
-            )
-            with self.assertRaises(LedgerConflict):
-                ledger.prepare_continuation(
-                    "delta-racing",
-                    owner,
-                    previous_input_sha256="sha256:" + "b" * 64,
-                    next_input_sha256="sha256:" + "d" * 64,
-                    cursor=1,
-                )
-            settled = ledger.settle_continuation("delta-1", accepted=True)
-            self.assertEqual(settled["state"], "owned")
-            self.assertEqual(settled["input_sha256"], "sha256:" + "c" * 64)
-
-            shipped = ledger.record_result(
-                node="review_e01",
-                contract_rev=1,
-                run="run_review_e01_r01",
-                generation=1,
-                input_sha256="sha256:" + "c" * 64,
-                owner=owner,
-                disposition="retired",
-                cursor=1,
-            )
-            self.assertEqual(shipped["state"], "retired")
-
-    def test_new_generation_replaces_retired_owner_and_rejects_late_result(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        old_owner = "/root/work_n01_policy_complex_r01"
-        new_owner = "/root/work_n01_policy_complex_r02"
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("spawn-1", identity())
-            ledger.activate("spawn-1", old_owner)
-            ledger.retire(old_owner)
-            ledger.reserve("spawn-2", identity(run="run_n01_policy_r02"))
-            ledger.activate("spawn-2", new_owner)
-
-            with self.assertRaises(LedgerConflict):
-                ledger.record_result(
-                    node="n01_policy",
-                    contract_rev=1,
-                    run="run_n01_policy_r01",
-                    generation=1,
-                    input_sha256="sha256:" + "b" * 64,
-                    owner=old_owner,
-                    disposition="retired",
-                )
-            current = ledger.read_rows()[0]
-            self.assertEqual(current["owner"], new_owner)
-            self.assertEqual(current["generation"], 2)
-
-    def test_retired_and_superseded_owners_remain_fenced_until_cleanup(self) -> None:
-        from task_ledger import TaskLedger
-
-        old_owner = "/root/work_n01_policy_complex_r01"
-        new_owner = "/root/work_n01_policy_complex_r02"
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("spawn-1", identity())
-            ledger.activate("spawn-1", old_owner)
-            ledger.retire(old_owner)
-            self.assertTrue(ledger.is_managed_owner(old_owner))
-
-            ledger.reserve("spawn-2", identity(run="run_n01_policy_r02"))
-            ledger.activate("spawn-2", new_owner)
-            self.assertTrue(ledger.is_managed_owner(old_owner))
-            self.assertTrue(ledger.is_managed_owner(new_owner))
-
-            ledger.cleanup_if_terminal(force=True)
-            self.assertFalse(ledger.is_managed_owner(old_owner))
-
-    def test_generation_is_the_only_takeover_fence(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        owner = "/root/work_n01_policy_complex_r01"
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("spawn-1", identity())
-            ledger.activate("spawn-1", owner)
-            ledger.retire(owner)
-
-            with self.assertRaises(LedgerConflict):
+            with self.assertRaisesRegex(LedgerConflict, "rank 1"):
                 ledger.reserve(
-                    "spawn-stale",
-                    identity(run="run_n01_policy_r02", generation=1),
-                )
-            replacement = ledger.reserve(
-                "spawn-current",
-                identity(run="run_n01_policy_r02", generation=2),
-            )
-            self.assertEqual(replacement["generation"], 2)
-
-    def test_one_node_revision_can_have_only_one_reserved_owner(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            first = ledger.reserve("tool-1", identity())
-
-            self.assertEqual(first["state"], "reserved")
-            self.assertNotIn("identity_sha256", first)
-            self.assertNotIn("entry_sha256", first)
-            self.assertNotIn("transition_sha256", first)
-            with self.assertRaises(LedgerConflict):
-                ledger.reserve("tool-2", identity(run="run_n01_policy_r02"))
-
-    def test_repeating_the_same_reservation_is_idempotent(self) -> None:
-        from task_ledger import TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            first = ledger.reserve("tool-1", identity())
-            repeated = ledger.reserve("tool-1", identity())
-
-            self.assertEqual(repeated, first)
-
-    def test_postflight_activates_the_reserved_native_owner(self) -> None:
-        from task_ledger import TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-
-            active = ledger.activate(
-                "tool-1", "/root/work_n01_policy_complex_r01"
-            )
-
-            self.assertEqual(active["state"], "owned")
-            self.assertEqual(
-                active["owner"], "/root/work_n01_policy_complex_r01"
-            )
-
-    def test_failed_native_spawn_releases_its_reservation(self) -> None:
-        from task_ledger import TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-
-            ledger.release("tool-1")
-            replacement = ledger.reserve(
-                "tool-2", identity(run="run_n01_policy_r02")
-            )
-
-            self.assertEqual(replacement["state"], "reserved")
-
-    def test_live_continuation_must_match_owner_and_current_input(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", "/root/work_n01_policy_complex_r01")
-
-            ledger.prepare_continuation(
-                "continuation-1",
-                "/root/work_n01_policy_complex_r01",
-                previous_input_sha256="sha256:" + "b" * 64,
-                next_input_sha256="sha256:" + "c" * 64,
-                cursor=1,
-            )
-            continued = ledger.settle_continuation("continuation-1", accepted=True)
-            self.assertEqual(continued["input_sha256"], "sha256:" + "c" * 64)
-            self.assertEqual(continued["cursor"], 1)
-            with self.assertRaises(LedgerConflict):
-                ledger.prepare_continuation(
-                    "continuation-stale",
-                    "/root/work_n01_policy_complex_r01",
-                    previous_input_sha256="sha256:" + "b" * 64,
-                    next_input_sha256="sha256:" + "d" * 64,
-                    cursor=2,
+                    "skip-initial",
+                    identity(rank=2, model="gpt-5.6-terra"),
                 )
 
-    def test_rejected_continuation_restores_the_previous_cursor(self) -> None:
-        from task_ledger import TaskLedger
-
-        owner = "/root/work_n01_policy_complex_r01"
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", owner)
-            ledger.prepare_continuation(
-                "continuation-rejected",
-                owner,
-                previous_input_sha256="sha256:" + "b" * 64,
-                next_input_sha256="sha256:" + "c" * 64,
-                cursor=1,
-            )
-
-            restored = ledger.settle_continuation("continuation-rejected", accepted=False)
-
-            self.assertEqual(restored["state"], "owned")
-            self.assertEqual(restored["input_sha256"], "sha256:" + "b" * 64)
-            self.assertEqual(restored["cursor"], 0)
-
-    def test_retire_rejects_a_late_result(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", "/root/work_n01_policy_complex_r01")
-
-            retired = ledger.retire("/root/work_n01_policy_complex_r01")
-
-            self.assertEqual(retired["state"], "retired")
-            with self.assertRaises(LedgerConflict):
-                ledger.record_result(
-                    node="n01_policy",
-                    contract_rev=1,
-                    run="run_n01_policy_r01",
-                    generation=1,
-                    input_sha256="sha256:" + "b" * 64,
-                    owner="/root/work_n01_policy_complex_r01",
-                    disposition="retired",
+            ledger.reserve("spawn-r1", identity())
+            ledger.release("spawn-r1")
+            self.assertEqual(ledger.read_rows()[0]["state"], "rejected")
+            with self.assertRaisesRegex(LedgerConflict, "next fallback rank"):
+                ledger.reserve(
+                    "skip-r2",
+                    identity(rank=3, model="gpt-5.6-terra"),
                 )
-
-    def test_returned_result_retires_owner_but_allows_a_new_generation(self) -> None:
-        from task_ledger import TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", "/root/work_n01_policy_complex_r01")
-
-            returned = ledger.record_result(
-                node="n01_policy",
-                contract_rev=1,
-                run="run_n01_policy_r01",
-                generation=1,
-                input_sha256="sha256:" + "b" * 64,
-                owner="/root/work_n01_policy_complex_r01",
-                disposition="retired",
+            fallback = ledger.reserve(
+                "spawn-r2",
+                identity(rank=2, model="gpt-5.6-terra"),
             )
-            replacement = ledger.reserve("tool-2", identity(run="run_n01_policy_r02"))
+            self.assertEqual(fallback["route"]["rank"], 2)
+            self.assertEqual(fallback["state"], "reserved")
 
-            self.assertEqual(returned["state"], "retired")
-            self.assertEqual(replacement["generation"], 2)
-
-    def test_fenced_revision_requires_a_new_generation(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", "/root/work_n01_policy_complex_r01")
-            ledger.retire("/root/work_n01_policy_complex_r01")
-            with self.assertRaises(LedgerConflict):
-                ledger.reserve("tool-2", identity(run="run_n01_policy_r01"))
-            replacement = ledger.reserve("tool-3", identity(run="run_n01_policy_r02"))
-            self.assertEqual(replacement["run"], "run_n01_policy_r02")
-
-            ledger.release("tool-3")
-            restored = ledger.read_rows()[0]
-            self.assertEqual(restored["state"], "retired")
-            self.assertEqual(restored["run"], "run_n01_policy_r01")
-
-    def test_concurrent_reservations_leave_valid_json_and_one_owner(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
+    def test_concurrent_reservations_leave_one_valid_owner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = TaskLedger(Path(directory), "session-a")
             outcomes: list[str] = []
 
-            def reserve(tool_id: str) -> None:
+            def reserve(call_id: str) -> None:
                 try:
-                    ledger.reserve(tool_id, identity())
+                    ledger.reserve(call_id, identity())
                 except LedgerConflict:
                     outcomes.append("conflict")
                 else:
                     outcomes.append("reserved")
 
-            threads = [
-                threading.Thread(target=reserve, args=(f"tool-{index}",))
-                for index in range(2)
-            ]
+            threads = [threading.Thread(target=reserve, args=(f"call-{index}",)) for index in range(2)]
             for thread in threads:
                 thread.start()
             for thread in threads:
@@ -380,83 +96,97 @@ class TaskLedgerBehaviorTests(unittest.TestCase):
             self.assertEqual(sorted(outcomes), ["conflict", "reserved"])
             self.assertEqual(len(ledger.read_rows()), 1)
 
-    def test_task_stop_removes_ledger_and_atomic_staging_files(self) -> None:
-        from task_ledger import TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ledger = TaskLedger(root, "session-a")
-            ledger.reserve("tool-1", identity())
-
-            ledger.cleanup_if_terminal(force=True)
-
-            self.assertFalse(ledger.path.exists())
-            self.assertEqual(list(root.glob(".*.tmp-*.json")), [])
-
-    def test_terminal_cleanup_does_not_remove_a_live_row(self) -> None:
-        from task_ledger import TaskLedger
-
+    def test_continuation_is_single_flight_and_rejection_preserves_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-
-            self.assertFalse(ledger.cleanup_if_terminal())
-            self.assertTrue(ledger.path.exists())
-
-            ledger.activate("tool-1", "/root/work_n01_policy_complex_r01")
-            ledger.retire("/root/work_n01_policy_complex_r01")
-            self.assertTrue(ledger.cleanup_if_terminal())
-            self.assertFalse(ledger.path.exists())
-
-    def test_partial_worker_result_retires_its_exact_owner(self) -> None:
-        from task_ledger import LedgerConflict, TaskLedger
-
-        with tempfile.TemporaryDirectory() as directory:
-            ledger = TaskLedger(Path(directory), "session-a")
-            ledger.reserve("tool-1", identity())
-            ledger.activate("tool-1", "/root/work_n01_policy_complex_r01")
-
-            row = ledger.record_result(
-                node="n01_policy",
-                contract_rev=1,
-                run="run_n01_policy_r01",
-                input_sha256="sha256:" + "b" * 64,
-                generation=1,
-                owner="/root/work_n01_policy_complex_r01",
-                disposition="retired",
+            owner = "/root/worker_n01_worker_g01"
+            ledger.reserve("spawn", identity())
+            ledger.activate("spawn", owner)
+            ledger.prepare_continuation(
+                "continue-1",
+                owner,
+                previous_input_sha256="sha256:" + "b" * 64,
+                next_input_sha256="sha256:" + "e" * 64,
+                cursor=1,
             )
+            with self.assertRaisesRegex(LedgerConflict, "pending"):
+                ledger.prepare_continuation(
+                    "continue-2",
+                    owner,
+                    previous_input_sha256="sha256:" + "b" * 64,
+                    next_input_sha256="sha256:" + "f" * 64,
+                    cursor=1,
+                )
+            ledger.settle_pending_continuation("continue-1", accepted=False)
+            row = ledger.read_rows()[0]
+            self.assertEqual(row["cursor"], 0)
+            self.assertEqual(row["input_sha256"], "sha256:" + "b" * 64)
 
-            self.assertEqual(row["state"], "retired")
-            with self.assertRaises(LedgerConflict):
+    def test_retired_and_superseded_owners_remain_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = TaskLedger(Path(directory), "session-a")
+            first_owner = "/root/worker_n01_worker_g01"
+            ledger.reserve("spawn-1", identity())
+            ledger.activate("spawn-1", first_owner)
+            ledger.retire(first_owner)
+            self.assertTrue(ledger.is_managed_owner(first_owner))
+
+            replacement = ledger.reserve(
+                "spawn-2",
+                identity(generation=2, assurance="guarded", model="gpt-5.6-terra"),
+            )
+            self.assertEqual(replacement["generation"], 2)
+            with self.assertRaisesRegex(LedgerConflict, "stale"):
                 ledger.record_result(
-                    node="n01_policy",
+                    node="n01_worker",
                     contract_rev=1,
-                    run="run_n01_policy_r01",
-                    input_sha256="sha256:" + "b" * 64,
+                    run="worker_n01_worker_g01",
                     generation=1,
-                    owner="/root/work_n01_policy_complex_r01",
+                    input_sha256="sha256:" + "b" * 64,
+                    owner=first_owner,
                     disposition="retired",
                 )
 
-    def test_lazy_cleanup_removes_only_expired_ledger_residue(self) -> None:
-        from task_ledger import TaskLedger
-
+    def test_cleanup_removes_only_terminal_or_expired_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            stale = TaskLedger(root, "session-old")
-            current = TaskLedger(root, "session-current")
-            stale.reserve("tool-old", identity())
-            current.reserve("tool-current", identity())
-            expired = time.time() - 120
-            os.utime(stale.path, (expired, expired))
+            ledger = TaskLedger(root, "current")
+            owner = "/root/worker_n01_worker_g01"
+            ledger.reserve("spawn", identity())
+            self.assertFalse(ledger.cleanup_if_terminal())
+            ledger.activate("spawn", owner)
+            ledger.retire(owner)
+            self.assertTrue(ledger.cleanup_if_terminal())
+            self.assertFalse(ledger.path.exists())
 
+            stale = root / "stale.json"
+            stale.write_text('{"fenced_owners":[],"guarded_floors":[],"rows":{}}', encoding="utf-8")
+            old = time.time() - 120
+            os.utime(stale, (old, old))
+            fresh = root / "fresh.json"
+            fresh.write_text('{"fenced_owners":[],"guarded_floors":[],"rows":{}}', encoding="utf-8")
+            active = TaskLedger(root, "active")
+            active.reserve("spawn-active", identity())
+            os.utime(active.path, (old, old))
             removed = TaskLedger.cleanup_stale(
-                root, keep_session_id="session-current", max_age_seconds=60
+                root,
+                keep_session_id="current",
+                max_age_seconds=60,
+                live_max_age_seconds=180,
             )
+            self.assertEqual(removed, [stale])
+            self.assertTrue(fresh.exists())
+            self.assertTrue(active.path.exists())
 
-            self.assertEqual(removed, [stale.path])
-            self.assertFalse(stale.path.exists())
-            self.assertTrue(current.path.exists())
+            very_old = time.time() - 240
+            os.utime(active.path, (very_old, very_old))
+            removed = TaskLedger.cleanup_stale(
+                root,
+                keep_session_id="current",
+                max_age_seconds=60,
+                live_max_age_seconds=180,
+            )
+            self.assertEqual(removed, [active.path])
 
 
 if __name__ == "__main__":

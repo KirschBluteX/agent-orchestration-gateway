@@ -19,10 +19,8 @@ from protocol_hash import (
 )
 
 
-PURPOSES = frozenset(
-    {"analysis_inspect", "analysis_probe", "implementation", "acceptance"}
-)
-JUDGMENTS = frozenset({"routine", "complex"})
+ROLES = frozenset({"explorer", "reviewer", "worker"})
+ASSURANCES = frozenset({"mechanical", "bounded", "guarded"})
 DECISION_SPACES = frozenset(
     {"acceptance_equivalent", "bounded_effect", "unbounded", "unresolved"}
 )
@@ -55,46 +53,36 @@ RISK_CATEGORIES = tuple(
 )
 RISK_ANSWERS = frozenset({"no", "yes"})
 VERIFICATION_STRENGTHS = frozenset({"deterministic", "manual", "nondeterministic"})
-ROUTE_ASSURANCES = frozenset({"deterministic", "guarded"})
 ACCEPTANCE_EVENTS = frozenset(
     {
-        "concurrent_execution",
         "deviation",
         "explicit_independent_review",
         "failure",
-        "followup",
-        "retry",
         "routing_mismatch",
         "scope_surprise",
         "primary_owned_change",
     }
 )
-# A concurrent dispatch is a placement/capacity fact, not evidence that the
-# resulting state needs an independent acceptance reviewer.  Keep the enum in
-# the wire protocol for backwards-compatible packet parsing, but do not let it
-# independently upgrade the acceptance mode.
-INDEPENDENT_ACCEPTANCE_EVENTS = ACCEPTANCE_EVENTS - {"concurrent_execution"}
 PLACEMENT_BENEFITS = frozenset(
     {
-        "closed_execution",
-        "context_compaction",
+        "closed_chain",
+        "context_partition",
+        "context_recovery",
         "explicit_delegation",
         "independent_evidence",
         "parallel_ready",
         "runtime_isolation",
-        "source_partition",
     }
 )
 PLACEMENT_PRIORITY = (
     "explicit_delegation",
     "independent_evidence",
     "parallel_ready",
-    "context_compaction",
-    "source_partition",
+    "context_partition",
+    "context_recovery",
     "runtime_isolation",
-    "closed_execution",
+    "closed_chain",
 )
-MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ACCEPTANCE_ID_RE = re.compile(r"^A[0-9]{2,}$")
 
 
@@ -129,41 +117,17 @@ def _sorted_unique_identifiers(
     return normalized
 
 
-def require_purpose(value: object) -> str:
-    """Return one canonical CCO purpose or reject it."""
+def require_role(value: object) -> str:
+    """Return one native-aligned logical role or reject it."""
 
-    purpose = _text(value, "purpose")
-    if purpose not in PURPOSES:
-        raise DecisionPolicyError(f"unsupported purpose: {purpose}")
-    return purpose
-
-
-def classify_purpose(
-    *,
-    repository_mutation: bool,
-    diagnostic_process: bool,
-    acceptance_verdict: bool,
-) -> str:
-    """Derive purpose from the effects a closed task is authorized to perform."""
-
-    facts = (repository_mutation, diagnostic_process, acceptance_verdict)
-    if any(type(value) is not bool for value in facts):
-        raise DecisionPolicyError("purpose facts must be boolean")
-    if acceptance_verdict:
-        if repository_mutation or diagnostic_process:
-            raise DecisionPolicyError(
-                "acceptance purpose cannot authorize mutation or diagnostics"
-            )
-        return "acceptance"
-    if repository_mutation:
-        return "implementation"
-    if diagnostic_process:
-        return "analysis_probe"
-    return "analysis_inspect"
+    role = _text(value, "role")
+    if role not in ROLES:
+        raise DecisionPolicyError(f"unsupported role: {role}")
+    return role
 
 
 def normalize_closure(value: object) -> dict[str, object]:
-    """Validate the complete facts needed to close implementation judgment."""
+    """Validate the complete facts needed to close implementation choices."""
 
     if not isinstance(value, Mapping) or set(value) != CLOSURE_FIELDS:
         raise DecisionPolicyError("closure must contain every canonical closure field")
@@ -179,18 +143,19 @@ def normalize_closure(value: object) -> dict[str, object]:
     return {field: normalized[field] for field in sorted(normalized)}
 
 
-def derive_judgment(value: object) -> str:
-    """Derive routine, complex, or unresolved from one complete closure record."""
-
+def _closure_assurance(value: object) -> str:
     closure = normalize_closure(value)
-    return classify_judgment(
-        objective_closed=closure["objective_closed"],
-        interfaces_closed=closure["interfaces_closed"],
-        acceptance_closed=closure["acceptance_closed"],
-        ownership_closed=closure["ownership_closed"],
-        criteria_closed=closure["criteria_closed"],
-        decision_space=closure["decision_space"],
+    closed = all(
+        bool(closure[field])
+        for field in CLOSURE_FIELDS - {"decision_space"}
     )
+    if not closed or closure["decision_space"] in {"unbounded", "unresolved"}:
+        raise DecisionPolicyError("unresolved closure stays in Primary")
+    if closure["decision_space"] == "acceptance_equivalent":
+        return "mechanical"
+    if closure["decision_space"] == "bounded_effect":
+        return "bounded"
+    raise DecisionPolicyError("closure decision space is unsupported")
 
 
 def normalize_risk_assessment(value: object) -> dict[str, str]:
@@ -236,7 +201,7 @@ def derive_acceptance(
 ) -> dict[str, object]:
     """Derive Primary eligibility from evidence-bearing structural facts.
 
-    Judgment and contract count are intentionally absent: a complex or
+    Subjective difficulty and contract count are intentionally absent: a bounded or
     multi-contract graph is eligible when its risks, required checks, graph
     coverage, and lifecycle events are eligible.
     """
@@ -274,11 +239,7 @@ def derive_acceptance(
     if event_values != sorted(set(event_values)):
         raise DecisionPolicyError("events must be sorted and duplicate-free")
 
-    reasons = {
-        event
-        for event in event_values
-        if event in INDEPENDENT_ACCEPTANCE_EVENTS
-    }
+    reasons = set(event_values)
     if risks:
         reasons.add("declared_risk")
     if any(strength != "deterministic" for strength in strengths):
@@ -292,121 +253,106 @@ def derive_acceptance(
     }
 
 
-def derive_route_assurance(
+def derive_assurance(
     *,
-    risk_assessment: object,
-    required_verification_strengths: object,
-    acceptance_ids: object,
-    deterministic_graph_coverage: object,
-    events: object,
+    role: object,
+    closure: object,
+    acceptance_facts: object,
 ) -> str:
-    """Derive model eligibility from the acceptance facts already in the contract."""
+    """Derive the v7 mechanical, bounded, or guarded route assurance.
 
-    acceptance = derive_acceptance(
-        risk_assessment=risk_assessment,
-        required_verification_strengths=required_verification_strengths,
-        acceptance_ids=acceptance_ids,
-        deterministic_graph_coverage=deterministic_graph_coverage,
-        events=events,
-    )
-    guarded_reasons = set(acceptance["reasons"]) - {"explicit_independent_review"}
-    return "guarded" if guarded_reasons else "deterministic"
+    Closure decides whether meaningful choices remain. Acceptance facts can only
+    raise the assurance floor; they never make an unresolved contract dispatchable.
+    """
 
-
-def normalize_dispatch_decision(
-    value: object,
-    *,
-    selected_model: str | None,
-) -> dict[str, object]:
-    """Recompute every derived dispatch dimension from one closed fact record."""
-
-    required = {
-        "acceptance_facts",
-        "closure",
-        "derived",
-        "effects",
-        "placement",
-    }
-    if not isinstance(value, Mapping) or set(value) != required:
-        raise DecisionPolicyError("dispatch decision must contain every fact group")
-    effects = value["effects"]
-    effect_fields = {
-        "acceptance_verdict",
-        "diagnostic_process",
-        "repository_mutation",
-    }
-    if not isinstance(effects, Mapping) or set(effects) != effect_fields:
-        raise DecisionPolicyError("dispatch effects are malformed")
-    purpose = classify_purpose(
-        repository_mutation=effects["repository_mutation"],
-        diagnostic_process=effects["diagnostic_process"],
-        acceptance_verdict=effects["acceptance_verdict"],
-    )
-    closure = normalize_closure(value["closure"])
-    judgment = derive_judgment(closure)
-    if judgment == "unresolved":
-        raise DecisionPolicyError("unresolved judgment cannot be dispatched")
-
-    acceptance_facts = value["acceptance_facts"]
-    acceptance_fields = {
-        "acceptance_ids",
-        "deterministic_graph_coverage",
-        "events",
-        "required_verification_strengths",
-        "risk_assessment",
-    }
-    if not isinstance(acceptance_facts, Mapping) or set(acceptance_facts) != acceptance_fields:
-        raise DecisionPolicyError("dispatch acceptance facts are malformed")
+    normalized_role = require_role(role)
+    closure_assurance = _closure_assurance(closure)
+    if not isinstance(acceptance_facts, Mapping):
+        raise DecisionPolicyError("acceptance_facts must be an object")
     acceptance = derive_acceptance(**acceptance_facts)
-    assurance = derive_route_assurance(**acceptance_facts)
+    if normalized_role == "reviewer" or acceptance["mode"] == "independent":
+        return "guarded"
+    return closure_assurance
 
+
+def select_v7_placement(
+    *,
+    role: object,
+    benefits: object,
+    direct_action_count: object,
+    direct_verification_count: object,
+) -> dict[str, str]:
+    """Choose Primary or child from the approved structural whitelist.
+
+    A one-action/one-verification task remains in Primary when its only benefit
+    is a closed sequential chain. Explicit delegation, isolation, partitioning,
+    parallelism, recovery, or independent evidence remain valid child benefits.
+    """
+
+    normalized_role = require_role(role)
+    if normalized_role == "reviewer":
+        return {"reason": "independent_evidence", "target": "child"}
+    for label, value in (
+        ("direct_action_count", direct_action_count),
+        ("direct_verification_count", direct_verification_count),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DecisionPolicyError(f"{label} must be a non-negative integer")
+    facts = normalize_placement_benefits(benefits)
+    kinds = {item["kind"] for item in facts}
+    if not kinds:
+        return {"reason": "no_structural_benefit", "target": "primary"}
+    if (
+        kinds == {"closed_chain"}
+        and direct_action_count <= 1
+        and direct_verification_count <= 1
+    ):
+        return {"reason": "microtask", "target": "primary"}
+    for kind in PLACEMENT_PRIORITY:
+        if kind in kinds:
+            return {"reason": kind, "target": "child"}
+    raise DecisionPolicyError("placement benefits have no usable reason")
+
+
+def derive_node_decision(value: object) -> dict[str, object]:
+    """Expose the complete v7 policy interface through one deep module."""
+
+    fields = {"acceptance_facts", "closure", "placement", "role"}
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise DecisionPolicyError("node decision must contain every v7 fact group")
+    role = require_role(value["role"])
+    acceptance_facts = value["acceptance_facts"]
+    if not isinstance(acceptance_facts, Mapping):
+        raise DecisionPolicyError("acceptance_facts must be an object")
+    acceptance = derive_acceptance(**acceptance_facts)
+    if role == "reviewer" and acceptance["mode"] != "independent":
+        acceptance = {
+            "mode": "independent",
+            "reasons": ["explicit_independent_review"],
+        }
     placement_facts = value["placement"]
-    if not isinstance(placement_facts, Mapping) or set(placement_facts) != {
+    expected = {
         "benefits",
-        "primary_model",
-    }:
-        raise DecisionPolicyError("dispatch placement facts are malformed")
-    primary_model = placement_facts["primary_model"]
-    if primary_model is not None and not isinstance(primary_model, str):
-        raise DecisionPolicyError("dispatch primary model is malformed")
-    benefits = normalize_placement_benefits(placement_facts["benefits"])
-    placement = select_placement(
-        purpose=purpose,
-        primary_model=primary_model,
-        selected_model=selected_model,
-        benefits=benefits,
-    )
-    derived = value["derived"]
-    expected_derived = {
-        "acceptance": acceptance,
-        "assurance": assurance,
-        "judgment": judgment,
-        "placement": placement,
-        "purpose": purpose,
+        "direct_action_count",
+        "direct_verification_count",
     }
-    if not isinstance(derived, Mapping) or dict(derived) != expected_derived:
-        raise DecisionPolicyError("dispatch derived decision does not match its facts")
+    if not isinstance(placement_facts, Mapping) or set(placement_facts) != expected:
+        raise DecisionPolicyError("placement facts are malformed")
     return {
-        "acceptance_facts": {
-            "acceptance_ids": list(acceptance_facts["acceptance_ids"]),
-            "deterministic_graph_coverage": list(
-                acceptance_facts["deterministic_graph_coverage"]
-            ),
-            "events": list(acceptance_facts["events"]),
-            "required_verification_strengths": list(
-                acceptance_facts["required_verification_strengths"]
-            ),
-            "risk_assessment": normalize_risk_assessment(
-                acceptance_facts["risk_assessment"]
-            ),
-        },
-        "closure": closure,
-        "derived": expected_derived,
-        "effects": {name: effects[name] for name in sorted(effect_fields)},
-        "placement": {
-            "benefits": benefits,
-            "primary_model": primary_model,
-        },
+        "acceptance": acceptance,
+        "acceptance_ids": list(acceptance_facts["acceptance_ids"]),
+        "assurance": derive_assurance(
+            role=role,
+            closure=value["closure"],
+            acceptance_facts=acceptance_facts,
+        ),
+        "placement": select_v7_placement(
+            role=role,
+            benefits=placement_facts["benefits"],
+            direct_action_count=placement_facts["direct_action_count"],
+            direct_verification_count=placement_facts["direct_verification_count"],
+        ),
+        "role": role,
     }
 
 
@@ -437,104 +383,14 @@ def normalize_placement_benefits(value: object) -> list[dict[str, Any]]:
     return normalized
 
 
-def select_placement(
-    *,
-    purpose: str,
-    primary_model: str | None,
-    selected_model: str | None,
-    benefits: object = None,
-) -> dict[str, str]:
-    """Return the only placement permitted by observed structural facts.
-
-    A route is never a reason by itself to create a child.  A same-model child
-    is reclaimed only when its sole reason would be closed execution; explicit
-    isolation, parallelism, or independent evidence still has structural value.
-    """
-
-    require_purpose(purpose)
-    if primary_model is not None and MODEL_RE.fullmatch(primary_model) is None:
-        raise DecisionPolicyError("primary_model is invalid")
-    if selected_model is not None and MODEL_RE.fullmatch(selected_model) is None:
-        raise DecisionPolicyError("selected_model is invalid")
-    facts = normalize_placement_benefits(benefits)
-    kinds = {item["kind"] for item in facts}
-    if purpose == "acceptance":
-        return {"reason": "independent_acceptance", "target": "child"}
-    if not kinds:
-        return {"reason": "no_structural_benefit", "target": "primary"}
-    if (
-        primary_model is not None
-        and selected_model is not None
-        and primary_model == selected_model
-        and kinds == {"closed_execution"}
-    ):
-        return {
-            "reason": "same_model_execution_only",
-            "target": "primary",
-        }
-    for kind in PLACEMENT_PRIORITY:
-        if kind in kinds:
-            return {"reason": kind, "target": "child"}
-    raise DecisionPolicyError("placement benefits have no usable reason")
-
-
-def classify_judgment(
-    *,
-    objective_closed: bool,
-    interfaces_closed: bool,
-    acceptance_closed: bool,
-    ownership_closed: bool,
-    decision_space: str,
-    criteria_closed: bool,
-) -> str:
-    """Classify a dispatch candidate without guessing at unresolved planning."""
-
-    if not all(
-        isinstance(value, bool)
-        for value in (
-            objective_closed,
-            interfaces_closed,
-            acceptance_closed,
-            ownership_closed,
-            criteria_closed,
-        )
-    ):
-        raise DecisionPolicyError("closure facts must be boolean")
-    if any(
-        not value
-        for value in (
-            objective_closed,
-            interfaces_closed,
-            acceptance_closed,
-            ownership_closed,
-            criteria_closed,
-        )
-    ):
-        return "unresolved"
-    if decision_space not in DECISION_SPACES:
-        raise DecisionPolicyError(f"unsupported decision space: {decision_space}")
-    if decision_space == "acceptance_equivalent":
-        return "routine"
-    if decision_space == "bounded_effect":
-        return "complex"
-    if decision_space in {"unresolved", "unbounded"}:
-        return "unresolved"
-    raise DecisionPolicyError(f"unsupported decision space: {decision_space}")
-
-
-def canonical_benefit_kinds(value: object) -> tuple[str, ...]:
-    """Expose only the stable kind set for route explanations and tests."""
-
-    return tuple(item["kind"] for item in normalize_placement_benefits(value))
-
-
 def _normalize_dispatch_node(value: object, index: int) -> dict[str, Any]:
     """Normalize the small, evidence-free shape used by capacity selection."""
 
     if not isinstance(value, Mapping):
         raise DecisionPolicyError(f"dispatch node {index} must be an object")
     required = {"access", "dependencies_ready", "node", "responsibility", "scope"}
-    if set(value) != required:
+    optional = {"downstream_count"}
+    if set(value) - (required | optional) or not required <= set(value):
         raise DecisionPolicyError(
             f"dispatch node {index} must contain {sorted(required)}"
         )
@@ -548,6 +404,11 @@ def _normalize_dispatch_node(value: object, index: int) -> dict[str, Any]:
     if type(value["dependencies_ready"]) is not bool:
         raise DecisionPolicyError(
             f"dispatch node {index}.dependencies_ready must be boolean"
+        )
+    downstream_count = value.get("downstream_count", 0)
+    if isinstance(downstream_count, bool) or not isinstance(downstream_count, int) or downstream_count < 0:
+        raise DecisionPolicyError(
+            f"dispatch node {index}.downstream_count must be a non-negative integer"
         )
     scope = value["scope"]
     if not isinstance(scope, list):
@@ -573,6 +434,7 @@ def _normalize_dispatch_node(value: object, index: int) -> dict[str, Any]:
         "node": node,
         "responsibility": responsibility,
         "scope": normalized_scope,
+        "downstream_count": downstream_count,
     }
 
 
@@ -624,7 +486,11 @@ def select_ready_nodes(nodes: object, *, native_capacity: int) -> list[str]:
     # consuming a slot while excluding several mutually compatible leaves.
     ordered = sorted(
         ready,
-        key=lambda item: (conflict_counts[item["node"]], item["node"]),
+        key=lambda item: (
+            -item["downstream_count"],
+            conflict_counts[item["node"]],
+            item["node"],
+        ),
     )
     selected: list[dict[str, Any]] = []
     for node in ordered:
@@ -633,7 +499,7 @@ def select_ready_nodes(nodes: object, *, native_capacity: int) -> list[str]:
         if any(conflicts(node, admitted) for admitted in selected):
             continue
         selected.append(node)
-    if len(selected) >= native_capacity or not ready:
+    if not ready or native_capacity == 0:
         return sorted(node["node"] for node in selected)
 
     index = {node["node"]: position for position, node in enumerate(ordered)}
@@ -647,24 +513,48 @@ def select_ready_nodes(nodes: object, *, native_capacity: int) -> list[str]:
 
     best = [index[node["node"]] for node in selected]
 
-    def search(candidates: int, chosen: list[int]) -> bool:
-        nonlocal best
-        if len(chosen) > len(best):
-            best = list(chosen)
-            if len(best) == native_capacity:
-                return True
-        if not candidates or len(chosen) + candidates.bit_count() <= len(best):
-            return False
-        while candidates:
-            if len(chosen) + candidates.bit_count() <= len(best):
-                return False
-            bit = candidates & -candidates
-            position = bit.bit_length() - 1
-            candidates ^= bit
-            compatible = candidates & ~conflict_masks[position]
-            if search(compatible, [*chosen, position]):
-                return True
-        return False
+    best_downstream = sum(ordered[position]["downstream_count"] for position in best)
+    best_size = len(best)
 
-    search((1 << len(ordered)) - 1, [])
+    def search(candidates: int, chosen: list[int], downstream: int) -> None:
+        nonlocal best
+        nonlocal best_downstream
+        nonlocal best_size
+        if downstream > best_downstream or (
+            downstream == best_downstream and len(chosen) > best_size
+        ):
+            best = list(chosen)
+            best_downstream = downstream
+            best_size = len(chosen)
+        remaining_slots = native_capacity - len(chosen)
+        if not candidates or remaining_slots == 0:
+            return
+        positions = [
+            position
+            for position in range(len(ordered))
+            if candidates & (1 << position)
+        ]
+        optimistic_weights = sorted(
+            (ordered[position]["downstream_count"] for position in positions),
+            reverse=True,
+        )[:remaining_slots]
+        optimistic_downstream = downstream + sum(optimistic_weights)
+        optimistic_size = len(chosen) + min(remaining_slots, len(positions))
+        if optimistic_downstream < best_downstream or (
+            optimistic_downstream == best_downstream
+            and optimistic_size <= best_size
+        ):
+            return
+
+        bit = candidates & -candidates
+        position = bit.bit_length() - 1
+        without = candidates ^ bit
+        search(
+            without & ~conflict_masks[position],
+            [*chosen, position],
+            downstream + ordered[position]["downstream_count"],
+        )
+        search(without, chosen, downstream)
+
+    search((1 << len(ordered)) - 1, [], 0)
     return sorted(ordered[position]["node"] for position in best)

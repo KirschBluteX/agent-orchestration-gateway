@@ -1,6 +1,20 @@
 {
   "description": "Global CCO dispatch, task-ledger lifecycle, and bounded result-envelope guardrails.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "timeout": 5,
+            "async": false,
+            "statusMessage": "Loading CCO dispatch policy"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "^(Agent|spawn_agent)$",
@@ -68,20 +82,6 @@
             "timeout": 120,
             "async": false,
             "statusMessage": "Checking CCO result and workspace"
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "timeout": 5,
-            "async": false,
-            "statusMessage": "Cleaning CCO task ledger"
           }
         ]
       }

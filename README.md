@@ -1,160 +1,219 @@
 # Codex Cost Orchestrator
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[简体中文](README.zh-CN.md)
 
-Codex Cost Orchestrator (CCO) is an implicit, cost-aware router for native Codex
-Agents. Primary keeps the user goal, architecture, decomposition, integration,
-verification, and final acceptance. Closed execution volume can move to a cheaper
-eligible model without requiring the user to invoke CCO explicitly.
+Codex Cost Orchestrator (CCO) is an implicit control plane for Codex native Agents.
+It keeps planning and final acceptance in the Primary Agent, dispatches only closed
+work, and uses a static local model policy designed to avoid paying for Sol on every
+child task.
 
-CCO does not add another Agent runtime. Codex native spawn, follow-up, wait, and
-interrupt remain authoritative. CCO supplies deterministic routing, a compact
-dispatch capsule, bounded ownership, and evidence-driven acceptance.
+CCO does not create another Agent runtime. Codex still owns spawn, follow-up,
+interrupt, sandboxing, and execution. CCO compiles and guards those native calls.
 
-## How it decides
+## What 1.0 provides
 
-CCO separates decisions that are often incorrectly collapsed into “simple versus
-complex coding”:
+- Logical `explorer`, `worker`, and `reviewer` roles over two model-neutral physical
+  profiles: read-only and writable.
+- Fact-derived `mechanical`, `bounded`, and `guarded` assurance instead of a vague
+  simple/complex label.
+- Structural placement gates, including parallelism, context partitioning, closed
+  chains, isolation, recovery, independent evidence, and explicit delegation.
+- Network-free static Luna/Terra routing with current user model/effort pins.
+- Strict interception of ordinary native Agent spawns; native inheritance requires an
+  explicit user-authorized bypass.
+- `cco.v7` capsules, prepared scope-limited baselines, owner/cursor fencing, guarded
+  generations, failure signatures, and late-result tombstones.
+- Acceptance IDs connected to structured evidence and the exact workspace delta.
+- Event-driven Primary waiting and no CCO concurrency ceiling below native capacity.
+- No Radar dependency, runtime route cache, token/billing history, or cost telemetry.
 
-| Decision | Values | Meaning |
-| --- | --- | --- |
-| Purpose | `analysis_inspect`, `analysis_probe`, `implementation`, `acceptance` | Why another Agent is useful |
-| Judgment | routine, complex | Whether bounded choices can affect the result |
-| Placement | Primary, child | Whether another native turn adds structural value |
-| Route | model + effort | Which supported pair executes the closed task |
-| Assurance | deterministic, guarded | Whether existing acceptance facts permit the economical worker pool |
-| Acceptance | primary, independent | Which evidence is required to finish |
+## Decision flow
 
-An atomic deterministic edit stays in Primary. A child is created only for closed
-execution, disjoint parallel work, context rescue, a source partition, runtime
-isolation, independent evidence, or explicit delegation. CCO never creates a child
-merely because a model is cheaper.
-
-## Fast dispatch
-
-Normal dispatch is one local graph compile followed by native spawns:
-
-```text
-authoring facts → route plan → cco.v6 capsule → native Agent
+```mermaid
+flowchart LR
+    U["User goal"] --> P["Primary closes contracts"]
+    P --> D["Role + assurance + placement"]
+    D -->|"not closed / no child benefit"| P
+    D --> R["Static local route"]
+    R --> G["Prepared cco.v7 graph"]
+    G --> H["PreToolUse + ledger"]
+    H --> A["Codex native Agent"]
+    A --> E["Result + exact-state evidence"]
+    E --> V["Primary acceptance or risk-triggered reviewer"]
 ```
 
-- The single prepared-graph entry derives policy and assurance labels from facts, captures one real
-  workspace artifact, validates the whole route plan, selects ready nodes at observed
-  native capacity, and builds every active and legal fallback capsule in memory.
-- Project files are never used as dispatch scratch space.
-- Light and strict dispatch share one implementation; strict mode adds evidence,
-  not a second protocol.
-- Logical task types remain distinct, while physical profiles are reduced to one
-  writable leaf and one read-only leaf.
-- Primary waits event-first after useful non-overlapping work is exhausted. It does
-  not repeatedly poll or spend model turns narrating unchanged status.
-- Callers cannot pair an arbitrary model with a detached plan hash; capsules retain
-  only the validated plan identity, active rank, and selected pair.
+CCO also keeps the Primary quiet after dispatch: it may continue only proven
+non-overlapping, dependency-independent work; otherwise it waits for native events.
 
-## Adaptive routing
+## Default routes
 
-User-selected model and reasoning effort always win. Otherwise, one local batch
-resolves every purpose/judgment/assurance route required by the graph. Routing never invokes
-an Agent or asks Primary to compare candidates in natural language.
+| Logical role / assurance | First | Pre-thread fallback |
+| --- | --- | --- |
+| explorer or worker / mechanical | Luna | Terra |
+| explorer or worker / bounded | Terra | Luna |
+| explorer or worker / guarded | Terra | none |
+| reviewer / any assurance | Terra | none |
 
-Automatic candidates must be supported by the current Codex Multi-Agent backend,
-have observed CodexRadar IQ strictly above 90, and pass sample/cohort/coverage
-checks. An automatic Luna candidate for complex work must also have a Wilson 95%
-lower bound strictly above 90; routine work keeps the point-estimate gate and
-uncertainty penalty. When the native catalog exposes backend metadata, CCO accepts explicitly known
-multi-agent backend versions (`v1` or `v2`) and rejects unmarked entries; it never
-guesses support from a model name. A Wilson-aware Pareto utility balances quality,
-resource use, time, and uncertainty.
+For each automatic model, effort adapts through `max → xhigh → high`. `ultra` and Sol
+are never automatic. A current explicit user pin may choose any native-supported
+model/effort pair, including Sol or guarded Luna. A full pin has no fallback.
 
-Luna and Terra are preferred for workers and reviewers. Sol may automatically win
-only when no eligible Luna/Terra exists or Sol’s Wilson 95% lower bound is above the
-best eligible Luna/Terra upper bound. A user-fixed Sol route is always honored.
+Bounded Luna fallback is available only after the contract is closed, risks are
+absent, coverage is deterministic, and Terra is unavailable before a thread starts.
+Any incomplete, blocked, or deviating result forces a guarded next generation.
 
-Assurance is derived from existing acceptance facts. A deterministic route has no
-declared risk, complete deterministic coverage, and no non-deterministic evidence;
-guarded routes remove Luna from automatic selection. An explicit user-fixed pair
-remains exact.
+## Requirements
 
-An evidence-backed Luna execution failure, deviation, or scope surprise retires that
-owner and creates a newer guarded generation; another Luna effort is not retried for
-the same failure. This escalation does not waive the strict Sol advantage gate.
+- Codex CLI or Codex desktop with plugin hooks and native Agents. Version `0.144.6`
+  is the release-tested contract.
+- Python 3.11 or newer.
+- Git.
+- Windows or Linux. macOS is not currently tested.
 
-The Radar TTL is one hour. If a bounded last-known-good snapshot is older than the
-TTL, CCO dispatches immediately from it and refreshes for a later dispatch. Route
-fallback advances through a pre-ranked plan; it does not rescore Radar or rebuild the
-whole contract. A confirmed pre-thread rejection takes the next precompiled native
-request without recapturing the baseline. One short-lived request suppresses duplicate
-refresh processes and is removed after success. Scores are hidden unless `--explain`
-is requested.
-
-## Concurrency and acceptance
-
-CCO imposes no concurrency cap below the native Codex limit. It fills available
-slots when nodes are dependency-ready, responsibilities differ, and write scopes do
-not overlap. Concurrency alone does not force a reviewer.
-
-Primary acceptance is allowed when risks are explicitly absent and deterministic
-evidence covers every acceptance criterion, including multi-node or complex graphs.
-Independent review is reserved for real risk, semantic/manual evidence, integration
-judgment, failure or deviation, a Primary-owned implementation change, or an
-explicit request.
-
-An independent review is a fresh read-only native Agent with `fork_turns: none` and
-one exact evidence bundle. `fix-first` keeps that reviewer continuable for one
-evidence-driven delta. Repeated attempts require new actionable evidence; fixed
-retry counters are not carried through every packet.
-
-## Safety and state
-
-The capsule binds purpose, judgment, derived assurance, route, context fork, scopes, contract,
-acceptance, evidence, baseline, graph identity, and one execution generation.
-PreToolUse requires the matching prepared artifact; SubagentStop verifies the current
-workspace against the whole graph's scope union before recording a result.
-
-A small task-local ledger outside the repository keeps only the current owner,
-generation, input cursor, and lifecycle phase. It rejects duplicate ownership,
-concurrent continuations, and late results. It is not a coordinator, database,
-durable audit log, filesystem lock, or acceptance record.
-
-Light tasks avoid enumerating ignored files. Strict tasks fingerprint ignored files
-and fail closed above the default 10,000-file or 256-MiB scan limits. Both retain the
-tracked/untracked and Git control-state checks implemented by the workspace schema,
-including path aliases, reparses, and submodules. Prepared artifacts live outside the
-repository and are removed at SessionEnd. Hooks are process guardrails; OS-enforced
-read-only isolation is claimed only when runtime metadata proves it.
-
-CCO keeps no billing, token, fee, route-history, encryption, provider-session,
-daemon, or database layer.
+CCO is not currently intended for surfaces that do not load Codex plugins/hooks.
 
 ## Install
 
-Python 3.11 or newer is required for installation, hooks, and validation.
-
-```powershell
+```text
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
 cd codex-cost-orchestrator
-codex plugin marketplace add .agents/plugins
+codex plugin marketplace add KirschBluteX/codex-cost-orchestrator --ref main
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --upgrade --workspace .
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
 ```
 
-Verify the two physical profiles:
+Then:
 
-```powershell
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --check --workspace .
+1. Open `/hooks` in Codex.
+2. Review and trust every current CCO hook definition.
+3. Run the read-only readiness check:
+
+```text
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
 ```
 
-Start a new Codex task after installing or updating so profiles, hooks, and the skill
-are reloaded. Then describe an ordinary implementation request; explicit
-`$codex-cost-orchestrator:orchestrate` remains optional.
+Doctor must report both `HOOKS READY` and `STATIC ROUTE READY`. Start a new Codex task
+after installation or update so the new skill, profiles, and hooks are loaded.
 
-## Development
+CCO is implicit after that. For example, ask Codex normally:
 
-```powershell
-python -X utf8 -B -m unittest discover -s tests -v
+```text
+Refactor this module, preserve its public behavior, and verify the result.
+```
+
+You do not need to mention CCO or call a skill explicitly.
+
+### Update
+
+```text
+codex plugin marketplace upgrade codex-cost-orchestrator
+codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
+codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
+```
+
+Review and trust changed hooks again, then start a new task.
+
+### Uninstall
+
+```text
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --uninstall
+codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
+codex plugin marketplace remove codex-cost-orchestrator
+```
+
+The installer removes only byte-identical CCO-owned profiles. Modified or unknown
+files are preserved and reported for manual review.
+
+## Configuration
+
+Configuration precedence is:
+
+```text
+current user pin → trusted project policy → global policy → built-in defaults
+```
+
+Global configuration lives at `~/.codex/cco.toml`:
+
+```toml
+trusted_project_roots = ["C:/work/my-project"]
+
+[routes.worker.mechanical]
+candidates = [
+  { model = "gpt-5.6-luna", effort = "max" },
+  { model = "gpt-5.6-terra", effort = "max" },
+]
+
+[routes.reviewer.guarded]
+candidates = [
+  { model = "gpt-5.6-terra", effort = "max" },
+]
+```
+
+A trusted project may override routes in `.codex/cco.toml` using the same `routes`
+tables. Project policy is ignored until its canonical repository root is listed in the
+global `trusted_project_roots` array.
+
+Automatic configuration cannot contain Sol. Guarded or reviewer automatic policy
+cannot contain Luna. Invalid higher-priority configuration or unsupported candidates
+leave affected work in Primary rather than silently using a lower-priority route.
+
+Normal operation does not display route scoring or cost rationale. `--doctor` and the
+graph compiler's `--full` mode are explicit local diagnostics.
+
+## Explicit native bypass
+
+If you intentionally want Codex's native Agent behavior and inherited model/effort,
+say so explicitly in the current user request. CCO then prefixes that one unmanaged
+spawn with:
+
+```text
+CCO_NATIVE_BYPASS v1
+```
+
+The hook strips the marker before dispatch. CCO never infers bypass permission, and a
+bypassed owner is outside CCO lifecycle and evidence guarantees.
+
+## Security and data behavior
+
+- PreToolUse fails closed for unprepared ordinary spawns and managed continuations.
+- The prepared workspace fingerprints tracked content and ignored files inside typed
+  scopes, even in the default light mode. Git status and Git control state remain
+  repository-wide so newly created out-of-scope deltas are still detected.
+- Worker result paths must exactly equal the real delta inside that node's scopes.
+- Large terminal graph artifacts are removed immediately. Small task tombstones stay
+  outside the repository for late-result fencing. A later SessionStart removes
+  terminal residue after 24 hours and conservatively retains live/unknown abandoned
+  state for up to seven days because current Codex has no SessionEnd hook.
+- CCO sends no CCO telemetry and stores no token counts, billing records, Radar data,
+  or long-term route history. A temporary prepared artifact necessarily contains the
+  closed node contracts, scopes, route bindings, and workspace fingerprints; it does
+  not copy repository file contents or the full conversation.
+- Hashes provide canonical identity and stale-result fencing; they are not encryption
+  or authentication against a malicious Primary/leaf.
+- Hook trust remains a user decision. Bootstrap and doctor never grant it.
+
+See [SECURITY.md](SECURITY.md) and [operations](docs/OPERATIONS.md) for boundaries and
+recovery.
+
+## Validation
+
+```text
 python -m ruff check plugins tests .github/scripts
+python -X utf8 -B -m unittest discover -s tests -v
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 
-See the [orchestration skill](plugins/codex-cost-orchestrator/skills/orchestrate/SKILL.md)
-and [cco.v6 capsule reference](plugins/codex-cost-orchestrator/skills/orchestrate/references/contracts-v6.md).
+CI covers Windows/Python 3.14 and Linux/Python 3.11. See
+[benchmark methodology](docs/BENCHMARK.md); the project does not claim a universal
+bill-savings percentage without workload-matched measurements.
+
+## Project status
+
+Version 1.0.0 is a production-oriented first stable protocol, not a hard security
+boundary or a replacement for Primary review. Issues and pull requests are welcome;
+see [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and
+[CHANGELOG.md](CHANGELOG.md).
+
+MIT License. Copyright (c) 2026 KirschQAQ.

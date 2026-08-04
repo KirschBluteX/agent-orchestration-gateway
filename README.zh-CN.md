@@ -1,137 +1,210 @@
 # Codex Cost Orchestrator
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md)
 
-Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的隐式成本感知路由器。Primary
-保留用户目标、架构、拆分、集成、验证和最终验收；已经闭合的执行工作可以交给更便宜且
-合格的模型，用户无需每次显式调用 CCO。
+Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的隐式控制层。它让 Primary
+保留规划与最终验收，只派发已经闭合的工作，并通过静态本地模型策略，避免每个子任务都
+使用 Sol。
 
-CCO 不增加第二套 Agent runtime。Codex 原生 spawn、follow-up、wait 和 interrupt
-仍是唯一执行机制；CCO 只提供确定性路由、紧凑派遣胶囊、有限所有权与证据驱动验收。
+CCO 不创建第二套 Agent runtime。spawn、follow-up、interrupt、sandbox 和实际执行仍由
+Codex 负责；CCO 只编译并守卫这些原生调用。
 
-## 决策方式
+## 1.0 提供什么
 
-CCO 将经常被错误合并为“简单/复杂编程”的判断拆开：
+- 逻辑角色为 `explorer`、`worker`、`reviewer`，物理上只使用模型中立的只读/可写
+  两个 profile。
+- 使用事实推导的 `mechanical`、`bounded`、`guarded` 保障等级，不再依赖宽泛的
+  “简单/复杂”标签。
+- 只有并行、上下文分区、闭合链、运行隔离、上下文恢复、独立证据或用户明确委派等
+  结构收益，才能创建 child。
+- 完全离线的 Luna/Terra 静态路由，同时保留当前用户对模型和思考强度的显式 pin。
+- 默认严格接管普通原生 Agent spawn；只有用户明确授权时才能恢复原生继承。
+- `cco.v7` 胶囊、scope 限定 baseline、owner/cursor fencing、guarded generation、
+  failure signature 与迟到结果 tombstone。
+- 将 acceptance ID、结构化证据和真实 workspace delta 连接为一条验收链。
+- Primary 派遣后事件驱动等待；CCO 不再额外压低 Codex 原生并发容量。
+- 不依赖 Radar，不创建运行时路由缓存，也不记录 token、账单或成本统计。
 
-| 判断 | 可选值 | 含义 |
-| --- | --- | --- |
-| Purpose | `analysis_inspect`、`analysis_probe`、`implementation`、`acceptance` | 为什么需要另一个 Agent |
-| Judgment | routine、complex | 闭合后是否仍有影响结果的有限选择 |
-| Placement | Primary、child | 新开原生轮次是否有结构收益 |
-| Route | 模型 + 思考强度 | 由哪个受支持组合执行 |
-| Assurance | deterministic、guarded | 现有验收事实是否允许使用经济型 worker 池 |
-| Acceptance | primary、independent | 完成需要哪类证据 |
+## 决策流程
 
-原子、确定、低风险的小修改留在 Primary。只有闭合执行、互不冲突的并行节点、上下文
-救援、独立源码分区、运行隔离、独立证据或用户明确委派时才创建 child；仅仅价格更低
-不是派遣理由。
-
-## 快速派遣
-
-普通派遣只需要一次本地工作图编译和所需的原生 spawn：
-
-```text
-任务事实 → 路由计划 → cco.v6 胶囊 → 原生 Agent
+```mermaid
+flowchart LR
+    U["用户目标"] --> P["Primary 闭合合同"]
+    P --> D["角色 + 保障等级 + Placement"]
+    D -->|"未闭合 / 无 child 收益"| P
+    D --> R["静态本地路由"]
+    R --> G["Prepared cco.v7 graph"]
+    G --> H["PreToolUse + ledger"]
+    H --> A["Codex 原生 Agent"]
+    A --> E["结果 + 精确状态证据"]
+    E --> V["Primary 验收或风险触发 reviewer"]
 ```
 
-- 单一 prepared-graph 入口从事实推导策略与 assurance 标签、捕获一份真实 workspace artifact、校验
-  完整 route plan，再按宿主可用容量选择 ready 节点，并在内存中生成全部 active 与合法
-  fallback canonical capsule。
-- 不使用项目文件作为派遣临时文件。
-- 轻量与严格路径共用同一实现；严格路径只是增加证据，不维护第二套协议。
-- 逻辑任务类型仍完整区分，物理 profile 仅保留可写 leaf 与只读 leaf。
-- 派遣后，Primary 完成真正互不重叠的工作便进入事件驱动等待，不短轮询、不反复消耗
-  模型轮次播报无变化状态。
-- 调用方不能把任意模型与单独的 plan hash 拼在一起；胶囊只保留已验证 plan 的身份、
-  当前 rank 与 selected pair。
+派遣后，Primary 只可继续已证明不会重叠、冲突或依赖 leaf 的工作；其余情况直接等待
+原生事件，不轮询，也不发起只用于“查看进度”的模型请求。
 
-## 自适应模型路由
+## 默认路由
 
-用户指定的模型与思考强度始终优先。未指定时，一个本地批处理会同时解析工作图所需的
-所有 purpose × judgment × assurance 路由。路由阶段不创建 Agent，也不让 Primary 用自然语言逐个
-比较候选。
+| 逻辑角色 / 保障等级 | 首选 | 仅限线程创建前的后备 |
+| --- | --- | --- |
+| explorer 或 worker / mechanical | Luna | Terra |
+| explorer 或 worker / bounded | Terra | Luna |
+| explorer 或 worker / guarded | Terra | 无 |
+| reviewer / 任意等级 | Terra | 无 |
 
-自动候选必须受当前 Codex Multi-Agent 后端支持、CodexRadar 观测 IQ 严格大于 90，并通过
-样本、同群和覆盖率检查。Luna 自动承接 complex 工作时，其 Wilson 95% 下界还必须严格
-大于 90；routine 工作仍使用点估计门槛与不确定性惩罚。原生目录提供后端元数据时，CCO 接受明确已知的多 Agent 后端版本
-（`v1` 或 `v2`），拒绝未标记条目，不会依据模型名称猜测支持情况。算法使用 Wilson 区间、
-Pareto 前沿以及质量/资源/时间/不确定性效用。
+每个自动模型按 `max → xhigh → high` 选择第一个本机支持的强度。系统不会自动选择
+`ultra` 或 Sol。当前用户显式 pin 可以选择本机原生 Agent 支持的任意模型/强度，包含
+Sol 或 guarded Luna；完整 pin 不设后备。
 
-worker 与 reviewer 默认优先 Luna/Terra。只有不存在合格的 Luna/Terra，或 Sol 的
-Wilson 95% 下界高于最佳 Luna/Terra 的上界时，Sol 才能自动胜出。用户明确指定 Sol 时
-始终照常执行。Assurance 由现有验收事实推导：无声明风险、确定性覆盖完整且没有人工或
-非确定性证据时为 deterministic；guarded 路由不会自动选择 Luna，但用户固定的组合仍准确执行。
+bounded 使用 Luna 后备的前提是：合同已经闭合、没有声明风险、验收覆盖可确定，并且
+Terra 在线程创建前不可用。任何 incomplete、blocked 或 deviation 结果都会强制下一
+generation 使用 guarded。
 
-若 Luna 出现有证据的执行失败、偏差或 scope surprise，CCO 会退役该 owner，并为同一工作
-创建新的 guarded generation；不会换一个 Luna effort 重试同一失败。该升级不会放宽 Sol
-必须具有明确统计优势的门槛。
+## 环境要求
 
-Radar TTL 默认为一小时。若 LKG 超过 TTL 但仍在 72 小时有效期内，CCO 会立即用它完成
-当前派遣，并刷新供后续派遣使用。fallback 只推进预排序计划的 rank，不重新评分、不重建
-整份合同。确认预线程拒绝后直接使用下一个预编译 native request，不重新捕获 baseline。
-同一 stale snapshot 只允许一个短期刷新请求，成功后立即删除。默认不显示 IQ、价格、耗时
-或效用解释；仅在请求 `--explain` 时显示。
+- 支持插件 hooks 和原生 Agent 的 Codex CLI / Codex 桌面端；本版本按 `0.144.6`
+  契约验证。
+- Python 3.11 或更高版本。
+- Git。
+- Windows 或 Linux；当前不测试 macOS。
 
-## 并发与验收
-
-CCO 不设置低于 Codex 原生限制的人为并发上限。只要节点依赖就绪、职责不同且写入范围
-不重叠，就会填满可用原生槽位。并发本身不再强制 reviewer。
-
-当风险被明确排除，且确定性证据覆盖全部验收标准时，即使是 complex 或多节点图也可由
-Primary 验收。只有真实风险、语义/人工证据、集成判断、失败或偏差、Primary 自己修改了
-实现，或用户明确要求时，才启动独立 reviewer。
-
-独立审查使用 fresh 只读原生 Agent、`fork_turns: none` 和一份精确证据包。`fix-first`
-会保留同一 reviewer，允许一次证据驱动的 delta；再次尝试必须具有新的可行动证据，不再让
-每份 packet 携带固定 3/2 次数仪式。
-
-## 安全与状态
-
-胶囊绑定 purpose、judgment、派生 assurance、route、上下文 fork、scope、合同、验收、证据、baseline、
-graph identity 和一个执行 generation。PreToolUse 必须找到完全匹配的 prepared artifact；
-SubagentStop 会按整张图的 scope 并集验证当前 workspace 后才记录结果。
-
-仓库外仅保留一个很小的任务级 ledger，记录当前 owner、generation、input cursor 和
-lifecycle phase，用于拒绝重复 owner、并发 continuation 与迟到结果。它不是 coordinator、
-数据库、永久审计日志、文件锁或验收记录。
-
-轻量模式不会枚举 ignored 文件；严格模式会指纹化 ignored 文件，并在默认超过 10,000 个
-文件或 256 MiB 扫描量时 fail closed。两种模式都保留 workspace schema 已实现的
-tracked/untracked 与 Git 控制状态检查，包括路径别名、reparse 和 submodule。Prepared
-artifact 位于仓库外，并在 SessionEnd 删除。Hook 只是进程守卫；只有运行元数据证明只读时，
-才称 reviewer 具有操作系统强制只读隔离。
-
-CCO 不保存计费、token、费用或路由历史，也不增加加密层、provider session、daemon 或
-数据库。
+不加载 Codex plugin/hook 的使用界面目前不在支持范围内。
 
 ## 安装
 
-安装、hook 与验证均要求 Python 3.11 或更新版本。
-
-```powershell
+```text
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
 cd codex-cost-orchestrator
-codex plugin marketplace add .agents/plugins
+codex plugin marketplace add KirschBluteX/codex-cost-orchestrator --ref main
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --upgrade --workspace .
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
 ```
 
-验证两个物理 profile：
+随后：
 
-```powershell
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --check --workspace .
+1. 在 Codex 中打开 `/hooks`。
+2. 阅读并信任全部当前 CCO hook。
+3. 执行只读 readiness 检查：
+
+```text
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
 ```
 
-安装或更新后新建一个 Codex 任务，使 profile、hook 和 skill 重新加载。之后直接描述普通
-实现需求即可；显式 `$codex-cost-orchestrator:orchestrate` 仍可使用，但不是必需。
+doctor 必须同时显示 `HOOKS READY` 和 `STATIC ROUTE READY`。安装或更新后新建一个
+Codex 任务，使新的 skill、profile 与 hook 生效。
 
-## 开发验证
+之后 CCO 会默认隐式运行。例如直接提出：
 
-```powershell
-python -X utf8 -B -m unittest discover -s tests -v
+```text
+重构这个模块，保持公开行为不变，并验证最终结果。
+```
+
+不需要显式写 `$codex-cost-orchestrator:orchestrate`。
+
+### 更新
+
+```text
+codex plugin marketplace upgrade codex-cost-orchestrator
+codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
+codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
+```
+
+若 hook 内容变化，需要重新检查并信任，然后新建任务。
+
+### 卸载
+
+```text
+python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --uninstall
+codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
+codex plugin marketplace remove codex-cost-orchestrator
+```
+
+安装器只删除内容与已发布 CCO 文件完全一致的 profile。被用户修改或来源未知的文件会
+保留，并提示人工处理。
+
+## 配置
+
+优先级如下：
+
+```text
+当前用户 pin → 受信项目配置 → 全局配置 → 内置默认值
+```
+
+全局配置位于 `~/.codex/cco.toml`：
+
+```toml
+trusted_project_roots = ["C:/work/my-project"]
+
+[routes.worker.mechanical]
+candidates = [
+  { model = "gpt-5.6-luna", effort = "max" },
+  { model = "gpt-5.6-terra", effort = "max" },
+]
+
+[routes.reviewer.guarded]
+candidates = [
+  { model = "gpt-5.6-terra", effort = "max" },
+]
+```
+
+受信项目可在 `.codex/cco.toml` 使用同样的 `routes` 表进行覆盖。只有其规范化仓库根
+路径已经写入全局 `trusted_project_roots` 时，项目配置才会被读取。
+
+自动配置不能包含 Sol；guarded 与 reviewer 的自动配置不能包含 Luna。高优先级配置
+错误或候选不受本机支持时，受影响节点会留在 Primary，不会静默采用低优先级方案。
+
+正常任务不会展示路由打分或成本解释。`--doctor` 与 graph compiler 的 `--full` 是显式
+本地诊断入口。
+
+## 显式恢复原生派遣
+
+若当前任务确实希望使用 Codex 原生 Agent 行为和模型/强度继承，请在用户请求中明确
+说明。CCO 只会为这一次非托管 spawn 添加：
+
+```text
+CCO_NATIVE_BYPASS v1
+```
+
+hook 会在派遣前移除标记。CCO 不会自行推断 bypass 权限；bypass owner 也不再享受
+CCO 生命周期和证据保证。
+
+## 安全与本地数据
+
+- PreToolUse 对未准备的普通 spawn 和受管 continuation 采用 fail-closed。
+- prepared workspace 只在 typed scope 内指纹化 tracked 内容与 ignored 文件；即使是默认
+  light 模式，也会保留全仓库 Git status 与 Git control state，以发现新产生的 scope 外变更。
+- worker 声明的 changed paths 必须与该节点 scope 内的真实 delta 完全一致。
+- 大型终态 graph artifact 会立即删除。用于迟到结果 fencing 的小型 tombstone 存放在
+  仓库外；后续 SessionStart 会清理超过 24 小时的终态残留，并将仍像 live/unknown 的
+  遗留状态保守保留最多 7 天，因为当前 Codex 没有 SessionEnd hook。
+- CCO 不发送自身遥测，也不保存 token 数、账单、Radar 数据或长期路由历史。临时
+  prepared artifact 必然包含闭合合同、scope、route binding 与 workspace 指纹，但
+  不复制仓库文件正文或完整对话。
+- hash 用于规范化身份和陈旧结果 fencing，不是加密，也不是抵抗恶意 Primary/leaf 的
+  身份认证。
+- hook 信任始终由用户决定；bootstrap 和 doctor 都不会自动授权。
+
+详细边界与恢复方式见 [SECURITY.md](SECURITY.md) 和
+[运维说明](docs/OPERATIONS.md)。
+
+## 验证
+
+```text
 python -m ruff check plugins tests .github/scripts
+python -X utf8 -B -m unittest discover -s tests -v
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 
-详细规则见 [orchestration skill](plugins/codex-cost-orchestrator/skills/orchestrate/SKILL.md)
-和 [cco.v6 胶囊参考](plugins/codex-cost-orchestrator/skills/orchestrate/references/contracts-v6.md)。
+CI 覆盖 Windows/Python 3.14 与 Linux/Python 3.11。基准方法见
+[docs/BENCHMARK.md](docs/BENCHMARK.md)；项目不会在缺少同工作负载对照实验时宣称固定的
+账单节省比例。
+
+## 项目状态
+
+1.0.0 是第一版稳定协议，目标是生产导向的流程护栏；它不是硬安全边界，也不能替代
+Primary 的最终验收。欢迎提交 issue 与 PR，参见 [CONTRIBUTING.md](CONTRIBUTING.md)、
+[ROADMAP.md](ROADMAP.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+
+MIT License。Copyright (c) 2026 KirschQAQ。

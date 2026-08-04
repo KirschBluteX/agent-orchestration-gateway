@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Cost Orchestrator"
-  short_description: "Implicitly route analysis, implementation, and acceptance"
-  default_prompt: "Classify purpose and judgment, derive assurance from acceptance facts, choose Primary or a bounded adaptive child, then verify the exact resulting state."
+  short_description: "Route closed native Agent work with static local policy"
+  default_prompt: "Keep unresolved work in Primary; derive role, assurance, placement, and a static local route for each closed node, then verify acceptance IDs against the exact resulting state."
 
 policy:
   allow_implicit_invocation: true

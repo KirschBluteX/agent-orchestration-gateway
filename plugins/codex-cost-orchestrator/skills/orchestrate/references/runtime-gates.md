@@ -1,88 +1,91 @@
-# CCO v6 runtime gates
+# CCO v7 runtime gates
 
-## Install and profile health
+## Install, trust, and profile health
 
-Install or upgrade explicitly:
+Run bootstrap explicitly; plugin installation never silently writes global profiles:
 
 ```text
-python scripts/install_agents.py --workspace <repo> --upgrade
+python scripts/install_agents.py --workspace <repo> --bootstrap
+python scripts/install_agents.py --workspace <repo> --doctor
 python scripts/install_agents.py --workspace <repo> --check --profile read --profile write
+python scripts/install_agents.py --workspace <repo> --uninstall
 ```
 
-Upgrade creates the two current profiles and removes only obsolete CCO profile files
-whose bytes match a known published hash. Unknown or user-modified files are retained.
-Start a new Codex task after installation because roles, hooks, and skills load at
-task creation.
+Bootstrap atomically installs or upgrades the two CCO-owned physical profiles and
+removes only published legacy bytes. Unknown and user-modified files are preserved.
+Uninstall has the same ownership rule. Python 3.11 or newer is required.
 
-Both leaves are model-neutral and non-delegating; the read leaf requests read-only.
-An exact user route that native spawn rejects stops. An adaptive pre-thread rejection
-may advance only to the next request precompiled in the prepared graph. Never rerun
-Radar or rebuild a capsule after that rejection, and never silently substitute after
-a usable owner exists.
+Open `/hooks`, review all CCO definitions, and trust the current hashes. Doctor calls
+Codex's local `hooks/list` interface and reports `NOT READY` when any required hook is
+missing, disabled, untrusted, modified, or loaded from another plugin version. Doctor
+never writes trust state and never uses `--dangerously-bypass-hook-trust`.
 
-When bundled entries expose backend metadata, explicitly known
-`multi_agent_version=v1` and `v2` entries are eligible. Do not infer support from a
-model name, Radar presence, or an unmarked/unknown entry. The native spawn response
-remains the final route evidence; adaptive rejection can use only the prepared
-fallback.
+Start a new Codex task after plugin/profile changes. SessionStart injects one compact
+mandatory-dispatch reminder. PreToolUse remains the mechanical enforcement point.
 
-Use the native spawn response as route evidence when it exposes role/model/effort.
-Only when a required dimension is absent—or before claiming OS read-only—run
-`scripts/inspect_agent_runtime.py` once for that exact owner. It resolves a canonical
-task path in one directory pass and streams only allowlisted rollout metadata; never
-scan session history on every dispatch by default.
+## Native capability and route health
 
-## Route health
+Use capability metadata exposed by the active host when available. The PATH Codex CLI
+bundled catalogue is only a fallback. An entry is eligible only when it explicitly
+advertises native multi-Agent v1 or v2 plus the selected reasoning effort. The actual
+spawn response remains final evidence.
 
-The graph resolver performs network/catalog work outside its non-blocking state lock.
-A fully fixed pair skips Radar. A fresh cache avoids the network. An expired but
-source-valid LKG returns immediately with `needs_refresh`; refresh is off the current
-dispatch path. Only one LKG, one small route-state file, and a native-catalog cache are
-retained. One short-lived refresh request suppresses duplicate processes for the same
-stale snapshot; it is removed after success and expires after a failed attempt. Atomic
-staging files are removed on success/failure and stale abandoned ones are pruned
-conservatively.
+Routing is static and local. There is no Radar request, network dependency, route TTL,
+cache, pricing table, token meter, or billing history. A full current-user pin has one
+candidate. A partial pin adapts only its unpinned dimension. Built-in effort fallback
+is `max`, `xhigh`, then `high`. A pre-thread rejection may use only the next prepared
+fallback. Unsupported or invalid high-priority policy returns that node to Primary.
 
-## Native capacity and waiting
+Global policy: `~/.codex/cco.toml`. Project policy: `.codex/cco.toml`, read only when
+the canonical repository root is listed by the global `trusted_project_roots` array.
 
-The host `[agents].max_concurrent_threads_per_session` or its native default owns
-capacity. CCO sets no lower cap. Dispatch only dependency-ready, responsibility- and
-scope-disjoint nodes. After independent Primary work ends, make one event-driven wait
-with a long useful timeout. Do not poll unchanged state.
+## Native capacity and quiescence
 
-## Lifecycle strength
+The host's live Agent capacity is the only concurrency ceiling. CCO adds none. Admit
+dependency-ready nodes with distinct responsibilities and non-conflicting typed
+scopes. The deterministic selector prioritizes downstream graph progress, then uses
+available capacity and stable node ordering.
 
-The ledger is outside the repository and contains one active owner per node revision.
-It detects duplicate owners, concurrent cursor advancement, retired owners, and late
-results. PreToolUse requires the prepared workspace artifact, and SubagentStop checks
-the exact baseline against the whole graph's typed scopes before recording a result.
-The ledger is not durable coordination and cannot stop a late filesystem write.
-Primary must still inspect attribution and check the workspace after every returned
-or rejected write result.
+After spawn, Primary performs only proven non-overlapping, dependency-independent
+work. Otherwise it waits for native events rather than polling or issuing progress-
+only model requests.
 
-Light mode intentionally does not enumerate ignored paths. Strict mode fingerprints
-ignored paths and fails closed above 10,000 files or 256 MiB of ignored content unless
-the graph compiler is given explicit tighter or broader limits. Both modes protect Git
-control state, tracked/untracked status, path aliases, reparses, and submodules as
-implemented by the workspace-state schema; strict is required when ignored files are
-inside the risk boundary. Spawn and continuation preflight retain a five-second fast
-bound; only SubagentStop workspace verification has a 120-second protection bound so
-a legitimate strict scan is not killed by the old envelope-only timeout.
+## Workspace and lifecycle strength
 
-Hook failures may be fail-open at the host layer. Primary evidence remains mandatory.
-Call a review OS read-only only when observed runtime metadata says `read-only`; with
-broader permissions use before/after state comparison or stop if hard isolation is
-required.
+The prepared graph fingerprints tracked content and ignored files only inside declared
+typed scopes. Git status and Git control state remain global so a newly created
+out-of-scope delta is still detectable; the standalone unscoped workspace CLI retains
+strict whole-repository content inspection. Path aliases, reparses, junctions, and
+submodules remain protected. Ignored scans fail closed above the configured file/byte
+bounds.
 
-## Recovery
+The task-local ledger lives outside the repository. It provides one active owner per
+node revision, cursor single-flight, generation fencing, guarded floors, and late-
+result tombstones. It is not encryption or authentication against a malicious
+Primary. It is also not a second Agent runtime, durable scheduler, or protection
+against a late filesystem write. Primary still inspects actual state.
 
-- Missing/mismatched profile: stop delegation; do not use a generic fallback.
-- Pre-thread adaptive rejection: advance one bound candidate and rejection ticket.
-- Resident owner missing information: one evidence-bearing continuation cursor.
-- Completed, cold, fenced, or materially changed work: newer full generation.
-- Evidence-backed Luna execution failure, deviation, or scope surprise: retire it,
-  record the event, and compile a newer guarded generation; do not try another Luna
-  effort, and do not waive the Sol advantage gate.
-- Repeated failure signature: require a materially different intervention.
-- Auth, policy, sandbox, or malformed-request failure: do not auto-retry.
-- Scope surprise: preserve state, retire owner, and reclose the contract/baseline.
+Spawn/continuation hooks keep a five-second bound. SubagentStop gets 120 seconds for a
+legitimate workspace scan; there is no ten-minute reviewer hard timeout. Large graph
+artifacts are deleted as soon as all graph owners are terminal. Current Codex does not
+expose SessionEnd, so tiny tombstones remain across turns. A later SessionStart
+removes terminal residue after 24 hours and live/unknown abandoned state after seven
+days.
+
+The read profile requests OS read-only, but describe it as isolated only when observed
+runtime metadata confirms the effective sandbox. If hard isolation is required and
+cannot be proven, stop rather than relying only on before/after comparison.
+
+## Recovery table
+
+- Missing/mismatched profile or untrusted hook: stop delegation and run doctor.
+- Confirmed pre-thread native rejection: take the next precompiled fallback.
+- Same owner, same contract, new evidence: one cursor continuation.
+- Completed, fenced, materially changed, or cold work: newer full generation.
+- Incomplete, blocked, deviation, scope/routing surprise: retire, record a canonical
+  failure signature, reclose facts, and use a newer guarded generation.
+- Luna quality failure: use Terra guarded; never try another Luna effort automatically.
+- Terra quality failure: return to Primary for replanning.
+- Repeated failure signature without new evidence: do not retry.
+- Auth, policy, sandbox, malformed packet, or unsupported exact pin: do not auto-retry.
+- Sol: never an automatic fallback; only a current explicit user pin may select it.
