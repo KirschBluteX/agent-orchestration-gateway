@@ -16,14 +16,12 @@ import tomllib
 
 
 PROFILE_FILENAMES = {
-    "routine": "codex-cost-orchestrator-routine-worker.toml",
-    "complex": "codex-cost-orchestrator-complex-worker.toml",
-    "reviewer": "codex-cost-orchestrator-reviewer.toml",
+    "read": "codex-cost-orchestrator-read-leaf.toml",
+    "write": "codex-cost-orchestrator-write-leaf.toml",
 }
 PROFILE_AGENT_NAMES = {
-    "routine": "cost_orchestrator_routine_worker",
-    "complex": "cost_orchestrator_complex_worker",
-    "reviewer": "cost_orchestrator_reviewer",
+    "read": "cost_orchestrator_read_leaf",
+    "write": "cost_orchestrator_write_leaf",
 }
 LEGACY_PROFILE_SHA256 = {
     "codex-cost-orchestrator-routine-worker.toml": frozenset(
@@ -32,6 +30,10 @@ LEGACY_PROFILE_SHA256 = {
             "c9b2187367ab1c167cae594bf589c74adb3b8959c3c4292751117aec820cdc21",
             "bc8ce4bfb9b58b0fac32272f60456b3b327f1d21427dd8e01dff5fd22ac5ceb5",
             "cf9e6b654c6426717ebf738548cf1b5830615b248bddc9acda2f29428b7f62a1",
+            # Previous locally-installed CCO v4 profile with an explicit Sol pin.
+            "0471ca8bd00f5bad089aaf6b1bf45d9b7403c1df679f278c29f975d523d981c4",
+            # CCO v5 model-neutral routine leaf.
+            "5004b32698625ab551ae24e6206235c53a30d726eb77ec8981d6132ed2b971a3",
         }
     ),
     "codex-cost-orchestrator-complex-worker.toml": frozenset(
@@ -40,6 +42,9 @@ LEGACY_PROFILE_SHA256 = {
             "e50aadfd85e83841750cea5af5b076e746e7bfddf63cc3f24c27beddc9b8a851",
             "cca439e5c44163be360c665c18fbd9a1641fcd3e28d1488ef60e5ce0b58eb884",
             "a5937769fe00b99480feb5dcc289b862e4529d9605836d1a62d59de01dfcbb90",
+            "adfc26ef02fd70a987427b80429eb17be7c9b20fb31b8fe8d8c3eaaab77fd7a9",
+            # CCO v5 model-neutral complex leaf.
+            "58bdfe423732a4896e7331461b6c789115e3491af72643d67756c7fd6654e904",
         }
     ),
     "codex-cost-orchestrator-reviewer.toml": frozenset(
@@ -48,6 +53,16 @@ LEGACY_PROFILE_SHA256 = {
             "395a35427315e71b37227a79ac38889aa9f102eebf7dbdb78d9ae86b510ee9bc",
             "1df307612992239960b4dececd79f6f1935b42662983204d350cb7ed519528b8",
             "309381c4bb2c009d0f062677b00b6f74ecf788b9eacd018dd344e3f4b0bb20f8",
+            "e9769ef541b2bcd6ded6f407e90cfab077965a05a24b180735759418d00710f1",
+            # CCO v5 model-neutral reviewer leaf.
+            "0d8c3f65266444cebf48595e5a9257f54dcaea03775a8a66eb8d496e200bcddd",
+        }
+    ),
+    "codex-cost-orchestrator-analysis-worker.toml": frozenset(
+        {
+            # Published v5 analysis leaf.  It never existed in the repository's
+            # v4 tree, so its exact installed hash is recorded explicitly.
+            "7978912a51a343e2efefc82ec56d82e036910138d66146f574a32f0546c131d9",
         }
     ),
 }
@@ -92,6 +107,11 @@ def is_reparse(path: Path) -> bool:
         or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
         or is_junction
     )
+
+
+def has_reparse_ancestor(path: Path) -> bool:
+    absolute = Path(os.path.abspath(path.expanduser()))
+    return any(is_reparse(candidate) for candidate in (absolute, *absolute.parents))
 
 
 def fail(message: str) -> None:
@@ -140,6 +160,17 @@ def cleanup_prepared(changes: list[PreparedChange]) -> None:
                 pass
 
 
+def removable_legacy_profiles(target: Path) -> list[Path]:
+    """Return only old CCO profiles whose bytes match a published release."""
+
+    removable: list[Path] = []
+    for filename, hashes in LEGACY_PROFILE_SHA256.items():
+        candidate = target / filename
+        if is_real_file(candidate) and file_sha256(candidate) in hashes:
+            removable.append(candidate)
+    return removable
+
+
 def prepare_change(
     target: Path,
     filename: str,
@@ -152,10 +183,11 @@ def prepare_change(
     staged_path: Path | None = None
     backup_path: Path | None = None
     try:
-        staged_path = stage_bytes(
-            target, template_bytes, ".cost-orchestrator-agent-"
-        )
-        if kind == "upgrade":
+        if kind != "remove":
+            staged_path = stage_bytes(
+                target, template_bytes, ".cost-orchestrator-agent-"
+            )
+        if kind in {"upgrade", "remove"}:
             if (
                 source_identity is None
                 or source_sha256 is None
@@ -216,6 +248,13 @@ def rollback_prepared(changes: list[PreparedChange]) -> list[str]:
                 os.replace(change.backup_path, change.destination)
                 change.backup_path = None
             elif (
+                change.kind == "remove"
+                and not change.destination.exists()
+                and change.backup_path is not None
+            ):
+                os.replace(change.backup_path, change.destination)
+                change.backup_path = None
+            elif (
                 is_real_file(change.destination)
                 and change.applied_identity is not None
                 and file_identity(change.destination) == change.applied_identity
@@ -248,16 +287,12 @@ def template_error(path: Path, profile: str) -> str | None:
         return f"shipped profile is not valid UTF-8 TOML: {path}"
     if value.get("name") != PROFILE_AGENT_NAMES[profile]:
         return f"shipped profile has the wrong agent name: {path}"
-    if profile in {"routine", "complex"} and (
+    if profile in {"read", "write"} and (
         "model" in value or "model_reasoning_effort" in value
     ):
-        return f"worker profile must not pin model or model_reasoning_effort: {path}"
-    if profile == "reviewer" and (
-        value.get("model") != "gpt-5.6-sol"
-        or value.get("model_reasoning_effort") != "high"
-        or value.get("sandbox_mode") != "read-only"
-    ):
-        return f"reviewer profile must retain Sol High and read-only defaults: {path}"
+        return f"leaf profile must not pin model or model_reasoning_effort: {path}"
+    if profile == "read" and value.get("sandbox_mode") != "read-only":
+        return f"read profile must request read-only execution: {path}"
     if "agents" in value:
         return f"leaf profile must not declare an agents table: {path}"
     features = value.get("features", {})
@@ -411,6 +446,9 @@ def install(
     if target == Path(target.anchor):
         fail("refusing to use a filesystem root as the agent target directory")
         return 1
+    if has_reparse_ancestor(target):
+        fail(f"target directory has a reparse ancestor: {target}")
+        return 1
 
     for profile, filename in zip(selected_profiles, filenames, strict=True):
         template = templates / filename
@@ -470,7 +508,7 @@ def install(
     current_destinations: list[Path] = []
     try:
         target.mkdir(parents=True, exist_ok=True)
-        if is_reparse(target) or not target.is_dir():
+        if has_reparse_ancestor(target) or not target.is_dir():
             raise InstallTransactionError(
                 f"target directory changed before installation: {target}"
             )
@@ -497,7 +535,36 @@ def install(
                 )
             )
 
+        if upgrade:
+            for destination in removable_legacy_profiles(target):
+                changes.append(
+                    prepare_change(
+                        target,
+                        destination.name,
+                        destination,
+                        destination.read_bytes(),
+                        "remove",
+                        file_identity(destination),
+                        file_sha256(destination),
+                    )
+                )
+
         for change in changes:
+            if change.kind == "remove":
+                if (
+                    not is_real_file(change.destination)
+                    or change.backup_path is None
+                    or not os.path.samefile(change.destination, change.backup_path)
+                    or file_identity(change.destination) != change.source_identity
+                    or file_sha256(change.destination) != change.source_sha256
+                ):
+                    raise InstallTransactionError(
+                        f"legacy profile changed during upgrade: {change.destination}"
+                    )
+                change.destination.unlink()
+                change.applied = True
+                continue
+
             if change.staged_path is None:
                 raise InstallTransactionError("staged profile is unavailable")
             if change.kind == "upgrade":
@@ -539,9 +606,15 @@ def install(
                 raise InstallTransactionError(
                     f"post-install exactness check failed: {destination}"
                 )
+        for change in changes:
+            if change.kind == "remove" and change.destination.exists():
+                raise InstallTransactionError(
+                    f"legacy profile was not removed: {change.destination}"
+                )
     except (OSError, InstallTransactionError) as error:
         rollback_errors = rollback_prepared(changes)
-        cleanup_prepared(changes)
+        if not rollback_errors:
+            cleanup_prepared(changes)
         if not target_existed:
             try:
                 target.rmdir()
@@ -556,6 +629,9 @@ def install(
     for destination in current_destinations:
         print(f"ALREADY CURRENT: {destination}")
     for change in changes:
+        if change.kind == "remove":
+            print(f"REMOVED LEGACY: {change.destination}")
+            continue
         action = "UPGRADED" if change.kind == "upgrade" else "INSTALLED"
         print(f"{action}: {change.destination}")
 

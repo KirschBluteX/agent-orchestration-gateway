@@ -40,7 +40,7 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
                             "id": current_child,
                             "parent_thread_id": current_parent,
                             "agent_path": target,
-                            "agent_role": "cost_orchestrator_routine_worker",
+                            "agent_role": "cost_orchestrator_write_leaf",
                         },
                     },
                     {
@@ -108,7 +108,7 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
                     "payload": {
                         "id": thread_id,
                         "parent_thread_id": "DO_NOT_LEAK_PARENT",
-                        "agent_role": "cost_orchestrator_routine_worker",
+                        "agent_role": "cost_orchestrator_write_leaf",
                         "agent_path": "DO_NOT_LEAK_AGENT_PATH",
                         "model_provider": "DO_NOT_LEAK_PROVIDER",
                         "base_instructions": "DO_NOT_LEAK_INSTRUCTIONS",
@@ -219,7 +219,7 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
                     "type": "session_meta",
                     "payload": {
                         "id": thread_id,
-                        "agent_role": "cost_orchestrator_complex_worker",
+                        "agent_role": "cost_orchestrator_write_leaf",
                     },
                 },
                 {
@@ -256,10 +256,10 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
     def test_requires_role_model_and_effort(self) -> None:
         cases = {
             "missing-role": ({"model": "gpt-5.6-luna", "effort": "max"}, None),
-            "missing-model": ({"effort": "max"}, "cost_orchestrator_routine_worker"),
+            "missing-model": ({"effort": "max"}, "cost_orchestrator_write_leaf"),
             "missing-effort": (
                 {"model": "gpt-5.6-luna"},
-                "cost_orchestrator_routine_worker",
+                "cost_orchestrator_write_leaf",
             ),
         }
         for index, (label, (turn, role)) in enumerate(cases.items(), start=4):
@@ -307,7 +307,7 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
                     "type": "session_meta",
                     "payload": {
                         "id": thread_id,
-                        "agent_role": "cost_orchestrator_complex_worker",
+                        "agent_role": "cost_orchestrator_write_leaf",
                     },
                 },
                 {
@@ -329,7 +329,7 @@ class RuntimeInspectorBehaviorTests(unittest.TestCase):
                 "--sessions-dir",
                 str(sessions_root),
                 "--expect-role",
-                "cost_orchestrator_complex_worker",
+                "cost_orchestrator_write_leaf",
                 "--expect-model",
                 "gpt-user-selected-worker",
                 "--expect-effort",

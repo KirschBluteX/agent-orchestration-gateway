@@ -52,12 +52,5 @@ jobs:
           .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py
           plugins/codex-cost-orchestrator/skills/orchestrate
 
-      - name: Check POSIX compatibility wrappers
-        if: runner.os == 'Linux'
-        run: |
-          sh -n plugins/codex-cost-orchestrator/scripts/install-agents.sh
-          sh -n plugins/codex-cost-orchestrator/scripts/inspect-agent-runtime.sh
-          sh -n plugins/codex-cost-orchestrator/scripts/verify.sh
-
       - name: Check patch whitespace
         run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD

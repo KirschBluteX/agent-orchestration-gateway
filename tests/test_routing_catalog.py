@@ -12,21 +12,29 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "plugins" / "codex-cost-orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
+import routing_catalog as routing_module  # noqa: E402
+
 from routing_catalog import (  # noqa: E402
     RADAR_URL,
     STATE_FILENAME,
     FetchResult,
     RoutingCatalogError,
     advance_route,
+    advance_route_plan,
     fetch_radar,
     load_radar_snapshot,
+    load_native_catalog,
     normalize_snapshot,
     read_routing_state,
     render_resolution,
     resolve_graph_route,
+    resolve_graph_route_plan,
     resolve_route,
+    resolve_route_plan,
+    route_plan_sha256,
     routing_lock,
     stabilize_route,
+    validate_route_plan,
     validate_route_decision,
     write_json_atomic,
 )
@@ -112,6 +120,126 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             )
 
         self.assertEqual(decision["selected"]["model"], "gpt-5.6-luna")
+
+    def test_route_plan_batches_multiple_purpose_judgment_keys_in_order(self) -> None:
+        plan = resolve_route_plan(
+            [
+                {"purpose": "implementation", "judgment": "routine"},
+                {"purpose": "acceptance", "judgment": "complex"},
+            ],
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0),
+                point("gpt-5.6-terra", "max", passed=74, cost=4.0, minutes=28.0),
+            ),
+            native_catalog(
+                ("gpt-5.6-luna", "max"),
+                ("gpt-5.6-terra", "max"),
+            ),
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(plan["protocol"], "cco.route-plan.v1")
+        self.assertFalse(plan["needs_refresh"])
+        self.assertEqual(
+            [(route["purpose"], route["judgment"]) for route in plan["routes"]],
+            [("acceptance", "complex"), ("implementation", "routine")],
+        )
+        self.assertTrue(all(len(route["candidates"]) <= 3 for route in plan["routes"]))
+
+    def test_route_plan_validator_requires_hash_and_active_candidate_consistency(self) -> None:
+        plan = resolve_route_plan(
+            [{"purpose": "implementation", "judgment": "routine"}],
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0),
+                point("gpt-5.6-terra", "max", passed=74, cost=4.0, minutes=28.0),
+            ),
+            native_catalog(
+                ("gpt-5.6-luna", "max"),
+                ("gpt-5.6-terra", "max"),
+            ),
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(validate_route_plan(plan), plan)
+        self.assertEqual(route_plan_sha256(plan), plan["plan_sha256"])
+
+        hash_tampered = json.loads(json.dumps(plan))
+        hash_tampered["needs_refresh"] = True
+        with self.assertRaises(RoutingCatalogError):
+            validate_route_plan(hash_tampered)
+
+        semantic_tampered = json.loads(json.dumps(plan))
+        active = semantic_tampered["routes"][0]
+        active["selected"] = {
+            "effort": active["selected"]["effort"],
+            "model": "gpt-5.6-sol",
+        }
+        semantic_tampered["plan_sha256"] = route_plan_sha256(semantic_tampered)
+        with self.assertRaises(RoutingCatalogError):
+            validate_route_plan(semantic_tampered)
+
+        invented_reason = json.loads(json.dumps(plan))
+        invented_reason["routes"][0]["placement"]["reason"] = "looks_cheap"
+        invented_reason["plan_sha256"] = route_plan_sha256(invented_reason)
+        with self.assertRaises(RoutingCatalogError):
+            validate_route_plan(invented_reason)
+
+    def test_route_plan_validator_rejects_noncanonical_route_order(self) -> None:
+        plan = resolve_route_plan(
+            [
+                {"purpose": "implementation", "judgment": "routine"},
+                {"purpose": "acceptance", "judgment": "complex"},
+            ],
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0),
+                point("gpt-5.6-terra", "max", passed=74, cost=4.0, minutes=28.0),
+            ),
+            native_catalog(
+                ("gpt-5.6-luna", "max"),
+                ("gpt-5.6-terra", "max"),
+            ),
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+        reordered = json.loads(json.dumps(plan))
+        reordered["routes"].reverse()
+        reordered["plan_sha256"] = route_plan_sha256(reordered)
+
+        with self.assertRaises(RoutingCatalogError):
+            validate_route_plan(reordered)
+
+    def test_route_plan_advance_only_changes_rank_selected_and_ticket(self) -> None:
+        plan = resolve_route_plan(
+            [{"purpose": "implementation", "judgment": "complex"}],
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0),
+                point("gpt-5.6-terra", "max", passed=73, cost=4.0, minutes=25.0),
+            ),
+            native_catalog(
+                ("gpt-5.6-luna", "max"),
+                ("gpt-5.6-terra", "max"),
+            ),
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+        active = plan["routes"][0]["selected"]
+
+        advanced = advance_route_plan(
+            plan,
+            purpose="implementation",
+            judgment="complex",
+            rejected_model=active["model"],
+            rejected_effort=active["effort"],
+            rejection_ticket="native:unsupported-model-effort",
+        )
+
+        before = dict(plan["routes"][0])
+        after = dict(advanced["routes"][0])
+        for field in ("decision_sha256", "candidates", "placement"):
+            self.assertEqual(after[field], before[field])
+        self.assertEqual(after["dispatch"]["rank"], 2)
+        self.assertEqual(
+            after["dispatch"]["rejection_tickets"],
+            ["native:unsupported-model-effort"],
+        )
 
     def test_requires_iq_strictly_above_90_and_native_capability(self) -> None:
         decision = resolve_route(
@@ -264,15 +392,15 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 complex_route["selected"]["model"],
                 complex_route["selected"]["effort"],
             ),
-            ("gpt-5.6-sol", "xhigh"),
+            ("gpt-5.6-luna", "max"),
         )
         self.assertEqual(
             complex_route["selection_method"], "strict_pareto_fixed_anchor_mcda"
         )
         self.assertNotIn(
-            ("gpt-5.6-sol", "ultra"),
+            "gpt-5.6-sol",
             [
-                (candidate["model"], candidate["effort"])
+                candidate["model"]
                 for candidate in complex_route["pareto_frontier"]
             ],
         )
@@ -338,10 +466,53 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
         )
 
-        self.assertEqual(
-            (decision["selected"]["model"], decision["selected"]["effort"]),
-            ("gpt-5.6-sol", "xhigh"),
+        self.assertEqual(decision["selected"]["model"], "gpt-5.6-luna")
+
+    def test_sol_cannot_auto_win_without_non_overlapping_wilson_iq_advantage(self) -> None:
+        decision = resolve_route(
+            radar_payload(
+                point("gpt-5.6-terra", "max", passed=74, cost=4.0, minutes=30.0),
+                point("gpt-5.6-sol", "max", passed=75, cost=1.0, minutes=20.0),
+            ),
+            native_catalog(
+                ("gpt-5.6-terra", "max"),
+                ("gpt-5.6-sol", "max"),
+            ),
+            "complex",
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
         )
+
+        self.assertEqual(decision["selected"]["model"], "gpt-5.6-terra")
+
+    def test_sol_can_auto_win_with_strict_wilson_iq_advantage(self) -> None:
+        decision = resolve_route(
+            radar_payload(
+                point(
+                    "gpt-5.6-terra",
+                    "max",
+                    passed=650,
+                    valid_tasks=1000,
+                    cost=4.0,
+                    minutes=30.0,
+                ),
+                point(
+                    "gpt-5.6-sol",
+                    "max",
+                    passed=850,
+                    valid_tasks=1000,
+                    cost=5.0,
+                    minutes=30.0,
+                ),
+            ),
+            native_catalog(
+                ("gpt-5.6-terra", "max"),
+                ("gpt-5.6-sol", "max"),
+            ),
+            "complex",
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(decision["selected"]["model"], "gpt-5.6-sol")
 
     def test_cost_and_time_penalties_remain_monotonic_above_anchors(self) -> None:
         decision = resolve_route(
@@ -440,6 +611,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 cache_dir,
                 now=datetime(2026, 8, 3, 11, 0, 1, tzinfo=timezone.utc),
                 fetcher=fetch,
+                force_refresh=True,
             )
 
             self.assertEqual(calls, [None, '"radar-v1"'])
@@ -468,6 +640,35 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 128 * 1024,
             )
 
+    def test_expired_but_bounded_lkg_returns_immediately_and_requests_refresh(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=66, cost=0.5, minutes=30.0)
+        )
+        calls: list[str | None] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            first = load_radar_snapshot(
+                cache_dir,
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda etag: (
+                    calls.append(etag)
+                    or FetchResult(status=200, payload=radar, etag='"radar-v1"')
+                ),
+            )
+            stale = load_radar_snapshot(
+                cache_dir,
+                now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail(
+                    "stale-while-revalidate must not fetch on the dispatch path"
+                ),
+            )
+
+        self.assertEqual(calls, [None])
+        self.assertFalse(first.needs_refresh)
+        self.assertTrue(stale.needs_refresh)
+        self.assertEqual(stale.status, "last_known_good")
+
     def test_fresh_foreign_temporary_is_not_deleted_by_another_loader(self) -> None:
         radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=66, cost=0.5, minutes=30.0)
@@ -495,12 +696,12 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             ):
                 with self.assertRaises(RoutingCatalogError):
                     write_json_atomic(
-                        directory / "routing-state-v1.json",
+                        directory / "routing-state-v2.json",
                         {"protocol": "test"},
-                        prefix="routing-state-v1.",
+                        prefix="routing-state-v2.",
                     )
 
-            self.assertEqual(list(directory.glob("routing-state-v1.*.tmp")), [])
+            self.assertEqual(list(directory.glob("routing-state-v2.*.tmp")), [])
 
     def test_short_lived_lock_blocks_overlap_and_is_removed_on_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -511,6 +712,19 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                     with routing_lock(cache_dir, now=now, wait_seconds=0):
                         self.fail("overlapping lock unexpectedly acquired")
             self.assertFalse((cache_dir / "routing-v1.lock").exists())
+
+    def test_routing_lock_is_non_blocking_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            now = datetime.now(timezone.utc)
+            with routing_lock(cache_dir, now=now):
+                with mock.patch(
+                    "routing_catalog.time.sleep",
+                    side_effect=AssertionError("routing lock must never sleep"),
+                ):
+                    with self.assertRaises(RoutingCatalogError):
+                        with routing_lock(cache_dir, now=now):
+                            self.fail("overlapping lock unexpectedly acquired")
 
     def test_refresh_failure_uses_bounded_last_known_good(self) -> None:
         radar = radar_payload(
@@ -534,6 +748,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 cache_dir,
                 now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
                 fetcher=unavailable,
+                force_refresh=True,
             )
 
             self.assertEqual(fallback.status, "last_known_good")
@@ -565,6 +780,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                     fetcher=lambda _etag: FetchResult(
                         status=304, payload=None, etag='"radar-v1"'
                     ),
+                    force_refresh=True,
                 )
 
     def test_older_200_response_does_not_replace_a_newer_lkg(self) -> None:
@@ -593,6 +809,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 fetcher=lambda _etag: FetchResult(
                     status=200, payload=older, etag='"older"'
                 ),
+                force_refresh=True,
             )
 
         self.assertEqual(fallback.status, "last_known_good")
@@ -709,10 +926,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(
-            (decision["selected"]["model"], decision["selected"]["effort"]),
-            ("gpt-5.6-sol", "xhigh"),
-        )
+        self.assertEqual(decision["selected"]["model"], "gpt-5.6-luna")
         self.assertEqual(decision["policy"]["quality_weight"], 0.70)
 
     def test_one_user_fixed_dimension_constrains_the_adaptive_choice(self) -> None:
@@ -720,12 +934,12 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             radar_payload(
                 point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0),
                 point("gpt-5.6-sol", "high", passed=72, cost=3.0, minutes=20.0),
-                point("gpt-5.6-sol", "xhigh", passed=78, cost=6.0, minutes=25.0),
+                point("gpt-5.6-terra", "max", passed=73, cost=4.0, minutes=25.0),
             ),
             native_catalog(
                 ("gpt-5.6-luna", "max"),
                 ("gpt-5.6-sol", "high"),
-                ("gpt-5.6-sol", "xhigh"),
+                ("gpt-5.6-terra", "max"),
             ),
             "complex",
             now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
@@ -734,6 +948,22 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
 
         self.assertEqual(decision["selected"]["model"], "gpt-5.6-sol")
         self.assertEqual(decision["constraints"]["fixed_model"], "gpt-5.6-sol")
+
+    def test_fully_fixed_user_pair_skips_radar_and_only_checks_native_capability(self) -> None:
+        decision = resolve_route(
+            {"this": "is intentionally not a Radar payload"},
+            native_catalog(("gpt-5.6-sol", "max")),
+            "routine",
+            fixed_model="gpt-5.6-sol",
+            fixed_effort="max",
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            (decision["selected"]["model"], decision["selected"]["effort"]),
+            ("gpt-5.6-sol", "max"),
+        )
+        self.assertEqual(decision["selection_method"], "fixed_user_pair_native_capability")
 
     def test_native_catalog_identity_is_bound_to_the_decision(self) -> None:
         radar = radar_payload(
@@ -762,6 +992,39 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         )
         self.assertNotEqual(luna_only["decision_sha256"], both["decision_sha256"])
 
+    def test_native_catalog_is_cached_by_codex_version_and_content_fingerprint(self) -> None:
+        payload = json.dumps(
+            native_catalog(("gpt-5.6-luna", "max"))
+        ).encode("utf-8")
+        calls: list[tuple[str, ...]] = []
+
+        class Result:
+            returncode = 0
+            stderr = b""
+
+            def __init__(self, stdout: bytes) -> None:
+                self.stdout = stdout
+
+        def runner(command: list[str], **_kwargs: object) -> Result:
+            calls.append(tuple(command[1:]))
+            if command[1:] == ["--version"]:
+                return Result(b"codex-cli 1.2.3\n")
+            return Result(payload)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            executable = directory / "codex-test"
+            executable.write_bytes(b"codex-build-one")
+            first = load_native_catalog(
+                directory, executable=executable, runner=runner
+            )
+            second = load_native_catalog(
+                directory, executable=executable, runner=runner
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(calls, [("--version",), ("debug", "models", "--bundled")])
+
     def test_route_decision_hash_is_canonical_and_order_independent(self) -> None:
         luna = point("gpt-5.6-luna", "max", passed=66, cost=0.5, minutes=30.0)
         terra = point("gpt-5.6-terra", "max", passed=64, cost=4.0, minutes=31.0)
@@ -785,11 +1048,11 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         recommendation = resolve_route(
             radar_payload(
                 point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0),
-                point("gpt-5.6-sol", "xhigh", passed=78, cost=6.0, minutes=25.0),
+                point("gpt-5.6-terra", "max", passed=73, cost=4.0, minutes=25.0),
             ),
             native_catalog(
                 ("gpt-5.6-luna", "max"),
-                ("gpt-5.6-sol", "xhigh"),
+                ("gpt-5.6-terra", "max"),
             ),
             "routine",
             now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
@@ -817,11 +1080,11 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         recommendation = resolve_route(
             radar_payload(
                 point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0),
-                point("gpt-5.6-sol", "xhigh", passed=78, cost=6.0, minutes=25.0),
+                point("gpt-5.6-terra", "max", passed=73, cost=4.0, minutes=25.0),
             ),
             native_catalog(
                 ("gpt-5.6-luna", "max"),
-                ("gpt-5.6-sol", "xhigh"),
+                ("gpt-5.6-terra", "max"),
             ),
             "complex",
             now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
@@ -839,23 +1102,60 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         self.assertNotEqual(fallback["selected"], rejected)
         self.assertNotEqual(fallback["decision_sha256"], decision["decision_sha256"])
 
-    def test_new_winner_requires_two_distinct_snapshots_before_switching(self) -> None:
+    def test_advance_only_updates_rank_and_appends_a_rejection_ticket(self) -> None:
+        recommendation = resolve_route(
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0),
+                point("gpt-5.6-terra", "max", passed=73, cost=4.0, minutes=25.0),
+            ),
+            native_catalog(
+                ("gpt-5.6-luna", "max"),
+                ("gpt-5.6-terra", "max"),
+            ),
+            "complex",
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+        decision, _state = stabilize_route(recommendation, None)
+        rejected = decision["selected"]
+
+        fallback = advance_route(
+            decision,
+            rejected_model=rejected["model"],
+            rejected_effort=rejected["effort"],
+            rejection_ticket="native:unsupported-model-effort",
+        )
+
+        self.assertEqual(fallback["dispatch"]["rank"], 2)
+        self.assertEqual(
+            fallback["dispatch"]["rejection_tickets"],
+            ["native:unsupported-model-effort"],
+        )
+        for field in (
+            "eligible_candidates",
+            "fallback_order",
+            "pareto_frontier",
+            "policy",
+            "policy_sha256",
+        ):
+            self.assertEqual(fallback[field], decision[field])
+
+    def test_new_eligible_winner_switches_without_persisting_candidate_history(self) -> None:
         native = native_catalog(
             ("gpt-5.6-luna", "max"),
-            ("gpt-5.6-sol", "xhigh"),
+            ("gpt-5.6-terra", "max"),
         )
         initial_radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=66, cost=0.5, minutes=30.0),
-            point("gpt-5.6-sol", "xhigh", passed=62, cost=6.0, minutes=25.0),
+            point("gpt-5.6-terra", "max", passed=62, cost=6.0, minutes=25.0),
         )
         first_change_radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=66, cost=0.5, minutes=30.0),
-            point("gpt-5.6-sol", "xhigh", passed=80, cost=0.6, minutes=20.0),
+            point("gpt-5.6-terra", "max", passed=80, cost=0.6, minutes=20.0),
         )
         first_change_radar["fingerprint"] = "b" * 64
         second_change_radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=66, cost=0.5, minutes=30.0),
-            point("gpt-5.6-sol", "xhigh", passed=81, cost=0.6, minutes=20.0),
+            point("gpt-5.6-terra", "max", passed=81, cost=0.6, minutes=20.0),
         )
         second_change_radar["fingerprint"] = "c" * 64
         now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
@@ -863,31 +1163,31 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         initial, state = stabilize_route(
             resolve_route(initial_radar, native, "routine", now=now), None
         )
-        pending, state = stabilize_route(
+        switched, state = stabilize_route(
             resolve_route(first_change_radar, native, "routine", now=now), state
         )
-        switched, state = stabilize_route(
+        stable, state = stabilize_route(
             resolve_route(second_change_radar, native, "routine", now=now), state
         )
 
         self.assertEqual(initial["selected"]["model"], "gpt-5.6-luna")
         self.assertEqual(initial["hysteresis"]["status"], "initialized")
-        self.assertEqual(pending["selected"]["model"], "gpt-5.6-luna")
-        self.assertEqual(pending["hysteresis"]["status"], "pending")
-        self.assertEqual(switched["selected"]["model"], "gpt-5.6-sol")
+        self.assertEqual(switched["selected"]["model"], "gpt-5.6-terra")
         self.assertEqual(switched["hysteresis"]["status"], "switched")
+        self.assertEqual(stable["hysteresis"]["status"], "stable")
+        self.assertEqual(set(state["lanes"]["routine"]), {"active", "policy_sha256"})
 
-    def test_still_eligible_active_route_does_not_bypass_hysteresis(self) -> None:
+    def test_materially_better_ready_route_switches_without_pending_history(self) -> None:
         native = native_catalog(
             ("gpt-5.6-luna", "max"),
-            ("gpt-5.6-sol", "xhigh"),
+            ("gpt-5.6-terra", "max"),
         )
         now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
         initial, state = stabilize_route(
             resolve_route(
                 radar_payload(
                     point("gpt-5.6-luna", "max", passed=70, cost=1.0, minutes=20.0),
-                    point("gpt-5.6-sol", "xhigh", passed=69, cost=2.0, minutes=21.0),
+                    point("gpt-5.6-terra", "max", passed=69, cost=2.0, minutes=21.0),
                 ),
                 native,
                 "complex",
@@ -897,30 +1197,30 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         )
         changed = radar_payload(
             point("gpt-5.6-luna", "max", passed=70, cost=1.0, minutes=20.0),
-            point("gpt-5.6-sol", "xhigh", passed=80, cost=0.8, minutes=19.0),
+            point("gpt-5.6-terra", "max", passed=80, cost=0.8, minutes=19.0),
         )
         changed["fingerprint"] = "b" * 64
-        pending, _state = stabilize_route(
+        switched, _state = stabilize_route(
             resolve_route(changed, native, "complex", now=now), state
         )
 
         self.assertEqual(initial["selected"]["model"], "gpt-5.6-luna")
-        self.assertEqual(pending["selected"]["model"], "gpt-5.6-luna")
-        self.assertEqual(pending["hysteresis"]["status"], "pending")
+        self.assertEqual(switched["selected"]["model"], "gpt-5.6-terra")
+        self.assertEqual(switched["hysteresis"]["status"], "switched")
 
-    def test_fingerprint_only_change_does_not_count_as_new_measurement(self) -> None:
+    def test_fingerprint_only_change_keeps_the_same_active_route(self) -> None:
         native = native_catalog(
             ("gpt-5.6-luna", "max"),
-            ("gpt-5.6-sol", "xhigh"),
+            ("gpt-5.6-terra", "max"),
         )
         now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
         initial_radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=70, cost=1.0, minutes=20.0),
-            point("gpt-5.6-sol", "xhigh", passed=69, cost=2.0, minutes=21.0),
+            point("gpt-5.6-terra", "max", passed=69, cost=2.0, minutes=21.0),
         )
         winning_radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=70, cost=1.0, minutes=20.0),
-            point("gpt-5.6-sol", "xhigh", passed=80, cost=0.8, minutes=19.0),
+            point("gpt-5.6-terra", "max", passed=80, cost=0.8, minutes=19.0),
         )
         same_measurements = json.loads(json.dumps(winning_radar))
         same_measurements["fingerprint"] = "c" * 64
@@ -928,25 +1228,25 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         _initial, state = stabilize_route(
             resolve_route(initial_radar, native, "complex", now=now), None
         )
-        pending, state = stabilize_route(
+        switched, state = stabilize_route(
             resolve_route(winning_radar, native, "complex", now=now), state
         )
-        still_pending, _state = stabilize_route(
+        stable, _state = stabilize_route(
             resolve_route(same_measurements, native, "complex", now=now), state
         )
 
-        self.assertEqual(pending["hysteresis"]["pending_count"], 1)
-        self.assertEqual(still_pending["hysteresis"]["pending_count"], 1)
-        self.assertEqual(still_pending["selected"]["model"], "gpt-5.6-luna")
+        self.assertEqual(switched["hysteresis"]["status"], "switched")
+        self.assertEqual(stable["hysteresis"]["status"], "stable")
+        self.assertEqual(stable["selected"]["model"], "gpt-5.6-terra")
 
     def test_policy_change_applies_immediately_instead_of_using_stale_hysteresis(self) -> None:
         radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=70, cost=0.5, minutes=30.0),
-            point("gpt-5.6-sol", "xhigh", passed=78, cost=6.0, minutes=25.0),
+            point("gpt-5.6-terra", "max", passed=78, cost=6.0, minutes=25.0),
         )
         native = native_catalog(
             ("gpt-5.6-luna", "max"),
-            ("gpt-5.6-sol", "xhigh"),
+            ("gpt-5.6-terra", "max"),
         )
         now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
 
@@ -968,7 +1268,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             state,
         )
 
-        self.assertEqual(changed_policy["selected"]["model"], "gpt-5.6-sol")
+        self.assertEqual(changed_policy["selected"]["model"], "gpt-5.6-terra")
         self.assertEqual(changed_policy["hysteresis"]["status"], "switched_policy")
 
     def test_default_render_is_quiet_and_explanation_is_opt_in(self) -> None:
@@ -989,10 +1289,383 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
         explained = render_resolution(decision, explain=True)
 
         self.assertEqual(
-            set(quiet), {"decision_sha256", "effort", "lane", "model"}
+            set(quiet),
+            {
+                "candidates",
+                "decision_sha256",
+                "effort",
+                "judgment",
+                "lane",
+                "model",
+                "placement",
+                "purpose",
+            },
         )
+        self.assertLessEqual(len(quiet["candidates"]), 3)
+        self.assertNotIn("tradeoffs", quiet)
         self.assertIn("tradeoffs", explained)
         self.assertIn("eligible_candidates", explained)
+
+    def test_purpose_and_judgment_select_distinct_policies(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=68, cost=0.4, minutes=20.0),
+            point("gpt-5.6-terra", "max", passed=80, cost=9.0, minutes=35.0),
+        )
+        native = native_catalog(
+            ("gpt-5.6-luna", "max"),
+            ("gpt-5.6-terra", "max"),
+        )
+        now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+
+        implementation, _ = stabilize_route(
+            resolve_route(
+                radar,
+                native,
+                purpose="implementation",
+                judgment="routine",
+                now=now,
+            ),
+            None,
+        )
+        acceptance, _ = stabilize_route(
+            resolve_route(
+                radar,
+                native,
+                purpose="acceptance",
+                judgment="complex",
+                now=now,
+            ),
+            None,
+        )
+
+        self.assertEqual(implementation["selected"]["model"], "gpt-5.6-luna")
+        self.assertEqual(acceptance["selected"]["model"], "gpt-5.6-terra")
+        self.assertEqual(implementation["purpose"], "implementation")
+        self.assertEqual(acceptance["judgment"], "complex")
+        validate_route_decision(implementation)
+        validate_route_decision(acceptance)
+
+    def test_acceptance_softly_avoids_exact_primary_route(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-sol", "max", passed=80, cost=8.0, minutes=30.0),
+            point("gpt-5.6-terra", "max", passed=79, cost=4.5, minutes=30.0),
+        )
+        native = native_catalog(
+            ("gpt-5.6-sol", "max"),
+            ("gpt-5.6-terra", "max"),
+        )
+
+        decision, _ = stabilize_route(
+            resolve_route(
+                radar,
+                native,
+                purpose="acceptance",
+                judgment="complex",
+                primary_model="gpt-5.6-sol",
+                primary_effort="max",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+            ),
+            None,
+        )
+
+        self.assertEqual(
+            (decision["selected"]["model"], decision["selected"]["effort"]),
+            ("gpt-5.6-terra", "max"),
+        )
+        self.assertEqual(
+            decision["placement_context"]["primary_effort"], "max"
+        )
+        validate_route_decision(decision)
+
+    def test_acceptance_prefers_terra_when_sol_has_no_clear_iq_advantage(self) -> None:
+        decision, _ = stabilize_route(
+            resolve_route(
+                radar_payload(
+                    point(
+                        "gpt-5.6-sol",
+                        "xhigh",
+                        passed=80,
+                        cost=8.0,
+                        minutes=30.0,
+                    ),
+                    point(
+                        "gpt-5.6-terra",
+                        "max",
+                        passed=79,
+                        cost=4.5,
+                        minutes=30.0,
+                    ),
+                ),
+                native_catalog(
+                    ("gpt-5.6-sol", "xhigh"),
+                    ("gpt-5.6-terra", "max"),
+                ),
+                purpose="acceptance",
+                judgment="complex",
+                primary_model="gpt-5.6-sol",
+                primary_effort="max",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+            ),
+            None,
+        )
+
+        self.assertEqual(
+            (decision["selected"]["model"], decision["selected"]["effort"]),
+            ("gpt-5.6-terra", "max"),
+        )
+        validate_route_decision(decision)
+
+    def test_acceptance_does_not_let_resource_value_override_sol_iq_gate(self) -> None:
+        decision, _ = stabilize_route(
+            resolve_route(
+                radar_payload(
+                    point(
+                        "gpt-5.6-sol",
+                        "max",
+                        passed=80,
+                        cost=8.0,
+                        minutes=30.0,
+                    ),
+                    point(
+                        "gpt-5.6-terra",
+                        "max",
+                        passed=79,
+                        cost=5.0,
+                        minutes=30.0,
+                    ),
+                ),
+                native_catalog(
+                    ("gpt-5.6-sol", "max"),
+                    ("gpt-5.6-terra", "max"),
+                ),
+                purpose="acceptance",
+                judgment="complex",
+                primary_model="gpt-5.6-sol",
+                primary_effort="max",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+            ),
+            None,
+        )
+
+        self.assertEqual(
+            (decision["selected"]["model"], decision["selected"]["effort"]),
+            ("gpt-5.6-terra", "max"),
+        )
+        validate_route_decision(decision)
+
+    def test_acceptance_preserves_a_fully_fixed_user_route(self) -> None:
+        decision, _ = stabilize_route(
+            resolve_route(
+                radar_payload(
+                    point(
+                        "gpt-5.6-sol",
+                        "max",
+                        passed=80,
+                        cost=8.0,
+                        minutes=30.0,
+                    ),
+                    point(
+                        "gpt-5.6-terra",
+                        "max",
+                        passed=79,
+                        cost=4.5,
+                        minutes=30.0,
+                    ),
+                ),
+                native_catalog(
+                    ("gpt-5.6-sol", "max"),
+                    ("gpt-5.6-terra", "max"),
+                ),
+                purpose="acceptance",
+                judgment="complex",
+                fixed_model="gpt-5.6-sol",
+                fixed_effort="max",
+                primary_model="gpt-5.6-sol",
+                primary_effort="max",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+            ),
+            None,
+        )
+
+        self.assertEqual(
+            (decision["selected"]["model"], decision["selected"]["effort"]),
+            ("gpt-5.6-sol", "max"),
+        )
+        validate_route_decision(decision)
+
+    def test_primary_effort_change_invalidates_route_hysteresis(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-sol", "max", passed=80, cost=8.0, minutes=30.0),
+            point("gpt-5.6-terra", "max", passed=79, cost=4.5, minutes=30.0),
+        )
+        native = native_catalog(
+            ("gpt-5.6-sol", "max"),
+            ("gpt-5.6-terra", "max"),
+        )
+        now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+        first, state = stabilize_route(
+            resolve_route(
+                radar,
+                native,
+                purpose="acceptance",
+                judgment="complex",
+                primary_model="gpt-5.6-sol",
+                primary_effort="max",
+                now=now,
+            ),
+            None,
+        )
+        second, _ = stabilize_route(
+            resolve_route(
+                radar,
+                native,
+                purpose="acceptance",
+                judgment="complex",
+                primary_model="gpt-5.6-sol",
+                primary_effort="xhigh",
+                now=now,
+            ),
+            state,
+        )
+
+        self.assertNotEqual(first["policy_sha256"], second["policy_sha256"])
+        self.assertEqual(first["selected"]["model"], "gpt-5.6-terra")
+        self.assertEqual(second["selected"]["model"], "gpt-5.6-terra")
+        self.assertEqual(second["hysteresis"]["status"], "switched_policy")
+        validate_route_decision(first)
+        validate_route_decision(second)
+
+    def test_cli_accepts_primary_model_and_effort_context(self) -> None:
+        args = routing_module.parser().parse_args(
+            [
+                "resolve",
+                "--purpose",
+                "acceptance",
+                "--judgment",
+                "complex",
+                "--primary-model",
+                "gpt-5.6-sol",
+                "--primary-effort",
+                "max",
+            ]
+        )
+
+        self.assertEqual(args.primary_model, "gpt-5.6-sol")
+        self.assertEqual(args.primary_effort, "max")
+
+    def test_cli_exposes_rejection_ticket_without_requiring_route_rebuild(self) -> None:
+        args = routing_module.parser().parse_args(
+            [
+                "advance-plan",
+                "--purpose",
+                "implementation",
+                "--judgment",
+                "routine",
+                "--rejected-model",
+                "gpt-5.6-luna",
+                "--rejected-effort",
+                "max",
+                "--rejection-ticket",
+                "native:unsupported-model-effort",
+            ]
+        )
+
+        self.assertEqual(args.command, "advance-plan")
+        self.assertEqual(args.rejection_ticket, "native:unsupported-model-effort")
+
+    def test_same_model_execution_only_child_is_reclaimed(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-sol", "max", passed=80, cost=9.0, minutes=35.0)
+        )
+        native = native_catalog(("gpt-5.6-sol", "max"))
+        now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+
+        reclaimed = resolve_route(
+            radar,
+            native,
+            purpose="implementation",
+            judgment="complex",
+            primary_model="gpt-5.6-sol",
+            placement_benefits=[
+                {
+                    "evidence": ["contract:sha256:" + "a" * 64],
+                    "kind": "closed_execution",
+                }
+            ],
+            now=now,
+        )
+        delegated = resolve_route(
+            radar,
+            native,
+            purpose="implementation",
+            judgment="complex",
+            primary_model="gpt-5.6-sol",
+            placement_benefits=[
+                {"evidence": ["peer:n02"], "kind": "parallel_ready"}
+            ],
+            now=now,
+        )
+
+        self.assertEqual(reclaimed["placement"]["target"], "primary")
+        self.assertEqual(
+            reclaimed["placement"]["reason"], "same_model_execution_only"
+        )
+        self.assertEqual(delegated["placement"]["target"], "child")
+        self.assertEqual(delegated["placement"]["reason"], "parallel_ready")
+
+    def test_route_price_alone_never_authorizes_a_child(self) -> None:
+        decision = resolve_route(
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=76, cost=0.5, minutes=30.0)
+            ),
+            native_catalog(("gpt-5.6-luna", "max")),
+            purpose="implementation",
+            judgment="complex",
+            primary_model="gpt-5.6-sol",
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            decision["placement"],
+            {"reason": "no_structural_benefit", "target": "primary"},
+        )
+
+    def test_placement_benefit_cli_is_evidence_bearing_and_canonical(self) -> None:
+        parsed = routing_module.parse_placement_benefits(
+            [
+                "parallel_ready=peer:n03",
+                "closed_execution=contract:sha256:" + "a" * 64,
+                "parallel_ready=peer:n02",
+            ]
+        )
+
+        self.assertEqual(
+            parsed,
+            [
+                {
+                    "evidence": ["contract:sha256:" + "a" * 64],
+                    "kind": "closed_execution",
+                },
+                {
+                    "evidence": ["peer:n02", "peer:n03"],
+                    "kind": "parallel_ready",
+                },
+            ],
+        )
+
+    def test_legacy_lane_maps_to_implementation_purpose(self) -> None:
+        decision = resolve_route(
+            radar_payload(
+                point("gpt-5.6-luna", "max", passed=72, cost=0.5, minutes=30.0)
+            ),
+            native_catalog(("gpt-5.6-luna", "max")),
+            "routine",
+            now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(decision["purpose"], "implementation")
+        self.assertEqual(decision["judgment"], "routine")
+        self.assertEqual(decision["lane"], "routine")
 
     def test_graph_resolution_persists_only_lkg_and_small_hysteresis_state(self) -> None:
         radar = radar_payload(
@@ -1035,10 +1708,121 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             self.assertEqual(first["snapshot_sha256"], second["snapshot_sha256"])
             self.assertIsNotNone(state)
             self.assertEqual(
+                set(state["lanes"]["routine"]),
+                {"active", "policy_sha256"},
+            )
+            self.assertEqual(
                 sorted(path.name for path in cache_dir.iterdir()),
-                ["radar-lkg-v1.json", "routing-state-v1.json"],
+                ["radar-lkg-v1.json", "routing-state-v2.json"],
             )
             self.assertLess((cache_dir / STATE_FILENAME).stat().st_size, 4096)
+
+    def test_graph_route_returns_stale_lkg_with_refresh_signal_off_critical_path(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        calls: list[str | None] = []
+
+        def fetch(etag: str | None) -> FetchResult:
+            calls.append(etag)
+            return FetchResult(status=200, payload=radar, etag='"radar-v1"')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            resolve_graph_route(
+                cache_dir,
+                "routine",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=fetch,
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+            )
+            _decision, loaded = resolve_graph_route(
+                cache_dir,
+                "routine",
+                now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail("dispatch must not synchronously refresh"),
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+            )
+
+        self.assertEqual(calls, [None])
+        self.assertEqual(loaded.status, "last_known_good")
+        self.assertTrue(loaded.needs_refresh)
+
+    def test_graph_route_with_fully_fixed_pair_never_loads_radar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            decision, loaded = resolve_graph_route(
+                Path(temp_dir),
+                "complex",
+                fixed_model="gpt-5.6-sol",
+                fixed_effort="max",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail("fixed route must not load Radar"),
+                native_loader=lambda: native_catalog(("gpt-5.6-sol", "max")),
+            )
+
+        self.assertEqual(decision["selected"], {"model": "gpt-5.6-sol", "effort": "max"})
+        self.assertEqual(loaded.status, "not_required")
+        self.assertFalse(loaded.needs_refresh)
+
+    def test_graph_route_plan_loads_shared_inputs_once(self) -> None:
+        calls: list[str | None] = []
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan, loaded = resolve_graph_route_plan(
+                Path(temp_dir),
+                [
+                    {"purpose": "analysis_inspect", "judgment": "routine"},
+                    {"purpose": "implementation", "judgment": "complex"},
+                ],
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda etag: (
+                    calls.append(etag)
+                    or FetchResult(status=200, payload=radar, etag='"radar-v1"')
+                ),
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+            )
+            state = read_routing_state(Path(temp_dir) / STATE_FILENAME)
+
+        self.assertEqual(calls, [None])
+        self.assertEqual(len(plan["routes"]), 2)
+        self.assertFalse(plan["needs_refresh"])
+        self.assertEqual(loaded.status, "refreshed")
+        self.assertIsNotNone(state)
+        self.assertEqual(
+            set(state["lanes"]),
+            {"analysis_inspect:routine", "complex"},
+        )
+
+    def test_graph_route_plan_propagates_needs_refresh_from_stale_lkg(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        request = [{"purpose": "implementation", "judgment": "routine"}]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            resolve_graph_route_plan(
+                directory,
+                request,
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=radar, etag='"radar-v1"'
+                ),
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+            )
+            plan, loaded = resolve_graph_route_plan(
+                directory,
+                request,
+                now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail("dispatch must not refresh Radar"),
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+            )
+
+        self.assertTrue(plan["needs_refresh"])
+        self.assertTrue(loaded.needs_refresh)
 
     def test_refresh_ttl_cannot_be_configured_below_ten_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

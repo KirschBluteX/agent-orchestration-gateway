@@ -62,20 +62,6 @@ def one_consistent(
     return value
 
 
-def read_records(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    try:
-        with path.open(encoding="utf-8") as rollout:
-            for line in rollout:
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise InspectionError("rollout contains a non-object record")
-                records.append(value)
-    except (OSError, json.JSONDecodeError) as error:
-        raise InspectionError("rollout is unavailable or invalid") from error
-    return records
-
-
 def read_session_metadata(path: Path) -> dict[str, Any] | None:
     """Read only far enough to identify one rollout during path resolution."""
     try:
@@ -92,11 +78,14 @@ def read_session_metadata(path: Path) -> dict[str, Any] | None:
     return None
 
 
-def resolve_thread_id(
+def resolve_rollout(
     sessions_dir: Path, target: str, parent_thread_id: str | None
-) -> str:
+) -> tuple[str, Path]:
     if THREAD_ID_PATTERN.fullmatch(target) is not None:
-        return target
+        matches = list(sessions_dir.rglob(f"rollout-*-{target}.jsonl"))
+        if len(matches) != 1:
+            raise InspectionError("expected exactly one rollout for the requested thread")
+        return target, matches[0]
     if CANONICAL_TASK_PATH_PATTERN.fullmatch(target) is None:
         raise InspectionError("TARGET must be a lowercase UUID or canonical task path")
     if (
@@ -105,7 +94,7 @@ def resolve_thread_id(
     ):
         raise InspectionError("canonical task path requires a lowercase parent thread UUID")
 
-    matches: list[str] = []
+    matches: list[tuple[str, Path]] = []
     for rollout_path in sessions_dir.rglob("rollout-*.jsonl"):
         try:
             session = read_session_metadata(rollout_path)
@@ -120,7 +109,7 @@ def resolve_thread_id(
             child_id = string_or_none(session.get("id"))
             if child_id is None or THREAD_ID_PATTERN.fullmatch(child_id) is None:
                 raise InspectionError("matching rollout has an invalid child thread ID")
-            matches.append(child_id)
+            matches.append((child_id, rollout_path))
 
     if len(matches) != 1:
         raise InspectionError("expected exactly one rollout for the requested task path")
@@ -133,23 +122,24 @@ def inspect(
     sessions_dir = sessions_dir.expanduser().resolve()
     if not sessions_dir.is_dir():
         raise InspectionError("sessions directory is unavailable")
-    thread_id = resolve_thread_id(sessions_dir, target, parent_thread_id)
-
-    matches = list(sessions_dir.rglob(f"rollout-*-{thread_id}.jsonl"))
-    if len(matches) != 1:
-        raise InspectionError("expected exactly one rollout for the requested thread")
-
-    records = read_records(matches[0])
-    sessions = [
-        record.get("payload")
-        for record in records
-        if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict)
-    ]
-    turns = [
-        record.get("payload")
-        for record in records
-        if record.get("type") == "turn_context" and isinstance(record.get("payload"), dict)
-    ]
+    thread_id, rollout_path = resolve_rollout(sessions_dir, target, parent_thread_id)
+    sessions: list[dict[str, Any]] = []
+    turns: list[dict[str, Any]] = []
+    try:
+        with rollout_path.open(encoding="utf-8") as rollout:
+            for line in rollout:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise InspectionError("rollout contains a non-object record")
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if record.get("type") == "session_meta":
+                    sessions.append(payload)
+                elif record.get("type") == "turn_context":
+                    turns.append(payload)
+    except (OSError, json.JSONDecodeError) as error:
+        raise InspectionError("rollout is unavailable or invalid") from error
     if len(sessions) != 1 or not turns:
         raise InspectionError("missing or ambiguous routing metadata")
 

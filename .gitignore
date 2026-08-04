@@ -16,7 +16,7 @@ build/
 dist/
 .codex-skill-validator/
 radar-lkg-v1.json
-routing-state-v1.json
+routing-state-v2.json
 radar-lkg-v1.*.tmp
-routing-state-v1.*.tmp
+routing-state-v2.*.tmp
 routing-v1.lock
