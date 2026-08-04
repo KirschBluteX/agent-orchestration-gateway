@@ -68,6 +68,8 @@ STATE_PROTOCOL = "cco.routing-state.v2"
 STATE_FILENAME = "routing-state-v2.json"
 STATE_TEMP_GLOB = "routing-state-v2.*.tmp"
 LOCK_FILENAME = "routing-v1.lock"
+RADAR_REFRESH_LOCK_FILENAME = "radar-refresh-v1.lock"
+RADAR_REFRESH_REQUEST_FILENAME = "radar-refresh-request-v1.json"
 LOCK_STALE_AFTER = timedelta(minutes=2)
 TEMP_STALE_AFTER = timedelta(hours=1)
 SWITCH_MARGIN = 0.01
@@ -298,6 +300,10 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
         raise RoutingCatalogError("native model catalog is malformed")
     if not 1 <= len(catalog["models"]) <= 256:
         raise RoutingCatalogError("native model catalog has an invalid model count")
+    backend_annotated = any(
+        isinstance(model, dict) and "multi_agent_version" in model
+        for model in catalog["models"]
+    )
     pairs: set[tuple[str, str]] = set()
     for model in catalog["models"]:
         if (
@@ -306,6 +312,8 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
             or MODEL_RE.fullmatch(model["slug"]) is None
         ):
             raise RoutingCatalogError("native model catalog is malformed")
+        if backend_annotated and model.get("multi_agent_version") != "v2":
+            continue
         levels = model.get("supported_reasoning_levels")
         if not isinstance(levels, list) or not 1 <= len(levels) <= 32:
             raise RoutingCatalogError("native model catalog is malformed")
@@ -744,6 +752,127 @@ def load_radar_snapshot(
             return LoadedSnapshot(cached["snapshot"], "last_known_good", fetched_at)
     finally:
         cleanup_stale_temps(cache_dir, now=now)
+
+
+def launch_radar_refresh(command: list[str]) -> None:
+    """Start the one-shot refresh helper without holding the dispatch path open."""
+
+    isolation: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NO_WINDOW}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
+    subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+        **isolation,
+    )
+
+
+def _reserve_refresh_request(cache_dir: Path, loaded: LoadedSnapshot) -> Path | None:
+    """Atomically reserve one process launch for an exact stale snapshot."""
+
+    request = cache_dir / RADAR_REFRESH_REQUEST_FILENAME
+    expected = loaded.fetched_at.astimezone(timezone.utc).isoformat()
+    payload = canonical_bytes(
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expected_fetched_at": expected,
+        }
+    )
+    for _attempt in range(2):
+        try:
+            descriptor = os.open(
+                request,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            try:
+                if is_reparse(request):
+                    return None
+                age = time.time() - request.stat().st_mtime
+            except OSError:
+                return None
+            try:
+                existing = load_json_bytes(
+                    request.read_bytes(), "radar refresh request"
+                )
+            except (OSError, RoutingCatalogError):
+                if age <= LOCK_STALE_AFTER.total_seconds():
+                    return None
+                try:
+                    request.unlink()
+                except OSError:
+                    return None
+                continue
+            if (
+                isinstance(existing, dict)
+                and existing.get("expected_fetched_at") == expected
+                and age <= LOCK_STALE_AFTER.total_seconds()
+            ):
+                return None
+            try:
+                request.unlink()
+            except OSError:
+                return None
+            continue
+        except OSError:
+            return None
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        return request
+    return None
+
+
+def _clear_refresh_request(cache_dir: Path, expected_fetched_at: datetime) -> None:
+    request = cache_dir / RADAR_REFRESH_REQUEST_FILENAME
+    try:
+        if not request.is_file() or is_reparse(request):
+            return
+        value = load_json_bytes(request.read_bytes(), "radar refresh request")
+        if isinstance(value, dict) and value.get("expected_fetched_at") == (
+            expected_fetched_at.astimezone(timezone.utc).isoformat()
+        ):
+            request.unlink(missing_ok=True)
+    except (OSError, RoutingCatalogError):
+        return
+
+
+def schedule_radar_refresh(
+    cache_dir: Path,
+    loaded: LoadedSnapshot,
+    *,
+    scheduler: Callable[[list[str]], Any] = launch_radar_refresh,
+) -> bool:
+    """Schedule a refresh only for a source-valid stale LKG."""
+
+    if not loaded.needs_refresh:
+        return False
+    directory = Path(os.path.abspath(cache_dir.expanduser()))
+    request = _reserve_refresh_request(directory, loaded)
+    if request is None:
+        return False
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "refresh",
+        "--cache-dir",
+        str(directory),
+        "--expected-fetched-at",
+        loaded.fetched_at.astimezone(timezone.utc).isoformat(),
+    ]
+    try:
+        scheduler(command)
+    except OSError:
+        # Revalidation is explicitly off the dispatch path.  A later stale read
+        # can retry if this best-effort scheduling attempt cannot start.
+        request.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -1515,6 +1644,7 @@ def resolve_graph_route_plan(
     refresh_interval: timedelta = REFRESH_INTERVAL,
     fetcher: Callable[[str | None], FetchResult] = fetch_radar,
     native_loader: Callable[[], dict[str, Any]] | None = None,
+    scheduler: Callable[[list[str]], Any] = launch_radar_refresh,
 ) -> tuple[dict[str, Any], LoadedSnapshot]:
     """Load shared routing inputs once and resolve a whole graph route batch."""
 
@@ -1563,6 +1693,7 @@ def resolve_graph_route_plan(
             now=current,
             needs_refresh=loaded.needs_refresh,
         )
+    schedule_radar_refresh(directory, loaded, scheduler=scheduler)
     return plan, loaded
 
 
@@ -2634,6 +2765,98 @@ def routing_lock(
         return
 
 
+@contextmanager
+def radar_refresh_lock(cache_dir: Path, *, now: datetime) -> Any:
+    """Acquire the non-blocking lock that serializes one-shot Radar refreshes."""
+
+    lock_file = cache_dir / RADAR_REFRESH_LOCK_FILENAME
+    token = hashlib.sha256(os.urandom(32)).hexdigest()
+    encoded = canonical_bytes(
+        {
+            "created_at": now.astimezone(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "token": token,
+        }
+    )
+    while True:
+        try:
+            descriptor = os.open(
+                lock_file,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            try:
+                age = now.astimezone(timezone.utc).timestamp() - lock_file.stat().st_mtime
+                if age > LOCK_STALE_AFTER.total_seconds():
+                    lock_file.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+            raise RoutingCacheBusy("radar refresh is already running")
+        except OSError as error:
+            raise RoutingCatalogError("radar refresh lock could not be acquired") from error
+        opened_identity = os.fstat(descriptor)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            yield
+        finally:
+            try:
+                current_identity = lock_file.stat()
+                if (
+                    current_identity.st_dev == opened_identity.st_dev
+                    and current_identity.st_ino == opened_identity.st_ino
+                ):
+                    lock_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
+
+
+def refresh_radar_snapshot(
+    cache_dir: Path,
+    *,
+    expected_fetched_at: datetime,
+    now: datetime | None = None,
+    fetcher: Callable[[str | None], FetchResult] = fetch_radar,
+) -> bool:
+    """Refresh one scheduled LKG only if it has not already been superseded."""
+
+    if expected_fetched_at.tzinfo is None:
+        raise RoutingCatalogError("expected refresh timestamp must include a timezone")
+    current = now or datetime.now(timezone.utc)
+    expected = expected_fetched_at.astimezone(timezone.utc)
+    directory = Path(os.path.abspath(cache_dir.expanduser()))
+    directory.mkdir(parents=True, exist_ok=True)
+    validate_cache_directory(directory)
+    try:
+        with radar_refresh_lock(directory, now=current):
+            cached = read_cache(directory / CACHE_FILENAME, now=current)
+            if cached is None:
+                return False
+            fetched_at = parse_timestamp(cached["fetched_at"], "fetched_at")
+            if fetched_at != expected:
+                _clear_refresh_request(directory, expected)
+                return False
+            loaded = load_radar_snapshot(
+                directory,
+                now=current,
+                fetcher=fetcher,
+                force_refresh=True,
+            )
+            refreshed = loaded.status in {"refreshed", "revalidated"}
+            if refreshed:
+                _clear_refresh_request(directory, expected)
+            return refreshed
+    except RoutingCacheBusy:
+        return False
+
+
 def default_cache_dir() -> Path:
     configured_home = os.environ.get("CODEX_HOME")
     base = Path(configured_home) if configured_home else Path.home() / ".codex"
@@ -2760,6 +2983,7 @@ def resolve_graph_route(
     placement_benefits: object = None,
     fetcher: Callable[[str | None], FetchResult] = fetch_radar,
     native_loader: Callable[[], dict[str, Any]] = load_native_catalog,
+    scheduler: Callable[[list[str]], Any] = launch_radar_refresh,
 ) -> tuple[dict[str, Any], LoadedSnapshot]:
     current = now or datetime.now(timezone.utc)
     cache_dir = Path(os.path.abspath(cache_dir.expanduser()))
@@ -2801,7 +3025,8 @@ def resolve_graph_route(
         decision, next_state = stabilize_route(recommendation, state)
         write_routing_state(state_file, next_state)
         cleanup_stale_temps(cache_dir, now=current)
-        return decision, loaded
+    schedule_radar_refresh(cache_dir, loaded, scheduler=scheduler)
+    return decision, loaded
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2850,6 +3075,12 @@ def parser() -> argparse.ArgumentParser:
     )
     resolve_plan.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     resolve_plan.add_argument("--refresh-ttl-minutes", type=int, default=60)
+    refresh = subparsers.add_parser(
+        "refresh",
+        help="Refresh one scheduled Radar LKG outside the route dispatch path.",
+    )
+    refresh.add_argument("--cache-dir", type=Path, default=default_cache_dir())
+    refresh.add_argument("--expected-fetched-at", required=True)
     advance = subparsers.add_parser(
         "advance",
         help="Advance an existing decision after a pre-thread native rejection.",
@@ -2872,6 +3103,14 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.command == "refresh":
+            refresh_radar_snapshot(
+                args.cache_dir,
+                expected_fetched_at=parse_timestamp(
+                    args.expected_fetched_at, "expected_fetched_at"
+                ),
+            )
+            return 0
         if args.command == "advance":
             raw = sys.stdin.buffer.read(CACHE_FILE_MAX_BYTES + 1)
             if len(raw) > CACHE_FILE_MAX_BYTES:

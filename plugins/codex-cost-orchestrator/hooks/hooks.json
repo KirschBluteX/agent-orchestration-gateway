@@ -65,9 +65,9 @@
             "type": "command",
             "command": "python3 -B \"${PLUGIN_ROOT}/hooks/subagent_stop.py\"",
             "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/subagent_stop.py\"",
-            "timeout": 5,
+            "timeout": 120,
             "async": false,
-            "statusMessage": "Checking CCO result envelope"
+            "statusMessage": "Checking CCO result and workspace"
           }
         ]
       }

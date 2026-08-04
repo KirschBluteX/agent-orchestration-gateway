@@ -16,8 +16,14 @@ task creation.
 
 Both leaves are model-neutral and non-delegating; the read leaf requests read-only.
 An exact user route that native spawn rejects stops. An adaptive pre-thread rejection
-may advance the bound fallback rank. Never silently substitute after a usable owner
-exists.
+may advance only to the next request precompiled in the prepared graph. Never rerun
+Radar or rebuild a capsule after that rejection, and never silently substitute after
+a usable owner exists.
+
+The native loader mirrors Codex Multi-Agent V2: when bundled entries expose backend
+metadata, only `multi_agent_version=v2` is eligible. Do not infer support from a model
+name, Radar presence, or a v1/unmarked bundled entry. This filter is dynamic, so a
+model automatically returns when the installed Codex catalog marks it V2.
 
 Use the native spawn response as route evidence when it exposes role/model/effort.
 Only when a required dimension is absent—or before claiming OS read-only—run
@@ -31,8 +37,10 @@ The graph resolver performs network/catalog work outside its non-blocking state 
 A fully fixed pair skips Radar. A fresh cache avoids the network. An expired but
 source-valid LKG returns immediately with `needs_refresh`; refresh is off the current
 dispatch path. Only one LKG, one small route-state file, and a native-catalog cache are
-retained. Atomic staging files are removed on success/failure and stale abandoned
-ones are pruned conservatively.
+retained. One short-lived refresh request suppresses duplicate processes for the same
+stale snapshot; it is removed after success and expires after a failed attempt. Atomic
+staging files are removed on success/failure and stale abandoned ones are pruned
+conservatively.
 
 ## Native capacity and waiting
 
@@ -45,8 +53,20 @@ with a long useful timeout. Do not poll unchanged state.
 
 The ledger is outside the repository and contains one active owner per node revision.
 It detects duplicate owners, concurrent cursor advancement, retired owners, and late
-results. It is not durable coordination and cannot stop a late filesystem write.
-Check the workspace after every returned or rejected write result.
+results. PreToolUse requires the prepared workspace artifact, and SubagentStop checks
+the exact baseline against the whole graph's typed scopes before recording a result.
+The ledger is not durable coordination and cannot stop a late filesystem write.
+Primary must still inspect attribution and check the workspace after every returned
+or rejected write result.
+
+Light mode intentionally does not enumerate ignored paths. Strict mode fingerprints
+ignored paths and fails closed above 10,000 files or 256 MiB of ignored content unless
+the graph compiler is given explicit tighter or broader limits. Both modes protect Git
+control state, tracked/untracked status, path aliases, reparses, and submodules as
+implemented by the workspace-state schema; strict is required when ignored files are
+inside the risk boundary. Spawn and continuation preflight retain a five-second fast
+bound; only SubagentStop workspace verification has a 120-second protection bound so
+a legitimate strict scan is not killed by the old envelope-only timeout.
 
 Hook failures may be fail-open at the host layer. Primary evidence remains mandatory.
 Call a review OS read-only only when observed runtime metadata says `read-only`; with

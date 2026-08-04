@@ -15,7 +15,11 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from ledger_runtime import preflight_continuation, reserve_spawn  # noqa: E402
+from ledger_runtime import (  # noqa: E402
+    preflight_continuation,
+    prepared_workspace_claim,
+    reserve_spawn,
+)
 from packet_compiler import (  # noqa: E402
     READ_ROLE,
     WRITE_ROLE,
@@ -46,6 +50,10 @@ def validate_dispatch(tool_input: object) -> dict[str, Any]:
     if not isinstance(tool_input, dict) or set(tool_input) != SPAWN_FIELDS:
         raise PacketError("v6 native spawn shape is invalid")
     capsule = parse_message(tool_input.get("message"))
+    if not {"acceptance", "decision", "graph_sha256"} <= set(capsule):
+        raise PacketError(
+            "v6 spawn requires the prepared graph decision, acceptance, and graph identity"
+        )
     execution = capsule["execution"]
     expected_role = WRITE_ROLE if capsule["purpose"] == "implementation" else READ_ROLE
     expected = {
@@ -89,11 +97,18 @@ def evaluate(value: object) -> dict[str, str]:
     try:
         if tool_name in {"spawn_agent", "Agent"}:
             capsule = validate_dispatch(tool_input)
-            reserve_spawn(value, capsule, str(tool_input["agent_type"]))
+            workspace = prepared_workspace_claim(value, capsule)
+            reserve_spawn(
+                value,
+                capsule,
+                str(tool_input["agent_type"]),
+                workspace=workspace,
+            )
             return {}
         if tool_name in {"send_message", "followup_task"}:
             message = tool_input.get("message")
             if not isinstance(message, str) or not message.startswith("CCO_DISPATCH cco.v6"):
+                preflight_continuation(value)
                 return {}
             capsule = validate_v6_continuation(tool_input)
             preflight_continuation(value, capsule)

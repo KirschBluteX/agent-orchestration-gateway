@@ -51,6 +51,53 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
         self.assertEqual(commit.returncode, 0, commit.stderr)
         return repo
 
+    def test_strict_mode_observes_an_ignored_file_outside_the_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            (repo / ".gitignore").write_text("secret.txt\n", encoding="utf-8")
+            (repo / "secret.txt").write_text("baseline\n", encoding="utf-8")
+            baseline = root / "baseline.json"
+
+            capture = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "capture",
+                    "--repo",
+                    str(repo),
+                    "--mode",
+                    "strict",
+                    "--output",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            (repo / "secret.txt").write_text("changed\n", encoding="utf-8")
+
+            checked = subprocess.run(
+                [
+                    sys.executable,
+                    str(STATE_TOOL),
+                    "verify",
+                    "--repo",
+                    str(repo),
+                    "--baseline",
+                    str(baseline),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(checked.returncode, 1, checked.stderr)
+            result = json.loads(checked.stdout)
+            self.assertEqual(result["changed_paths"], ["secret.txt"])
+            self.assertEqual(result["violations"], ["outside_lease:secret.txt"])
+
     def test_verifies_only_the_allowed_delta_from_a_dirty_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -263,7 +310,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
 
             self.assertEqual(capture.returncode, 0, capture.stderr)
             self.assertEqual(capture.stdout, "")
-            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["schema"], "cco.workspace-state.v2")
+            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["schema"], "cco.workspace-state.v3")
 
             inside = repo / "baseline.json"
             refused = subprocess.run(
@@ -1650,7 +1697,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
 
             self.assertEqual(verify.returncode, 1, verify.stderr)
             result = json.loads(verify.stdout)
-            self.assertEqual(result["schema"], "cco.workspace-verification.v2")
+            self.assertEqual(result["schema"], "cco.workspace-verification.v3")
             self.assertEqual(result["allowed_scopes"], [])
             self.assertEqual(
                 result["violations"], ["outside_lease:src/owned.txt"]

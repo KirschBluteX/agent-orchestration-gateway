@@ -12,9 +12,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "plugins" / "codex-cost-orchestrator" / "hooks" / "subagent_stop.py"
 SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
+HOOKS = HOOK.parent
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(HOOKS))
 
+import ledger_runtime  # noqa: E402
 from packet_compiler import compile_dispatch, compile_result, parse_message  # noqa: E402
+from task_ledger import TaskLedger  # noqa: E402
 from tests.v6_test_support import fixed_route_plan  # noqa: E402
 
 
@@ -100,8 +104,18 @@ class ReviewHookBehaviorTests(unittest.TestCase):
             )
         )
         with tempfile.TemporaryDirectory() as directory:
-            for native, message in cases:
+            ledger = TaskLedger(Path(directory), "session-v6-result")
+            for index, (native, message) in enumerate(cases):
                 with self.subTest(role=native["agent_type"]):
+                    capsule = parse_message(native["message"])
+                    call_id = f"spawn-result-{index}"
+                    ledger.reserve(
+                        call_id,
+                        ledger_runtime.claim_from_fields(
+                            capsule, role=str(native["agent_type"])
+                        ),
+                    )
+                    ledger.activate(call_id, "/root/" + str(native["task_name"]))
                     result = run(
                         payload(
                             str(native["agent_type"]),

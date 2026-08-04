@@ -65,7 +65,7 @@ ACCEPTANCE_EVENTS = frozenset(
         "retry",
         "routing_mismatch",
         "scope_surprise",
-        "sol_owned_change",
+        "primary_owned_change",
     }
 )
 # A concurrent dispatch is a placement/capacity fact, not evidence that the
@@ -291,6 +291,101 @@ def derive_acceptance(
     }
 
 
+def normalize_dispatch_decision(
+    value: object,
+    *,
+    selected_model: str | None,
+) -> dict[str, object]:
+    """Recompute every derived dispatch dimension from one closed fact record."""
+
+    required = {
+        "acceptance_facts",
+        "closure",
+        "derived",
+        "effects",
+        "placement",
+    }
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise DecisionPolicyError("dispatch decision must contain every fact group")
+    effects = value["effects"]
+    effect_fields = {
+        "acceptance_verdict",
+        "diagnostic_process",
+        "repository_mutation",
+    }
+    if not isinstance(effects, Mapping) or set(effects) != effect_fields:
+        raise DecisionPolicyError("dispatch effects are malformed")
+    purpose = classify_purpose(
+        repository_mutation=effects["repository_mutation"],
+        diagnostic_process=effects["diagnostic_process"],
+        acceptance_verdict=effects["acceptance_verdict"],
+    )
+    closure = normalize_closure(value["closure"])
+    judgment = derive_judgment(closure)
+    if judgment == "unresolved":
+        raise DecisionPolicyError("unresolved judgment cannot be dispatched")
+
+    acceptance_facts = value["acceptance_facts"]
+    acceptance_fields = {
+        "acceptance_ids",
+        "deterministic_graph_coverage",
+        "events",
+        "required_verification_strengths",
+        "risk_assessment",
+    }
+    if not isinstance(acceptance_facts, Mapping) or set(acceptance_facts) != acceptance_fields:
+        raise DecisionPolicyError("dispatch acceptance facts are malformed")
+    acceptance = derive_acceptance(**acceptance_facts)
+
+    placement_facts = value["placement"]
+    if not isinstance(placement_facts, Mapping) or set(placement_facts) != {
+        "benefits",
+        "primary_model",
+    }:
+        raise DecisionPolicyError("dispatch placement facts are malformed")
+    primary_model = placement_facts["primary_model"]
+    if primary_model is not None and not isinstance(primary_model, str):
+        raise DecisionPolicyError("dispatch primary model is malformed")
+    benefits = normalize_placement_benefits(placement_facts["benefits"])
+    placement = select_placement(
+        purpose=purpose,
+        primary_model=primary_model,
+        selected_model=selected_model,
+        benefits=benefits,
+    )
+    derived = value["derived"]
+    expected_derived = {
+        "acceptance": acceptance,
+        "judgment": judgment,
+        "placement": placement,
+        "purpose": purpose,
+    }
+    if not isinstance(derived, Mapping) or dict(derived) != expected_derived:
+        raise DecisionPolicyError("dispatch derived decision does not match its facts")
+    return {
+        "acceptance_facts": {
+            "acceptance_ids": list(acceptance_facts["acceptance_ids"]),
+            "deterministic_graph_coverage": list(
+                acceptance_facts["deterministic_graph_coverage"]
+            ),
+            "events": list(acceptance_facts["events"]),
+            "required_verification_strengths": list(
+                acceptance_facts["required_verification_strengths"]
+            ),
+            "risk_assessment": normalize_risk_assessment(
+                acceptance_facts["risk_assessment"]
+            ),
+        },
+        "closure": closure,
+        "derived": expected_derived,
+        "effects": {name: effects[name] for name in sorted(effect_fields)},
+        "placement": {
+            "benefits": benefits,
+            "primary_model": primary_model,
+        },
+    }
+
+
 def normalize_placement_benefits(value: object) -> list[dict[str, Any]]:
     """Validate the evidence-bearing facts that can justify a child."""
 
@@ -458,13 +553,14 @@ def _normalize_dispatch_node(value: object, index: int) -> dict[str, Any]:
 
 
 def select_ready_nodes(nodes: object, *, native_capacity: int) -> list[str]:
-    """Fill observed native capacity with independent, ready dispatch nodes.
+    """Maximize the independent ready set up to observed native capacity.
 
     CCO deliberately has no second concurrency ceiling.  The only bound is the
-    capacity reported by the native runtime.  Selection is deterministic: node
-    identifiers are sorted, unresolved dependencies are ignored, and a node is
-    admitted only when its responsibility and scope are disjoint from already
-    admitted nodes.
+    capacity reported by the native runtime.  Selection is deterministic and exact
+    up to that cap: a greedy lower bound handles the usual path, followed only when
+    needed by bitset branch-and-bound.  Maximum independent set is NP-hard in the
+    worst case, but native capacities are small and the search stops as soon as a
+    capacity-sized set is proven by construction.
     """
 
     if (
@@ -513,4 +609,38 @@ def select_ready_nodes(nodes: object, *, native_capacity: int) -> list[str]:
         if any(conflicts(node, admitted) for admitted in selected):
             continue
         selected.append(node)
-    return sorted(node["node"] for node in selected)
+    if len(selected) >= native_capacity or not ready:
+        return sorted(node["node"] for node in selected)
+
+    index = {node["node"]: position for position, node in enumerate(ordered)}
+    conflict_masks = [0] * len(ordered)
+    for left_position, left in enumerate(ordered):
+        mask = 0
+        for right_position, right in enumerate(ordered):
+            if left_position != right_position and conflicts(left, right):
+                mask |= 1 << right_position
+        conflict_masks[left_position] = mask
+
+    best = [index[node["node"]] for node in selected]
+
+    def search(candidates: int, chosen: list[int]) -> bool:
+        nonlocal best
+        if len(chosen) > len(best):
+            best = list(chosen)
+            if len(best) == native_capacity:
+                return True
+        if not candidates or len(chosen) + candidates.bit_count() <= len(best):
+            return False
+        while candidates:
+            if len(chosen) + candidates.bit_count() <= len(best):
+                return False
+            bit = candidates & -candidates
+            position = bit.bit_length() - 1
+            candidates ^= bit
+            compatible = candidates & ~conflict_masks[position]
+            if search(compatible, [*chosen, position]):
+                return True
+        return False
+
+    search((1 << len(ordered)) - 1, [])
+    return sorted(ordered[position]["node"] for position in best)

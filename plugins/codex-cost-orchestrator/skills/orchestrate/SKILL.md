@@ -32,11 +32,22 @@ source partition, runtime isolation, independent evidence, or explicit delegatio
 Reclaim duplicate work. Price, files, estimated tokens, and model labels never prove
 placement value.
 
-Keep an atomic deterministic low-risk edit in Primary. For a child, compile a single
-`CCO_DISPATCH cco.v6` capsule with `scripts/packet_compiler.py`. Use the writable leaf
-only for implementation; use the read leaf for inspection, bounded probes, and
-acceptance. Use `fork_turns: none` when the capsule and repository anchors close the
-task; otherwise use the smallest positive partial fork, never full history.
+Re-derive closure and placement whenever new facts can change ownership: after a
+user resolves a material trade-off, after the first RED test freezes a public
+interface, and after architecture plus typed write scopes are frozen. Skip an
+inapplicable checkpoint; never repeat it when its facts are unchanged. If the work is
+still unresolved or has lost its structural child benefit, keep or reclaim it in
+Primary before routing.
+
+Keep an atomic deterministic low-risk edit in Primary. For children, call
+`scripts/graph_compiler.py:prepare_dispatch_graph()` once after the graph is closed;
+it derives decisions, captures the real task-local workspace artifact, applies
+native capacity/conflicts, and returns every native request. Do not construct an
+initial capsule through `compile_dispatch()` or `compile_dispatch_batch()` directly.
+Use the writable leaf only for implementation; use the read leaf for inspection,
+bounded probes, and acceptance. Use `fork_turns: none` when the capsule and repository
+anchors close the task; otherwise use the smallest positive partial fork, never full
+history.
 Before a profile's first use in a task, check only that exact installed read/write
 profile with `scripts/install_agents.py --check`; never check unused logical kinds.
 
@@ -46,7 +57,10 @@ Exact user model/effort values always win. Otherwise call
 `routing_catalog.py resolve-plan` once for the whole graph.
 Routing is local and invokes no model or Agent. It intersects native capabilities
 with Radar IQ strictly above 90, validates sample/cohort/coverage, and applies a
-Wilson-aware Pareto utility over quality, resource use, time, and uncertainty.
+Wilson-aware Pareto utility over quality, resource use, time, and uncertainty. For a
+Multi-Agent V2 task, the live bundled catalog contributes only entries explicitly
+marked `multi_agent_version=v2`; an older Luna or any unmarked model is not guessed
+to be spawnable and automatically returns when its live metadata becomes V2.
 
 Prefer eligible Luna/Terra for workers and reviewers. Admit Sol as the automatic
 leader only when no eligible Luna/Terra exists or Sol's Wilson lower bound is strictly
@@ -54,18 +68,21 @@ above the best eligible Luna/Terra upper bound. A user-fixed Sol route remains e
 Bind only the compact plan identity and selected pair into the capsule; do not pass
 the metric table to a leaf.
 
-Pass the complete validated plan to `compile_dispatch()` for one child or to
-`compile_dispatch_batch()` for all dependency-ready children. A caller may not supply
-a selected pair or plan hash separately. The batch adapter applies observed native
-capacity plus responsibility/access/scope conflicts and returns native spawn inputs;
-it never spawns Agents itself. Placement is decided first, so only child-eligible
-contracts enter the route plan and batch.
+Pass the complete validated plan and all closed nodes to `prepare_dispatch_graph()`.
+A caller may not supply a selected pair or plan hash separately. The graph compiler
+applies observed native capacity plus responsibility/access/scope conflicts and
+returns native spawn inputs; it never spawns Agents itself. Placement is decided
+first, so only child-eligible contracts enter dispatch selection.
 
 The Radar TTL is one hour. A source-age-valid LKG up to 72 hours old can dispatch
 immediately with `needs_refresh`; refresh serves a later graph. Fully fixed pairs skip
-Radar. Fallback only advances the pre-ranked plan with a rejection ticket. Never
-rescore or rebuild a contract after a native pre-thread rejection. Explanations are
-hidden unless the user requests routing diagnosis.
+Radar. The prepared graph returns active requests plus every node's complete legal
+`fallback_dispatches`; after a confirmed adaptive pre-thread rejection, take only the
+next precompiled request. Never rescore, recompile the capsule, recapture the baseline,
+or rebuild a contract. Explanations are hidden unless the user requests routing
+diagnosis. Only one refresh process may be reserved for an exact stale snapshot;
+success removes its request artifact, while a failed launch or refresh is bounded by
+a short retry lease.
 
 ## Parallelism and quiescence
 
@@ -81,9 +98,12 @@ or a long native protection timeout.
 
 ## Capsule and lifecycle
 
-The capsule binds purpose, judgment, mode, contract, route, baseline, typed scopes,
-acceptance/evidence when applicable, context fork, one `generation`, and one
-continuation `cursor`. Hooks validate native arguments against that one identity.
+The capsule binds purpose, judgment, mode, contract, route, baseline, graph identity,
+typed scopes, acceptance/evidence when applicable, context fork, one `generation`,
+and one continuation `cursor`. PreToolUse also resolves the exact prepared workspace
+artifact and binds its whole-graph scopes into the ledger. SubagentStop verifies the
+current workspace against that graph union so disjoint concurrent nodes do not
+produce false positives; Primary still attributes each actual delta to its owner.
 Use `compile_continuation()` for a same-owner evidence-bearing delta; it increments
 only the cursor and keeps the generation.
 

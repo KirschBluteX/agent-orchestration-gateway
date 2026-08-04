@@ -98,6 +98,32 @@ def native_catalog(*pairs: tuple[str, str]) -> dict[str, object]:
 
 
 class RoutingCatalogBehaviorTests(unittest.TestCase):
+    def test_native_capabilities_follow_the_live_multi_agent_v2_backend(self) -> None:
+        catalog = {
+            "models": [
+                {
+                    "multi_agent_version": "v1",
+                    "slug": "gpt-5.6-luna",
+                    "supported_reasoning_levels": [{"effort": "max"}],
+                },
+                {
+                    "multi_agent_version": "v2",
+                    "slug": "gpt-5.6-terra",
+                    "supported_reasoning_levels": [{"effort": "max"}],
+                },
+                {
+                    "multi_agent_version": None,
+                    "slug": "gpt-5.5",
+                    "supported_reasoning_levels": [{"effort": "xhigh"}],
+                },
+            ]
+        }
+
+        self.assertEqual(
+            routing_module.native_capability_records(catalog),
+            [{"effort": "max", "model": "gpt-5.6-terra"}],
+        )
+
     def test_loaded_normalized_snapshot_can_be_resolved_end_to_end(self) -> None:
         radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=77, cost=0.5, minutes=30.0)
@@ -1673,6 +1699,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             point("gpt-5.6-sol", "xhigh", passed=78, cost=6.0, minutes=25.0),
         )
         calls: list[str | None] = []
+        scheduled: list[list[str]] = []
 
         def fetch(etag: str | None) -> FetchResult:
             calls.append(etag)
@@ -1689,6 +1716,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                     ("gpt-5.6-luna", "max"),
                     ("gpt-5.6-sol", "xhigh"),
                 ),
+                scheduler=scheduled.append,
             )
             second, loaded_second = resolve_graph_route(
                 cache_dir,
@@ -1699,10 +1727,12 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                     ("gpt-5.6-luna", "max"),
                     ("gpt-5.6-sol", "xhigh"),
                 ),
+                scheduler=scheduled.append,
             )
             state = read_routing_state(cache_dir / STATE_FILENAME)
 
             self.assertEqual(calls, [None])
+            self.assertEqual(scheduled, [])
             self.assertEqual(loaded_first.status, "refreshed")
             self.assertEqual(loaded_second.status, "fresh_cache")
             self.assertEqual(first["snapshot_sha256"], second["snapshot_sha256"])
@@ -1742,13 +1772,277 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
                 fetcher=lambda _etag: self.fail("dispatch must not synchronously refresh"),
                 native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+                scheduler=lambda _command: None,
             )
 
         self.assertEqual(calls, [None])
         self.assertEqual(loaded.status, "last_known_good")
         self.assertTrue(loaded.needs_refresh)
 
+    def test_graph_route_schedules_one_shot_refresh_for_a_stale_lkg(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        scheduled: list[list[str]] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            resolve_graph_route(
+                cache_dir,
+                "routine",
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=radar, etag='"radar-v1"'
+                ),
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+                scheduler=scheduled.append,
+            )
+            _decision, loaded = resolve_graph_route(
+                cache_dir,
+                "routine",
+                now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail("dispatch must not refresh Radar"),
+                native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+                scheduler=scheduled.append,
+            )
+
+        self.assertEqual(loaded.status, "last_known_good")
+        self.assertTrue(loaded.needs_refresh)
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0][2], "refresh")
+        self.assertIn("--cache-dir", scheduled[0])
+        self.assertIn("--expected-fetched-at", scheduled[0])
+
+    def test_same_stale_snapshot_schedules_only_one_live_refresh_process(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        scheduled: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            load_radar_snapshot(
+                cache_dir,
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=radar, etag='"radar-v1"'
+                ),
+            )
+            stale = load_radar_snapshot(
+                cache_dir,
+                now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail("stale load must not refresh"),
+            )
+            first = routing_module.schedule_radar_refresh(
+                cache_dir, stale, scheduler=scheduled.append
+            )
+            second = routing_module.schedule_radar_refresh(
+                cache_dir, stale, scheduler=scheduled.append
+            )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(len(scheduled), 1)
+
+    def test_stale_malformed_refresh_request_cannot_disable_future_refreshes(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        scheduled: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            load_radar_snapshot(
+                cache_dir,
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=radar, etag='"radar-v1"'
+                ),
+            )
+            stale = load_radar_snapshot(
+                cache_dir,
+                now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
+                fetcher=lambda _etag: self.fail("stale load must not refresh"),
+            )
+            request = cache_dir / routing_module.RADAR_REFRESH_REQUEST_FILENAME
+            request.write_text("not-json\n", encoding="utf-8")
+            os.utime(request, (0, 0))
+
+            reserved = routing_module.schedule_radar_refresh(
+                cache_dir, stale, scheduler=scheduled.append
+            )
+
+        self.assertTrue(reserved)
+        self.assertEqual(len(scheduled), 1)
+
+    def test_refresh_helper_lock_prevents_duplicate_network_refreshes(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        initial_now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+        refresh_now = datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc)
+        calls: list[str | None] = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            stale = load_radar_snapshot(
+                cache_dir,
+                now=initial_now,
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=radar, etag='"radar-v1"'
+                ),
+            )
+            with routing_module.radar_refresh_lock(cache_dir, now=refresh_now):
+                self.assertFalse(
+                    routing_module.refresh_radar_snapshot(
+                        cache_dir,
+                        expected_fetched_at=stale.fetched_at,
+                        now=refresh_now,
+                        fetcher=lambda _etag: self.fail(
+                            "a held refresh lock must prevent a network call"
+                        ),
+                    )
+                )
+            self.assertTrue(
+                routing_module.refresh_radar_snapshot(
+                    cache_dir,
+                    expected_fetched_at=stale.fetched_at,
+                    now=refresh_now,
+                    fetcher=lambda etag: (
+                        calls.append(etag)
+                        or FetchResult(status=200, payload=radar, etag='"radar-v2"')
+                    ),
+                )
+            )
+            self.assertFalse(
+                routing_module.refresh_radar_snapshot(
+                    cache_dir,
+                    expected_fetched_at=stale.fetched_at,
+                    now=refresh_now + timedelta(minutes=1),
+                    fetcher=lambda _etag: self.fail(
+                        "a completed refresh must not be repeated"
+                    ),
+                )
+            )
+
+        self.assertEqual(calls, ['"radar-v1"'])
+
+    def test_refresh_command_runs_the_one_shot_helper(self) -> None:
+        expected = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "routing_catalog.py",
+                    "refresh",
+                    "--cache-dir",
+                    temp_dir,
+                    "--expected-fetched-at",
+                    expected.isoformat(),
+                ],
+            ):
+                with mock.patch(
+                    "routing_catalog.refresh_radar_snapshot", return_value=True
+                ) as refresh:
+                    self.assertEqual(routing_module.main(), 0)
+
+        refresh.assert_called_once_with(
+            Path(temp_dir), expected_fetched_at=expected
+        )
+
+    def test_refresh_scheduler_uses_argument_list_without_a_shell(self) -> None:
+        command = [sys.executable, "routing_catalog.py", "refresh"]
+
+        with mock.patch("routing_catalog.subprocess.Popen") as spawn:
+            routing_module.launch_radar_refresh(command)
+
+        expected = {
+            "stdin": routing_module.subprocess.DEVNULL,
+            "stdout": routing_module.subprocess.DEVNULL,
+            "stderr": routing_module.subprocess.DEVNULL,
+            "shell": False,
+        }
+        if os.name == "nt":
+            expected["creationflags"] = routing_module.subprocess.CREATE_NO_WINDOW
+        else:
+            expected["start_new_session"] = True
+        spawn.assert_called_once_with(command, **expected)
+
+    def test_refresh_helper_atomically_replaces_only_the_normalized_lkg(self) -> None:
+        initial = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        updated = radar_payload(
+            point("gpt-5.6-luna", "max", passed=76, cost=0.4, minutes=29.0)
+        )
+        updated["source_updated_at"] = "2026-08-03T10:30:00+00:00"
+        initial_now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+        refresh_now = datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            stale = load_radar_snapshot(
+                cache_dir,
+                now=initial_now,
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=initial, etag='"radar-v1"'
+                ),
+            )
+            self.assertTrue(
+                routing_module.refresh_radar_snapshot(
+                    cache_dir,
+                    expected_fetched_at=stale.fetched_at,
+                    now=refresh_now,
+                    fetcher=lambda _etag: FetchResult(
+                        status=200, payload=updated, etag='"radar-v2"'
+                    ),
+                )
+            )
+
+            stored = json.loads(
+                (cache_dir / "radar-lkg-v1.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                sorted(path.name for path in cache_dir.iterdir()),
+                ["radar-lkg-v1.json"],
+            )
+            self.assertNotIn("history", stored["snapshot"])
+            self.assertEqual(stored["etag"], '"radar-v2"')
+            self.assertEqual(stored["fetched_at"], refresh_now.isoformat())
+
+    def test_refresh_helper_reports_failure_when_it_only_falls_back_to_lkg(self) -> None:
+        radar = radar_payload(
+            point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
+        )
+        initial_now = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+        refresh_now = datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            stale = load_radar_snapshot(
+                cache_dir,
+                now=initial_now,
+                fetcher=lambda _etag: FetchResult(
+                    status=200, payload=radar, etag='"radar-v1"'
+                ),
+            )
+            refreshed = routing_module.refresh_radar_snapshot(
+                cache_dir,
+                expected_fetched_at=stale.fetched_at,
+                now=refresh_now,
+                fetcher=lambda _etag: FetchResult(
+                    status=503, payload=None, etag=None
+                ),
+            )
+            stored = json.loads(
+                (cache_dir / "radar-lkg-v1.json").read_text(encoding="utf-8")
+            )
+
+        self.assertFalse(refreshed)
+        self.assertEqual(stored["fetched_at"], initial_now.isoformat())
+
     def test_graph_route_with_fully_fixed_pair_never_loads_radar(self) -> None:
+        scheduled: list[list[str]] = []
         with tempfile.TemporaryDirectory() as temp_dir:
             decision, loaded = resolve_graph_route(
                 Path(temp_dir),
@@ -1758,14 +2052,17 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
                 fetcher=lambda _etag: self.fail("fixed route must not load Radar"),
                 native_loader=lambda: native_catalog(("gpt-5.6-sol", "max")),
+                scheduler=scheduled.append,
             )
 
         self.assertEqual(decision["selected"], {"model": "gpt-5.6-sol", "effort": "max"})
         self.assertEqual(loaded.status, "not_required")
         self.assertFalse(loaded.needs_refresh)
+        self.assertEqual(scheduled, [])
 
     def test_graph_route_plan_loads_shared_inputs_once(self) -> None:
         calls: list[str | None] = []
+        scheduled: list[list[str]] = []
         radar = radar_payload(
             point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
         )
@@ -1783,10 +2080,12 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                     or FetchResult(status=200, payload=radar, etag='"radar-v1"')
                 ),
                 native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+                scheduler=scheduled.append,
             )
             state = read_routing_state(Path(temp_dir) / STATE_FILENAME)
 
         self.assertEqual(calls, [None])
+        self.assertEqual(scheduled, [])
         self.assertEqual(len(plan["routes"]), 2)
         self.assertFalse(plan["needs_refresh"])
         self.assertEqual(loaded.status, "refreshed")
@@ -1801,6 +2100,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
             point("gpt-5.6-luna", "max", passed=75, cost=0.5, minutes=30.0)
         )
         request = [{"purpose": "implementation", "judgment": "routine"}]
+        scheduled: list[list[str]] = []
 
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
@@ -1812,6 +2112,7 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                     status=200, payload=radar, etag='"radar-v1"'
                 ),
                 native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+                scheduler=scheduled.append,
             )
             plan, loaded = resolve_graph_route_plan(
                 directory,
@@ -1819,10 +2120,12 @@ class RoutingCatalogBehaviorTests(unittest.TestCase):
                 now=datetime(2026, 8, 3, 11, 1, tzinfo=timezone.utc),
                 fetcher=lambda _etag: self.fail("dispatch must not refresh Radar"),
                 native_loader=lambda: native_catalog(("gpt-5.6-luna", "max")),
+                scheduler=scheduled.append,
             )
 
         self.assertTrue(plan["needs_refresh"])
         self.assertTrue(loaded.needs_refresh)
+        self.assertEqual(len(scheduled), 1)
 
     def test_refresh_ttl_cannot_be_configured_below_ten_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

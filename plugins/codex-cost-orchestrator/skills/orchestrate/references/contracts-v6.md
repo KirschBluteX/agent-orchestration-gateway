@@ -8,9 +8,11 @@ credentials, or secrecy controls.
 
 ## Dispatch
 
-`packet_compiler.compile_dispatch(spec)` returns one native spawn input;
-`compile_dispatch_batch(nodes, route_plan, native_capacity)` applies the deterministic
-ready-node selector and returns several such inputs without spawning them:
+`graph_compiler.prepare_dispatch_graph(...)` is the production entry for initial
+dispatch. It derives labels from facts, captures one real workspace snapshot, writes
+one task-local prepared artifact outside the repository, applies the deterministic
+ready-node selector, and returns active plus precompiled fallback native spawn inputs
+without spawning them:
 
 ```text
 agent_type / task_name / fork_turns / model / reasoning_effort / message
@@ -37,12 +39,18 @@ Initial capsules have cursor zero. A continuation includes the previous capsule 
 one nonempty canonical delta, the same task name/generation, and cursor +1. Material
 contract or ownership changes use a fresh capsule and newer generation.
 
-Every initial compiler call receives one complete canonical `cco.route-plan.v1`.
-The compiler validates its hash, active candidate/rank, route key, and placement, then
-stores only `plan_sha256`, rank, and selected pair in the capsule. A caller-supplied
-pair or detached plan hash is invalid. This detects accidental or tampered
-substitution on the normal resolver path; it is not authentication against a
-malicious Primary, which remains CCO's trusted control plane.
+Every prepared graph receives one complete canonical `cco.route-plan.v1`. The graph
+compiler validates its hash, active candidate/rank, route key, and placement, then
+stores only `plan_sha256`, rank, and selected pair in each capsule. A caller-supplied
+pair or detached plan hash is invalid. The prepared artifact binds the graph manifest,
+route-plan identity, all node decisions/contracts/scopes, workspace mode, and exact
+snapshot under `graph_sha256`. Each node also binds the finite route identities
+derived from the original ranked plan. PreToolUse requires that artifact, exact node,
+and one bound route identity match; a rejection therefore advances to an
+already-compiled request without changing the graph or baseline.
+This detects accidental or tampered substitution on the normal resolver path; it is
+not authentication against a malicious Primary, which remains CCO's trusted control
+plane.
 
 ## Result
 
@@ -63,7 +71,14 @@ means its turn ended, not that Primary accepted the state.
 
 The active ledger owner, generation, cursor/current dispatch identity, and canonical
 native task path must all match. A retired or superseded owner cannot become current
-again. Primary acceptance is separate: inspect actual state and produce complete
-evidence. A reviewer may return `accept` only for its exact evidence/current state;
-`continue` represents a contract-preserving `fix-first`; `retire` represents a closed
+again. A workspace-bound ledger row also retains the prepared artifact path, baseline,
+graph identity, node scopes, whole-graph scopes, and light/strict mode. SubagentStop
+verifies the current state against the whole-graph scope union before accepting a
+result envelope; this tolerates disjoint parallel graph changes without authorizing
+Primary to misattribute them. SessionEnd removes the task ledger and every prepared
+artifact for that session.
+
+Primary acceptance is separate: inspect actual state and produce complete evidence.
+A reviewer may return `accept` only for its exact evidence/current state; `continue`
+represents a contract-preserving `fix-first`; `retire` represents a closed
 non-accepting review such as `rethink`.

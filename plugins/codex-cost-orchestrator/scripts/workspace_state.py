@@ -21,7 +21,10 @@ from protocol_hash import (
 )
 
 
-SCHEMA = "cco.workspace-state.v2"
+SCHEMA = "cco.workspace-state.v3"
+WORKSPACE_MODES = frozenset({"light", "strict"})
+DEFAULT_IGNORED_MAX_FILES = 10_000
+DEFAULT_IGNORED_MAX_BYTES = 256 * 1024 * 1024
 GIT_ADMIN_PATHS = (
     "AUTO_MERGE",
     "BISECT_EXPECTED_REV",
@@ -60,6 +63,8 @@ SNAPSHOT_FIELDS = frozenset(
         "git_info_sha256",
         "head",
         "hooks_sha256",
+        "ignored_limits",
+        "ignored_mode",
         "index_sha256",
         "refs_sha256",
         "repo_identity",
@@ -436,6 +441,55 @@ def status_entries(root: Path) -> dict[str, dict[str, Any]]:
     return dict(sorted(entries.items()))
 
 
+def ignored_entries(
+    root: Path,
+    *,
+    max_files: int,
+    max_bytes: int,
+) -> dict[str, dict[str, Any]]:
+    """Fingerprint ignored paths for strict workspace protection.
+
+    Strict mode is deliberately bounded.  A repository whose ignored tree is too
+    large must use light mode or reduce that tree; silently sampling would turn a
+    fail-closed boundary into an unverifiable heuristic.
+    """
+
+    if max_files < 0 or max_bytes < 0:
+        raise StateError("ignored scan limits must be non-negative")
+    raw = git(
+        root,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "-z",
+    )
+    paths = sorted(decode_path(value) for value in raw.split(b"\0") if value)
+    if len(paths) > max_files:
+        raise StateError(
+            f"strict ignored scan exceeds the {max_files} file limit"
+        )
+    total_bytes = 0
+    entries: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        candidate = root / Path(path)
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            total_bytes += metadata.st_size
+            if total_bytes > max_bytes:
+                raise StateError(
+                    f"strict ignored scan exceeds the {max_bytes} byte limit"
+                )
+        entries[path] = {
+            "fingerprint": fingerprint(root, path),
+            "status": "!",
+        }
+    return entries
+
+
 def repository_index_records(root: Path) -> dict[str, list[dict[str, str]]]:
     raw = git(root, "ls-files", "--stage", "--cached", "-z")
     index_records: dict[str, list[dict[str, str]]] = {}
@@ -494,6 +548,10 @@ def repository_path_spelling_key(value: str) -> str:
 def tracked_entries(
     root: Path,
     index_records: dict[str, list[dict[str, str]]] | None = None,
+    *,
+    ignored_mode: str = "light",
+    ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
+    ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
 ) -> dict[str, dict[str, Any]]:
     index_records = (
         repository_index_records(root) if index_records is None else index_records
@@ -515,7 +573,12 @@ def tracked_entries(
                 worktree_fingerprint = {
                     "kind": "submodule",
                     "git_marker": fingerprint(nested, ".git"),
-                    "state": state_payload(nested_root),
+                    "state": state_payload(
+                        nested_root,
+                        ignored_mode=ignored_mode,
+                        ignored_max_files=ignored_max_files,
+                        ignored_max_bytes=ignored_max_bytes,
+                    ),
                 }
             else:
                 worktree_fingerprint = {
@@ -532,16 +595,37 @@ def tracked_entries(
 def workspace_entries(
     root: Path,
     index_records: dict[str, list[dict[str, str]]] | None = None,
+    *,
+    ignored_mode: str = "light",
+    ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
+    ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
 ) -> dict[str, dict[str, Any]]:
     status = status_entries(root)
-    tracked = tracked_entries(root, index_records)
+    tracked = tracked_entries(
+        root,
+        index_records,
+        ignored_mode=ignored_mode,
+        ignored_max_files=ignored_max_files,
+        ignored_max_bytes=ignored_max_bytes,
+    )
+    ignored = (
+        ignored_entries(
+            root,
+            max_files=ignored_max_files,
+            max_bytes=ignored_max_bytes,
+        )
+        if ignored_mode == "strict"
+        else {}
+    )
     entries: dict[str, dict[str, Any]] = {}
-    for path in sorted(set(status) | set(tracked)):
+    for path in sorted(set(status) | set(tracked) | set(ignored)):
         entry: dict[str, Any] = {}
         if path in status:
             entry["status"] = status[path]
         if path in tracked:
             entry["tracked"] = tracked[path]
+        if path in ignored:
+            entry["ignored"] = ignored[path]
         entries[path] = entry
     return entries
 
@@ -590,7 +674,14 @@ def state_payload(
     *,
     control_roots: tuple[Path, ...] | None = None,
     index_records: dict[str, list[dict[str, str]]] | None = None,
+    ignored_mode: str = "light",
+    ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
+    ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
 ) -> dict[str, Any]:
+    if ignored_mode not in WORKSPACE_MODES:
+        raise StateError("workspace mode must be light or strict")
+    if ignored_max_files < 0 or ignored_max_bytes < 0:
+        raise StateError("ignored scan limits must be non-negative")
     control_roots = (
         repository_control_roots(root) if control_roots is None else control_roots
     )
@@ -609,8 +700,19 @@ def state_payload(
         "refs_sha256": refs_digest(root),
         "hooks_sha256": control_entry_digest(repository_git_path(root, "hooks")),
         "git_info_sha256": control_entry_digest(repository_git_path(root, "info")),
+        "ignored_mode": ignored_mode,
+        "ignored_limits": {
+            "max_bytes": ignored_max_bytes,
+            "max_files": ignored_max_files,
+        },
         "index_sha256": index_digest(root),
-        "entries": workspace_entries(root, index_records),
+        "entries": workspace_entries(
+            root,
+            index_records,
+            ignored_mode=ignored_mode,
+            ignored_max_files=ignored_max_files,
+            ignored_max_bytes=ignored_max_bytes,
+        ),
     }
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
@@ -634,6 +736,15 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
         raise StateError("baseline state identifier does not match its content")
     if not isinstance(value.get("entries"), dict):
         raise StateError("baseline entries are invalid")
+    if value.get("ignored_mode") not in WORKSPACE_MODES:
+        raise StateError("baseline workspace mode is invalid")
+    limits = value.get("ignored_limits")
+    if (
+        not isinstance(limits, dict)
+        or set(limits) != {"max_bytes", "max_files"}
+        or any(type(limits[name]) is not int or limits[name] < 0 for name in limits)
+    ):
+        raise StateError("baseline ignored scan limits are invalid")
     return value
 
 
@@ -831,8 +942,14 @@ def verify(
     control_roots: tuple[Path, ...] | None = None,
     index_records: dict[str, list[dict[str, str]]] | None = None,
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    limits = baseline["ignored_limits"]
     current = state_payload(
-        root, control_roots=control_roots, index_records=index_records
+        root,
+        control_roots=control_roots,
+        index_records=index_records,
+        ignored_mode=baseline["ignored_mode"],
+        ignored_max_files=limits["max_files"],
+        ignored_max_bytes=limits["max_bytes"],
     )
     baseline_entries = baseline["entries"]
     current_entries = current["entries"]
@@ -869,7 +986,7 @@ def verify(
         f"outside_lease:{path}" for path in changed if not is_allowed(path, allowed)
     )
     result = {
-        "schema": "cco.workspace-verification.v2",
+        "schema": "cco.workspace-verification.v3",
         "baseline_state": baseline["state_id"],
         "current_state": current["state_id"],
         "allowed_scopes": allowed,
@@ -919,6 +1036,13 @@ def parser() -> argparse.ArgumentParser:
     subparsers = root.add_subparsers(dest="command", required=True)
     capture = subparsers.add_parser("capture")
     capture.add_argument("--repo", type=Path, default=Path.cwd())
+    capture.add_argument("--mode", choices=sorted(WORKSPACE_MODES), default="light")
+    capture.add_argument(
+        "--ignored-max-files", type=int, default=DEFAULT_IGNORED_MAX_FILES
+    )
+    capture.add_argument(
+        "--ignored-max-bytes", type=int, default=DEFAULT_IGNORED_MAX_BYTES
+    )
     capture.add_argument(
         "--output",
         type=Path,
@@ -946,7 +1070,12 @@ def main() -> int:
     try:
         root = repository_root(args.repo)
         if args.command == "capture":
-            result = state_payload(root)
+            result = state_payload(
+                root,
+                ignored_mode=args.mode,
+                ignored_max_files=args.ignored_max_files,
+                ignored_max_bytes=args.ignored_max_bytes,
+            )
             code = 0
         else:
             baseline = validate_snapshot(

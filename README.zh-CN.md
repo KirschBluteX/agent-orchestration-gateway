@@ -27,14 +27,15 @@ CCO 将经常被错误合并为“简单/复杂编程”的判断拆开：
 
 ## 快速派遣
 
-普通派遣只需要一次本地编译和一次原生 spawn：
+普通派遣只需要一次本地工作图编译和所需的原生 spawn：
 
 ```text
 任务事实 → 路由计划 → cco.v6 胶囊 → 原生 Agent
 ```
 
-- 编译器先校验完整 route plan，再按宿主可用容量选择 ready 节点，并在内存中生成各自的
-  canonical capsule。
+- 单一 prepared-graph 入口从事实推导策略标签、捕获一份真实 workspace artifact、校验
+  完整 route plan，再按宿主可用容量选择 ready 节点，并在内存中生成全部 active 与合法
+  fallback canonical capsule。
 - 不使用项目文件作为派遣临时文件。
 - 轻量与严格路径共用同一实现；严格路径只是增加证据，不维护第二套协议。
 - 逻辑任务类型仍完整区分，物理 profile 仅保留可写 leaf 与只读 leaf。
@@ -49,8 +50,10 @@ CCO 将经常被错误合并为“简单/复杂编程”的判断拆开：
 所有 purpose × judgment 路由。路由阶段不创建 Agent，也不让 Primary 用自然语言逐个
 比较候选。
 
-自动候选必须受当前 Codex 原生目录支持、CodexRadar 观测 IQ 严格大于 90，并通过样本、
-同群和覆盖率检查。算法使用 Wilson 区间、Pareto 前沿以及质量/资源/时间/不确定性效用。
+自动候选必须受当前 Codex Multi-Agent 后端支持、CodexRadar 观测 IQ 严格大于 90，并通过
+样本、同群和覆盖率检查。原生目录提供后端元数据时，CCO 只接受明确标记
+`multi_agent_version=v2` 的条目，不会依据模型名称猜测支持情况。算法使用 Wilson 区间、
+Pareto 前沿以及质量/资源/时间/不确定性效用。
 
 worker 与 reviewer 默认优先 Luna/Terra。只有不存在合格的 Luna/Terra，或 Sol 的
 Wilson 95% 下界高于最佳 Luna/Terra 的上界时，Sol 才能自动胜出。用户明确指定 Sol 时
@@ -58,7 +61,9 @@ Wilson 95% 下界高于最佳 Luna/Terra 的上界时，Sol 才能自动胜出�
 
 Radar TTL 默认为一小时。若 LKG 超过 TTL 但仍在 72 小时有效期内，CCO 会立即用它完成
 当前派遣，并刷新供后续派遣使用。fallback 只推进预排序计划的 rank，不重新评分、不重建
-整份合同。默认不显示 IQ、价格、耗时或效用解释；仅在请求 `--explain` 时显示。
+整份合同。确认预线程拒绝后直接使用下一个预编译 native request，不重新捕获 baseline。
+同一 stale snapshot 只允许一个短期刷新请求，成功后立即删除。默认不显示 IQ、价格、耗时
+或效用解释；仅在请求 `--explain` 时显示。
 
 ## 并发与验收
 
@@ -75,21 +80,26 @@ Primary 验收。只有真实风险、语义/人工证据、集成判断、失�
 
 ## 安全与状态
 
-胶囊绑定 purpose、judgment、route、上下文 fork、scope、合同、验收、证据、baseline 和
-一个执行 generation；hook 会独立复算胶囊并核对原生参数。
+胶囊绑定 purpose、judgment、route、上下文 fork、scope、合同、验收、证据、baseline、
+graph identity 和一个执行 generation。PreToolUse 必须找到完全匹配的 prepared artifact；
+SubagentStop 会按整张图的 scope 并集验证当前 workspace 后才记录结果。
 
 仓库外仅保留一个很小的任务级 ledger，记录当前 owner、generation、input cursor 和
 lifecycle phase，用于拒绝重复 owner、并发 continuation 与迟到结果。它不是 coordinator、
 数据库、永久审计日志、文件锁或验收记录。
 
-轻量任务在工作图开始时共享一次 baseline，并校验 owned scopes 的 Git delta；严格路径
-才追加 Git 控制状态、路径别名、reparse 和 submodule 检查。Hook 只是进程守卫；只有运行
-元数据证明只读时，才称 reviewer 具有操作系统强制只读隔离。
+轻量模式不会枚举 ignored 文件；严格模式会指纹化 ignored 文件，并在默认超过 10,000 个
+文件或 256 MiB 扫描量时 fail closed。两种模式都保留 workspace schema 已实现的
+tracked/untracked 与 Git 控制状态检查，包括路径别名、reparse 和 submodule。Prepared
+artifact 位于仓库外，并在 SessionEnd 删除。Hook 只是进程守卫；只有运行元数据证明只读时，
+才称 reviewer 具有操作系统强制只读隔离。
 
 CCO 不保存计费、token、费用或路由历史，也不增加加密层、provider session、daemon 或
 数据库。
 
 ## 安装
+
+安装、hook 与验证均要求 Python 3.11 或更新版本。
 
 ```powershell
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
@@ -111,7 +121,7 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --check --works
 ## 开发验证
 
 ```powershell
-python -B -m unittest discover -s tests -v
+python -X utf8 -B -m unittest discover -s tests -v
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 

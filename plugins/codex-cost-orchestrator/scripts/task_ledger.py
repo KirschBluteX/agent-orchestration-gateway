@@ -30,6 +30,27 @@ class LedgerBusy(RuntimeError):
 
 _TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 _STATES = frozenset({"reserved", "owned", "continuable", "retired"})
+_KINDS = frozenset({"work", "analysis", "review"})
+_PURPOSES = frozenset(
+    {"analysis_inspect", "analysis_probe", "implementation", "acceptance"}
+)
+_ROLE_FOR_PURPOSE = {
+    "analysis_inspect": "cost_orchestrator_read_leaf",
+    "analysis_probe": "cost_orchestrator_read_leaf",
+    "implementation": "cost_orchestrator_write_leaf",
+    "acceptance": "cost_orchestrator_read_leaf",
+}
+_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
+_WORKSPACE_FIELDS = frozenset(
+    {
+        "baseline",
+        "baseline_path",
+        "graph_scopes",
+        "graph_sha256",
+        "scopes",
+        "workspace_mode",
+    }
+)
 _LOCK_WAIT_SECONDS = 0.25
 _STALE_LOCK_SECONDS = 60.0
 
@@ -75,7 +96,7 @@ class TaskLedger:
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"rows": {}}
+            return {"fenced_owners": [], "rows": {}}
         try:
             document = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
@@ -85,6 +106,17 @@ class TaskLedger:
         for row in document["rows"].values():
             if not isinstance(row, dict) or row.get("state") not in _STATES:
                 raise LedgerConflict("ledger row is malformed")
+        fenced_owners = document.get("fenced_owners", [])
+        if (
+            not isinstance(fenced_owners, list)
+            or any(
+                not isinstance(owner, str) or _TASK_PATH.fullmatch(owner) is None
+                for owner in fenced_owners
+            )
+            or len(set(fenced_owners)) != len(fenced_owners)
+        ):
+            raise LedgerConflict("ledger owner fences are malformed")
+        document["fenced_owners"] = fenced_owners
         return document
 
     def _write(self, document: Mapping[str, Any]) -> None:
@@ -147,10 +179,97 @@ class TaskLedger:
             "cursor": cls._integer(identity.get("cursor"), "cursor", minimum=0),
             "role": identity.get("role"),
         }
+        kind = identity.get("kind")
+        purpose = identity.get("purpose")
+        if (kind is None) != (purpose is None):
+            raise ValueError("claim kind/purpose must be provided together")
+        if kind is not None:
+            if (
+                not isinstance(kind, str)
+                or not isinstance(purpose, str)
+                or kind not in _KINDS
+                or purpose not in _PURPOSES
+            ):
+                raise ValueError("claim kind or purpose is invalid")
+            if kind == "work" and purpose != "implementation":
+                raise ValueError("work claim purpose is invalid")
+            if kind == "analysis" and purpose not in {
+                "analysis_inspect",
+                "analysis_probe",
+            }:
+                raise ValueError("analysis claim purpose is invalid")
+            if kind == "review" and purpose != "acceptance":
+                raise ValueError("review claim purpose is invalid")
+            if claim["role"] != _ROLE_FOR_PURPOSE[purpose]:
+                raise ValueError("claim role does not match purpose")
+            claim["kind"] = kind
+            claim["purpose"] = purpose
         cls._key(claim)
         for name in ("contract_sha256", "run", "input_sha256", "role"):
             if not isinstance(claim[name], str) or not claim[name]:
                 raise ValueError(f"claim {name} is invalid")
+        present_workspace_fields = _WORKSPACE_FIELDS.intersection(identity)
+        if present_workspace_fields:
+            if present_workspace_fields != _WORKSPACE_FIELDS:
+                raise ValueError("claim workspace identity is incomplete")
+            baseline = identity.get("baseline")
+            graph_sha256 = identity.get("graph_sha256")
+            baseline_path = identity.get("baseline_path")
+            workspace_mode = identity.get("workspace_mode")
+            scopes = identity.get("scopes")
+            graph_scopes = identity.get("graph_scopes")
+            if (
+                not isinstance(baseline, str)
+                or _SHA256.fullmatch(baseline) is None
+                or not isinstance(graph_sha256, str)
+                or _SHA256.fullmatch(graph_sha256) is None
+                or not isinstance(baseline_path, str)
+                or not Path(baseline_path).is_absolute()
+                or workspace_mode not in {"light", "strict"}
+                or not isinstance(scopes, list)
+                or not isinstance(graph_scopes, list)
+            ):
+                raise ValueError("claim workspace identity is invalid")
+            normalized_scope_sets: list[list[dict[str, str]]] = []
+            for scope_set in (scopes, graph_scopes):
+                normalized_scopes: list[dict[str, str]] = []
+                for scope in scope_set:
+                    if (
+                        not isinstance(scope, dict)
+                        or set(scope) != {"kind", "path"}
+                        or scope.get("kind") not in {"exact", "prefix"}
+                        or not isinstance(scope.get("path"), str)
+                        or not scope["path"]
+                    ):
+                        raise ValueError("claim workspace scopes are invalid")
+                    normalized_scopes.append(
+                        {"kind": scope["kind"], "path": scope["path"]}
+                    )
+                if (
+                    normalized_scopes
+                    != sorted(
+                        normalized_scopes,
+                        key=lambda item: (item["kind"], item["path"]),
+                    )
+                    or len(
+                        {(item["kind"], item["path"]) for item in normalized_scopes}
+                    )
+                    != len(normalized_scopes)
+                ):
+                    raise ValueError("claim workspace scopes are not canonical")
+                normalized_scope_sets.append(normalized_scopes)
+            if not all(scope in normalized_scope_sets[1] for scope in normalized_scope_sets[0]):
+                raise ValueError("claim node scopes are outside graph scopes")
+            claim.update(
+                {
+                    "baseline": baseline,
+                    "baseline_path": baseline_path,
+                    "graph_scopes": normalized_scope_sets[1],
+                    "graph_sha256": graph_sha256,
+                    "scopes": normalized_scope_sets[0],
+                    "workspace_mode": workspace_mode,
+                }
+            )
         return claim
 
     @staticmethod
@@ -189,6 +308,9 @@ class TaskLedger:
                     or row["contract_sha256"] != existing["contract_sha256"]
                 ):
                     raise LedgerConflict(f"{key} requires a newer generation")
+                previous_owner = existing.get("owner")
+                if isinstance(previous_owner, str) and _TASK_PATH.fullmatch(previous_owner):
+                    self._fence_owner(document, previous_owner)
                 row["_rollback"] = existing
             document["rows"][key] = row
             self._write(document)
@@ -229,7 +351,7 @@ class TaskLedger:
                 self._write(document)
             else:
                 del rows[key]
-                if rows:
+                if rows or document["fenced_owners"]:
                     self._write(document)
                 else:
                     self.path.unlink(missing_ok=True)
@@ -280,26 +402,33 @@ class TaskLedger:
         with self._lock():
             document = self._read()
             row = self._find_pending(document, call_id)
-            pending = row.pop("_pending")
-            if accepted:
-                row["input_sha256"] = pending["next_input_sha256"]
-                row["cursor"] = pending["cursor"]
-                row["state"] = "owned"
-            else:
-                row["state"] = pending["from_state"]
-            self._write(document)
-            return self._public(row)
+            return self._settle_pending(document, row, accepted=accepted)
+
+    def settle_pending_continuation(
+        self, call_id: str, *, accepted: bool
+    ) -> dict[str, Any] | None:
+        """Settle this call only when it reserved a CCO continuation."""
+
+        with self._lock():
+            document = self._read()
+            row = self._pending_by_call(document, call_id)
+            if row is None:
+                return None
+            return self._settle_pending(document, row, accepted=accepted)
 
     def retire(self, owner: str) -> dict[str, Any]:
         with self._lock():
             document = self._read()
             row = self._find_by_owner(document, owner)
             if row.get("state") == "retired":
+                if self._fence_owner(document, owner):
+                    self._write(document)
                 return self._public(row)
             if row.get("state") not in {"owned", "continuable"}:
                 raise LedgerConflict("only an owner can be retired")
             row["state"] = "retired"
             row.pop("_pending", None)
+            self._fence_owner(document, owner)
             self._write(document)
             return self._public(row)
 
@@ -341,6 +470,8 @@ class TaskLedger:
             if row.get("state") != "owned":
                 raise LedgerConflict("result owner is no longer current")
             row["state"] = disposition
+            if disposition == "retired":
+                self._fence_owner(document, owner)
             self._write(document)
             return self._public(row)
 
@@ -348,6 +479,18 @@ class TaskLedger:
         with self._lock():
             document = self._read()
             return [self._public(document["rows"][key]) for key in sorted(document["rows"])]
+
+    def is_managed_owner(self, owner: object) -> bool:
+        """Return whether this task ledger currently fences an exact owner."""
+
+        if not isinstance(owner, str) or _TASK_PATH.fullmatch(owner) is None:
+            return False
+        with self._lock():
+            document = self._read()
+            return owner in document["fenced_owners"] or any(
+                isinstance(row, dict) and row.get("owner") == owner
+                for row in document["rows"].values()
+            )
 
     def cleanup_if_terminal(self, *, force: bool = False) -> bool:
         """Check terminality and unlink under the same lock."""
@@ -368,6 +511,14 @@ class TaskLedger:
                 return row
         raise LedgerConflict("reservation does not exist")
 
+    @staticmethod
+    def _fence_owner(document: Mapping[str, Any], owner: str) -> bool:
+        fenced_owners = document["fenced_owners"]
+        if owner in fenced_owners:
+            return False
+        fenced_owners.append(owner)
+        return True
+
     def _find_by_owner(self, document: Mapping[str, Any], owner: str) -> dict[str, Any]:
         for row in document["rows"].values():
             if isinstance(row, dict) and row.get("owner") == owner:
@@ -375,11 +526,33 @@ class TaskLedger:
         raise LedgerConflict("owner does not exist")
 
     def _find_pending(self, document: Mapping[str, Any], call_id: str) -> dict[str, Any]:
+        row = self._pending_by_call(document, call_id)
+        if row is not None:
+            return row
+        raise LedgerConflict("continuation reservation does not exist")
+
+    @staticmethod
+    def _pending_by_call(
+        document: Mapping[str, Any], call_id: str
+    ) -> dict[str, Any] | None:
         for row in document["rows"].values():
             pending = row.get("_pending") if isinstance(row, dict) else None
             if isinstance(pending, dict) and pending.get("call_id") == call_id:
                 return row
-        raise LedgerConflict("continuation reservation does not exist")
+        return None
+
+    def _settle_pending(
+        self, document: Mapping[str, Any], row: dict[str, Any], *, accepted: bool
+    ) -> dict[str, Any]:
+        pending = row.pop("_pending")
+        if accepted:
+            row["input_sha256"] = pending["next_input_sha256"]
+            row["cursor"] = pending["cursor"]
+            row["state"] = "owned"
+        else:
+            row["state"] = pending["from_state"]
+        self._write(document)
+        return self._public(row)
 
     @classmethod
     def cleanup_stale(

@@ -31,14 +31,15 @@ merely because a model is cheaper.
 
 ## Fast dispatch
 
-Normal dispatch is one local compile followed by one native spawn:
+Normal dispatch is one local graph compile followed by native spawns:
 
 ```text
 authoring facts → route plan → cco.v6 capsule → native Agent
 ```
 
-- The compiler validates one whole route plan, selects ready nodes at observed native
-  capacity, and builds each canonical capsule in memory.
+- The single prepared-graph entry derives policy labels from facts, captures one real
+  workspace artifact, validates the whole route plan, selects ready nodes at observed
+  native capacity, and builds every active and legal fallback capsule in memory.
 - Project files are never used as dispatch scratch space.
 - Light and strict dispatch share one implementation; strict mode adds evidence,
   not a second protocol.
@@ -55,9 +56,11 @@ User-selected model and reasoning effort always win. Otherwise, one local batch
 resolves every purpose/judgment route required by the graph. Routing never invokes
 an Agent or asks Primary to compare candidates in natural language.
 
-Automatic candidates must be supported by the native Codex catalog, have observed
-CodexRadar IQ strictly above 90, and pass sample/cohort/coverage checks. A Wilson-
-aware Pareto utility balances quality, resource use, time, and uncertainty.
+Automatic candidates must be supported by the current Codex Multi-Agent backend,
+have observed CodexRadar IQ strictly above 90, and pass sample/cohort/coverage
+checks. When the native catalog exposes backend metadata, CCO accepts only entries
+marked `multi_agent_version=v2`; it never guesses support from a model name. A
+Wilson-aware Pareto utility balances quality, resource use, time, and uncertainty.
 
 Luna and Terra are preferred for workers and reviewers. Sol may automatically win
 only when no eligible Luna/Terra exists or Sol’s Wilson 95% lower bound is above the
@@ -66,7 +69,10 @@ best eligible Luna/Terra upper bound. A user-fixed Sol route is always honored.
 The Radar TTL is one hour. If a bounded last-known-good snapshot is older than the
 TTL, CCO dispatches immediately from it and refreshes for a later dispatch. Route
 fallback advances through a pre-ranked plan; it does not rescore Radar or rebuild the
-whole contract. Scores are hidden unless `--explain` is requested.
+whole contract. A confirmed pre-thread rejection takes the next precompiled native
+request without recapturing the baseline. One short-lived request suppresses duplicate
+refresh processes and is removed after success. Scores are hidden unless `--explain`
+is requested.
 
 ## Concurrency and acceptance
 
@@ -88,23 +94,28 @@ retry counters are not carried through every packet.
 ## Safety and state
 
 The capsule binds purpose, judgment, route, context fork, scopes, contract,
-acceptance, evidence, baseline, and one execution generation. Hooks independently
-validate the capsule and native arguments.
+acceptance, evidence, baseline, graph identity, and one execution generation.
+PreToolUse requires the matching prepared artifact; SubagentStop verifies the current
+workspace against the whole graph's scope union before recording a result.
 
 A small task-local ledger outside the repository keeps only the current owner,
 generation, input cursor, and lifecycle phase. It rejects duplicate ownership,
 concurrent continuations, and late results. It is not a coordinator, database,
 durable audit log, filesystem lock, or acceptance record.
 
-Light tasks share one graph baseline and verify scoped Git deltas. Strict tasks add
-full control-state, path-alias, reparse, and submodule checks. Hooks are process
-guardrails; OS-enforced read-only isolation is claimed only when runtime metadata
-proves it.
+Light tasks avoid enumerating ignored files. Strict tasks fingerprint ignored files
+and fail closed above the default 10,000-file or 256-MiB scan limits. Both retain the
+tracked/untracked and Git control-state checks implemented by the workspace schema,
+including path aliases, reparses, and submodules. Prepared artifacts live outside the
+repository and are removed at SessionEnd. Hooks are process guardrails; OS-enforced
+read-only isolation is claimed only when runtime metadata proves it.
 
 CCO keeps no billing, token, fee, route-history, encryption, provider-session,
 daemon, or database layer.
 
 ## Install
+
+Python 3.11 or newer is required for installation, hooks, and validation.
 
 ```powershell
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
@@ -127,7 +138,7 @@ are reloaded. Then describe an ordinary implementation request; explicit
 ## Development
 
 ```powershell
-python -B -m unittest discover -s tests -v
+python -X utf8 -B -m unittest discover -s tests -v
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 

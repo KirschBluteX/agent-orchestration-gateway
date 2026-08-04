@@ -12,23 +12,36 @@ sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 
 import agent_preflight  # noqa: E402
 from packet_compiler import CapsuleError, compile_continuation, compile_dispatch  # noqa: E402
-from tests.v6_test_support import fixed_route_plan  # noqa: E402
+from tests.v6_test_support import dispatch_decision, fixed_route_plan  # noqa: E402
 
 
 def native_input(*, kind: str = "work", purpose: str = "implementation") -> dict[str, object]:
+    judgment = "complex" if kind == "review" else "routine"
+    selected_model = "gpt-5.6-luna"
+    decision = dispatch_decision(
+        purpose=purpose,
+        judgment=judgment,
+        selected_model=selected_model,
+    )
     spec: dict[str, object] = {
+        "acceptance": decision["derived"]["acceptance"],
         "baseline": "sha256:" + "b" * 64,
         "contract": {"node": "n01_v6", "objective": "bounded result"},
-        "judgment": "routine",
+        "decision": decision,
+        "graph_sha256": "sha256:" + "a" * 64,
+        "judgment": judgment,
         "kind": kind,
         "node": "n01_v6" if kind != "review" else "review_e01",
         "purpose": purpose,
-        "route_plan": fixed_route_plan(purpose=purpose),
+        "route_plan": fixed_route_plan(
+            purpose=purpose,
+            judgment=judgment,
+            model=selected_model,
+        ),
     }
     if kind == "review":
         spec.update(
             {
-                "acceptance": {"mode": "independent"},
                 "current_state": "sha256:" + "c" * 64,
                 "epoch": "e01",
                 "evidence": {"records": []},

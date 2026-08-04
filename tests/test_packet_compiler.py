@@ -98,6 +98,22 @@ class PacketCompilerTests(unittest.TestCase):
         self.assertNotIn("attempt", execution)
         self.assertNotIn("followup", execution)
 
+    def test_fork_turns_requires_none_or_a_positive_integer(self) -> None:
+        for value in ("0", "00", "-1", "all", 1):
+            with self.subTest(value=value), self.assertRaises(CapsuleError):
+                compile_dispatch(
+                    {
+                        "baseline": "sha256:" + "b" * 64,
+                        "contract": contract(),
+                        "fork_turns": value,
+                        "judgment": "routine",
+                        "kind": "work",
+                        "node": "n01_capsule",
+                        "purpose": "implementation",
+                        "route_plan": route(),
+                    }
+                )
+
     def test_deprecated_execution_counters_are_rejected(self) -> None:
         for field in ("attempt", "followup"):
             with self.subTest(field=field), self.assertRaises(CapsuleError):
@@ -315,6 +331,22 @@ class PacketCompilerTests(unittest.TestCase):
         }
         with self.assertRaises(CapsuleError):
             compile_dispatch(spec)
+
+    def test_graph_identity_must_be_a_sha256(self) -> None:
+        for value in ({"canonical": "but not a digest"}, "graph-1", None):
+            with self.subTest(value=value), self.assertRaises(CapsuleError):
+                compile_dispatch(
+                    {
+                        "baseline": "sha256:" + "b" * 64,
+                        "contract": contract(),
+                        "graph_sha256": value,
+                        "judgment": "routine",
+                        "kind": "work",
+                        "node": "n01_capsule",
+                        "purpose": "implementation",
+                        "route_plan": route(),
+                    }
+                )
 
     def test_capsule_derives_compact_route_binding_from_the_complete_plan(self) -> None:
         plan = route("gpt-5.6-sol", "max")

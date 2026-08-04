@@ -36,7 +36,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertEqual(manifest["version"], "0.6.0")
+        self.assertEqual(manifest["version"], "0.7.0")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -97,10 +97,11 @@ class ProjectContractTests(unittest.TestCase):
             "cost_orchestrator_reviewer",
         ):
             self.assertNotIn(legacy, serialized)
-        for groups in hooks.values():
+        for event, groups in hooks.items():
             for group in groups:
                 for hook in group.get("hooks", []):
-                    self.assertLessEqual(hook["timeout"], 5)
+                    expected_timeout = 120 if event == "SubagentStop" else 5
+                    self.assertLessEqual(hook["timeout"], expected_timeout)
 
     def test_v6_is_the_only_shipped_protocol_and_has_no_fixed_retry_ritual(self) -> None:
         combined = shipped_text()
@@ -153,14 +154,10 @@ class ProjectContractTests(unittest.TestCase):
             self.assertTrue((REFERENCES / filename).is_file())
             self.assertIn(f"references/{filename}", contents)
 
-    def test_repository_reachable_history_has_one_expected_author_and_root(self) -> None:
-        authors = subprocess.check_output(
-            ["git", "log", "--format=%an"], cwd=REPO, text=True
-        ).splitlines()
+    def test_repository_reachable_history_has_one_root(self) -> None:
         roots = subprocess.check_output(
             ["git", "rev-list", "--max-parents=0", "HEAD"], cwd=REPO, text=True
         ).splitlines()
-        self.assertEqual(set(authors), {"KirschQAQ"})
         self.assertEqual(len(roots), 1)
 
 

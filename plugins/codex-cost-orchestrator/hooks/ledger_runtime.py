@@ -20,7 +20,14 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from task_ledger import LedgerConflict, TaskLedger  # noqa: E402
-from packet_compiler import normalize_capsule, parse_result_message  # noqa: E402
+from packet_compiler import READ_ROLE, normalize_capsule, parse_result_message  # noqa: E402
+from prepared_graph import (  # noqa: E402
+    PreparedGraphError,
+    cleanup_session_artifacts,
+    cleanup_stale_artifacts,
+    dispatch_workspace_claim,
+    verify_artifact_workspace,
+)
 from protocol_hash import canonical_bytes  # noqa: E402
 from workspace_state import StateError, repository_root  # noqa: E402
 
@@ -79,10 +86,31 @@ def ledger_for(payload: Mapping[str, Any]) -> TaskLedger | None:
     return TaskLedger(_ledger_root(payload), session_id)
 
 
+def prepared_workspace_claim(
+    payload: Mapping[str, Any], capsule: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve and validate the task-local baseline bound by a prepared graph."""
+
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or SESSION_ID.fullmatch(session_id) is None:
+        raise LedgerConflict("prepared baseline requires an exact session identity")
+    cwd_value = payload.get("cwd")
+    try:
+        return dispatch_workspace_claim(
+            ledger_root=_ledger_root(payload),
+            session_id=session_id,
+            capsule=capsule,
+            repo=Path(cwd_value) if isinstance(cwd_value, str) else Path.cwd(),
+        )
+    except PreparedGraphError as error:
+        raise LedgerConflict("prepared baseline artifact is invalid") from error
+
+
 def claim_from_fields(
     fields: Mapping[str, Any],
     *,
     role: str | None = None,
+    workspace: Mapping[str, Any] | None = None,
 ) -> dict[str, object]:
     """Compile validated wire fields into the ledger's minimal lifecycle claim."""
 
@@ -90,7 +118,7 @@ def claim_from_fields(
     execution = capsule["execution"]
     contract = capsule.get("contract", {})
     contract_sha256 = "sha256:" + hashlib.sha256(canonical_bytes(contract)).hexdigest()
-    return {
+    claim: dict[str, object] = {
         "node": capsule["node"],
         "contract_rev": int(contract.get("contract_rev", 1)),
         "contract_sha256": contract_sha256,
@@ -99,19 +127,42 @@ def claim_from_fields(
         "cursor": execution["cursor"],
         "role": role or capsule["role"],
         "run": execution["task_name"],
+        "kind": capsule["kind"],
+        "purpose": capsule["purpose"],
     }
+    if workspace is not None:
+        claim.update(
+            {
+                "baseline": workspace.get("baseline"),
+                "baseline_path": workspace.get("baseline_path"),
+                "graph_scopes": workspace.get("graph_scopes"),
+                "graph_sha256": workspace.get("graph_sha256"),
+                "scopes": workspace.get("scopes"),
+                "workspace_mode": workspace.get("workspace_mode"),
+            }
+        )
+    return claim
 
 
 def result_claim_from_message(message: Any) -> dict[str, Any]:
     return parse_result_message(message)
 
 
-def reserve_spawn(payload: Mapping[str, Any], fields: Mapping[str, str], role: str) -> None:
+def reserve_spawn(
+    payload: Mapping[str, Any],
+    fields: Mapping[str, str],
+    role: str,
+    *,
+    workspace: Mapping[str, Any] | None = None,
+) -> None:
     ledger = ledger_for(payload)
     call_id = payload.get("tool_use_id")
     if ledger is None or not isinstance(call_id, str):
         return
-    ledger.reserve(call_id, claim_from_fields(fields, role=role))
+    ledger.reserve(
+        call_id,
+        claim_from_fields(fields, role=role, workspace=workspace),
+    )
 
 
 def _task_paths(value: Any, *, key: str = "") -> set[str]:
@@ -175,28 +226,44 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def _continuation_fields(
-    payload: Mapping[str, Any], fields: Mapping[str, Any] | None
-) -> tuple[Mapping[str, Any], Mapping[str, Any]] | None:
-    tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return None
-    return tool_input, fields or {}
-
-
 def preflight_continuation(
     payload: Mapping[str, Any], fields: Mapping[str, Any] | None = None
 ) -> None:
     ledger = ledger_for(payload)
-    values = _continuation_fields(payload, fields)
-    if ledger is None or not ledger.path.exists() or values is None:
+    if ledger is None or not ledger.path.exists():
         return
-    tool_input, parsed = values
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return
     target = tool_input.get("target")
+    if fields is None:
+        if ledger.is_managed_owner(target):
+            raise LedgerConflict("managed CCO owner requires a v6 continuation capsule")
+        return
     call_id = payload.get("tool_use_id")
     if not isinstance(target, str) or not isinstance(call_id, str):
         raise LedgerConflict("continuation has no exact call or target")
-    capsule = normalize_capsule(dict(parsed))
+    capsule = normalize_capsule(dict(fields))
+    if "graph_sha256" in capsule:
+        workspace = prepared_workspace_claim(payload, capsule)
+        matching_rows = [
+            row for row in ledger.read_rows() if row.get("owner") == target
+        ]
+        workspace_fields = (
+            "baseline",
+            "baseline_path",
+            "graph_scopes",
+            "graph_sha256",
+            "scopes",
+            "workspace_mode",
+        )
+        if len(matching_rows) != 1 or any(
+            matching_rows[0].get(name) != workspace.get(name)
+            for name in workspace_fields
+        ):
+            raise LedgerConflict(
+                "continuation prepared baseline does not match its owner"
+            )
     previous = capsule.get("previous_capsule_sha256")
     current = capsule.get("capsule_sha256")
     cursor = capsule["execution"]["cursor"]
@@ -214,7 +281,7 @@ def postflight_continuation(payload: Mapping[str, Any]) -> None:
     call_id = payload.get("tool_use_id")
     if ledger is None or not ledger.path.exists() or not isinstance(call_id, str):
         return
-    ledger.settle_continuation(
+    ledger.settle_pending_continuation(
         call_id,
         accepted=not _native_rejection(payload.get("tool_response")),
     )
@@ -237,10 +304,14 @@ def accept_subagent_result(
     payload: Mapping[str, Any], fields: Mapping[str, Any] | None = None
 ) -> None:
     ledger = ledger_for(payload)
-    if ledger is None or not ledger.path.exists():
-        return
     parsed = fields or result_claim_from_message(payload.get("last_assistant_message"))
     if not parsed:
+        return
+    if parsed.get("disposition") == "accept" and (
+        ledger is None or not ledger.path.exists()
+    ):
+        raise LedgerConflict("accept result has no live dispatch ledger")
+    if ledger is None or not ledger.path.exists():
         return
     owner = payload.get("agent_id")
     if not isinstance(owner, str) or TASK_PATH.fullmatch(owner) is None:
@@ -255,8 +326,37 @@ def accept_subagent_result(
     if len(matching) != 1:
         raise LedgerConflict("v6 result dispatch identity is stale")
     row = matching[0]
+    if parsed.get("disposition") == "accept":
+        if (
+            parsed.get("status") != "complete"
+            or payload.get("agent_type") != READ_ROLE
+            or row.get("role") != READ_ROLE
+            or row.get("kind") != "review"
+            or row.get("purpose") != "acceptance"
+        ):
+            raise LedgerConflict(
+                "only a complete review acceptance may return an accept disposition"
+            )
+    if "baseline_path" in row:
+        cwd_value = payload.get("cwd")
+        try:
+            verification = verify_artifact_workspace(
+                Path(str(row["baseline_path"])),
+                repo=Path(cwd_value) if isinstance(cwd_value, str) else Path.cwd(),
+                baseline=str(row["baseline"]),
+                graph_sha256_value=str(row["graph_sha256"]),
+                graph_scopes_value=row["graph_scopes"],
+                workspace_mode=str(row["workspace_mode"]),
+            )
+        except PreparedGraphError as error:
+            raise LedgerConflict("result workspace artifact is invalid") from error
+        if verification["verdict"] != "pass":
+            raise LedgerConflict(
+                "result workspace verification failed: "
+                + ",".join(verification["violations"])
+            )
     disposition = "continuable" if parsed.get("disposition") == "continue" else "retired"
-    result = ledger.record_result(
+    ledger.record_result(
         node=str(row["node"]),
         contract_rev=int(row["contract_rev"]),
         run=str(row["run"]),
@@ -266,8 +366,6 @@ def accept_subagent_result(
         disposition=disposition,
         cursor=int(row["cursor"]),
     )
-    if result["state"] == "retired":
-        ledger.cleanup_if_terminal()
 
 
 def cleanup_task(payload: Mapping[str, Any]) -> None:
@@ -278,6 +376,12 @@ def cleanup_task(payload: Mapping[str, Any]) -> None:
         return
     if ledger.path.exists():
         ledger.cleanup_if_terminal(force=True)
+    cleanup_session_artifacts(ledger.root, str(payload.get("session_id")))
+    cleanup_stale_artifacts(
+        ledger.root,
+        keep_session_id=str(payload.get("session_id")),
+        max_age_seconds=24 * 60 * 60,
+    )
     TaskLedger.cleanup_stale(
         ledger.root,
         keep_session_id=str(payload.get("session_id")),

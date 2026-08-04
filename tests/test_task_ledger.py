@@ -147,6 +147,26 @@ class TaskLedgerBehaviorTests(unittest.TestCase):
             self.assertEqual(current["owner"], new_owner)
             self.assertEqual(current["generation"], 2)
 
+    def test_retired_and_superseded_owners_remain_fenced_until_cleanup(self) -> None:
+        from task_ledger import TaskLedger
+
+        old_owner = "/root/work_n01_policy_complex_r01"
+        new_owner = "/root/work_n01_policy_complex_r02"
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = TaskLedger(Path(directory), "session-a")
+            ledger.reserve("spawn-1", identity())
+            ledger.activate("spawn-1", old_owner)
+            ledger.retire(old_owner)
+            self.assertTrue(ledger.is_managed_owner(old_owner))
+
+            ledger.reserve("spawn-2", identity(run="run_n01_policy_r02"))
+            ledger.activate("spawn-2", new_owner)
+            self.assertTrue(ledger.is_managed_owner(old_owner))
+            self.assertTrue(ledger.is_managed_owner(new_owner))
+
+            ledger.cleanup_if_terminal(force=True)
+            self.assertFalse(ledger.is_managed_owner(old_owner))
+
     def test_generation_is_the_only_takeover_fence(self) -> None:
         from task_ledger import LedgerConflict, TaskLedger
 

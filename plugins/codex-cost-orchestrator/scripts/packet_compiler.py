@@ -15,7 +15,11 @@ import json
 import re
 from typing import Any, Mapping
 
-from decision_policy import DecisionPolicyError, select_ready_nodes
+from decision_policy import (
+    DecisionPolicyError,
+    normalize_dispatch_decision,
+    select_ready_nodes,
+)
 from protocol_hash import (
     ProtocolHashError,
     canonical_bytes,
@@ -36,6 +40,7 @@ NODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 EPOCH = re.compile(r"^e[0-9]{2,}$")
 MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EFFORT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
 PURPOSES = frozenset(
     {"analysis_inspect", "analysis_probe", "implementation", "acceptance"}
 )
@@ -237,10 +242,30 @@ def normalize_capsule(capsule: object) -> dict[str, Any]:
     if set(execution) != {"cursor", "fork_turns", "generation", "task_name"}:
         raise CapsuleError("capsule.execution has unsupported fields")
     fork_turns = execution.get("fork_turns", "none")
-    if fork_turns != "none" and (not isinstance(fork_turns, str) or not fork_turns.isdigit()):
+    if fork_turns != "none" and (
+        not isinstance(fork_turns, str)
+        or POSITIVE_INTEGER.fullmatch(fork_turns) is None
+    ):
         raise CapsuleError("execution.fork_turns is invalid")
     route = _route_binding(value.get("route"))
+    if "decision" in value:
+        try:
+            decision = normalize_dispatch_decision(
+                value.get("decision"),
+                selected_model=route["selected"]["model"],
+            )
+        except DecisionPolicyError as error:
+            raise CapsuleError(f"capsule decision is invalid: {error}") from error
+        if decision != value.get("decision"):
+            raise CapsuleError("capsule decision is not canonical")
+        derived = decision["derived"]
+        if purpose != derived["purpose"] or judgment != derived["judgment"]:
+            raise CapsuleError("capsule labels do not match the derived decision")
+        if "acceptance" in value and value.get("acceptance") != derived["acceptance"]:
+            raise CapsuleError("capsule acceptance does not match the derived decision")
     _sha(value.get("baseline"), "capsule.baseline")
+    if "graph_sha256" in value:
+        _sha(value.get("graph_sha256"), "capsule.graph_sha256")
     _scope_list(value.get("scopes", []), "capsule.scopes")
     _canonical(value.get("contract"), "capsule.contract")
     if kind == "review":
@@ -257,7 +282,7 @@ def normalize_capsule(capsule: object) -> dict[str, Any]:
         "requested_model", "role", "route", "scopes",
     }
     optional = {
-        "acceptance", "current_state", "epoch", "evidence", "graph_sha256",
+        "acceptance", "current_state", "decision", "epoch", "evidence", "graph_sha256",
     }
     continuation = {"delta", "previous_capsule_sha256"}
     if set(value) - required - optional - continuation or required - set(value):
@@ -355,9 +380,19 @@ def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
     }
     if epoch is not None:
         capsule["epoch"] = epoch
-    for name in ("acceptance", "evidence", "current_state", "graph_sha256"):
+    for name in ("acceptance", "evidence"):
         if name in spec and spec[name] is not None:
-            capsule[name] = _canonical(spec[name], f"spec.{name}") if name in {"acceptance", "evidence"} else spec[name]
+            capsule[name] = _canonical(spec[name], f"spec.{name}")
+    for name in ("current_state", "graph_sha256"):
+        if name in spec:
+            capsule[name] = _sha(spec[name], f"spec.{name}")
+    if "decision" in spec:
+        try:
+            capsule["decision"] = normalize_dispatch_decision(
+                spec["decision"], selected_model=route["selected"]["model"]
+            )
+        except DecisionPolicyError as error:
+            raise CapsuleError(f"spec.decision is invalid: {error}") from error
     if kind == "review":
         if "acceptance" not in capsule or "evidence" not in capsule:
             raise CapsuleError("review requires one acceptance and one evidence object")

@@ -192,6 +192,20 @@ class DecisionKernelTests(unittest.TestCase):
 
         self.assertEqual(decision, {"mode": "primary", "reasons": []})
 
+    def test_primary_owned_change_uses_model_neutral_acceptance_language(self) -> None:
+        decision = self.policy.derive_acceptance(
+            acceptance_ids=["A01"],
+            deterministic_graph_coverage=["A01"],
+            events=["primary_owned_change"],
+            required_verification_strengths=["deterministic"],
+            risk_assessment=self.complete_risks(),
+        )
+
+        self.assertEqual(
+            decision,
+            {"mode": "independent", "reasons": ["primary_owned_change"]},
+        )
+
     def test_ready_disjoint_responsibilities_fill_observed_native_capacity(self) -> None:
         nodes = [
             {
@@ -319,6 +333,29 @@ class DecisionKernelTests(unittest.TestCase):
             self.policy.select_ready_nodes(nodes, native_capacity=2),
             ["n02_left", "n03_right"],
         )
+
+    def test_selector_finds_a_capacity_sized_set_when_greedy_degree_cannot(self) -> None:
+        edges = {(0, 2), (0, 3), (0, 4), (1, 2), (1, 3)}
+        nodes = []
+        for index in range(5):
+            scopes = [
+                {"kind": "exact", "path": f"conflicts/e{left}_{right}"}
+                for left, right in sorted(edges)
+                if index in {left, right}
+            ]
+            nodes.append(
+                {
+                    "access": "write",
+                    "dependencies_ready": True,
+                    "node": f"n{index}",
+                    "responsibility": f"responsibility-{index}",
+                    "scope": scopes,
+                }
+            )
+
+        selected = self.policy.select_ready_nodes(nodes, native_capacity=3)
+
+        self.assertEqual(selected, ["n2", "n3", "n4"])
 
     def test_selector_rejects_unsafe_or_ambiguous_repository_scopes(self) -> None:
         base = {
