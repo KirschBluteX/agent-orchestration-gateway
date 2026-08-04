@@ -28,7 +28,7 @@ CAPSULE_JSON: <canonical compact object>
 
 The capsule binds:
 
-- logical `kind`, `purpose`, `judgment`, and light/strict/fresh/delta `mode`;
+- logical `kind`, `purpose`, `judgment`, derived assurance, and light/strict/fresh/delta `mode`;
 - node and optional review epoch;
 - one closed contract plus sorted typed exact/prefix scopes;
 - selected model/effort, route rank, and optional compact plan identity;
@@ -39,8 +39,9 @@ Initial capsules have cursor zero. A continuation includes the previous capsule 
 one nonempty canonical delta, the same task name/generation, and cursor +1. Material
 contract or ownership changes use a fresh capsule and newer generation.
 
-Every prepared graph receives one complete canonical `cco.route-plan.v1`. The graph
-compiler validates its hash, active candidate/rank, route key, and placement, then
+Every prepared graph receives one complete canonical `cco.route-plan.v2`. Its route
+key is purpose/judgment/assurance. The graph compiler re-derives assurance from the
+node acceptance facts, validates the plan hash, active candidate/rank, route key, and placement, then
 stores only `plan_sha256`, rank, and selected pair in each capsule. A caller-supplied
 pair or detached plan hash is invalid. The prepared artifact binds the graph manifest,
 route-plan identity, all node decisions/contracts/scopes, workspace mode, and exact

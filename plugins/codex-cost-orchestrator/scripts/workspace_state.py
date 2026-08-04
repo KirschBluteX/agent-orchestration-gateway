@@ -725,7 +725,7 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema") != SCHEMA:
         raise StateError("baseline uses an unsupported schema")
     if set(value) != SNAPSHOT_FIELDS:
-        raise StateError("baseline does not contain the exact v2 required fields")
+        raise StateError("baseline does not contain the exact v3 required fields")
     state_id = value.get("state_id")
     unsigned = {key: item for key, item in value.items() if key != "state_id"}
     canonical = json.dumps(

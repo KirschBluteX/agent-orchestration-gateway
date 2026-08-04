@@ -13,6 +13,7 @@ from decision_policy import (
     DecisionPolicyError,
     derive_acceptance,
     derive_judgment,
+    derive_route_assurance,
     normalize_closure,
     normalize_dispatch_decision,
     normalize_placement_benefits,
@@ -90,11 +91,15 @@ def _scopes(value: object, label: str) -> list[dict[str, str]]:
     return scopes
 
 
-def _route_for(plan: Mapping[str, Any], purpose: str, judgment: str) -> dict[str, Any]:
+def _route_for(
+    plan: Mapping[str, Any], purpose: str, judgment: str, assurance: str
+) -> dict[str, Any]:
     matches = [
         route
         for route in plan["routes"]
-        if route["purpose"] == purpose and route["judgment"] == judgment
+        if route["purpose"] == purpose
+        and route["judgment"] == judgment
+        and route["assurance"] == assurance
     ]
     if len(matches) != 1:
         raise GraphCompilerError("route plan lacks one exact derived route key")
@@ -119,7 +124,11 @@ def _decision(item: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any
         judgment = derive_judgment(closure)
         if judgment == "unresolved":
             raise GraphCompilerError("unresolved judgment stays in Primary")
-        route = _route_for(plan, purpose, judgment)
+        acceptance_facts = item["acceptance_facts"]
+        if not isinstance(acceptance_facts, Mapping):
+            raise GraphCompilerError("node acceptance facts are malformed")
+        assurance = derive_route_assurance(**acceptance_facts)
+        route = _route_for(plan, purpose, judgment, assurance)
         placement_facts = item["placement"]
         if not isinstance(placement_facts, Mapping) or set(placement_facts) != {
             "benefits",
@@ -135,9 +144,6 @@ def _decision(item: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any
         )
         if route["placement"] != placement:
             raise GraphCompilerError("route placement does not match derived placement")
-        acceptance_facts = item["acceptance_facts"]
-        if not isinstance(acceptance_facts, Mapping):
-            raise GraphCompilerError("node acceptance facts are malformed")
         acceptance = derive_acceptance(**acceptance_facts)
         decision = {
             "acceptance_facts": {
@@ -156,6 +162,7 @@ def _decision(item: Mapping[str, Any], plan: Mapping[str, Any]) -> dict[str, Any
             "closure": closure,
             "derived": {
                 "acceptance": acceptance,
+                "assurance": assurance,
                 "judgment": judgment,
                 "placement": placement,
                 "purpose": purpose,
@@ -185,10 +192,11 @@ def _route_variants(
     derived = decision["derived"]
     purpose = str(derived["purpose"])
     judgment = str(derived["judgment"])
+    assurance = str(derived["assurance"])
     variants = [plan]
     current = plan
     while True:
-        route = _route_for(current, purpose, judgment)
+        route = _route_for(current, purpose, judgment, assurance)
         rank = int(route["dispatch"]["rank"])
         if rank >= len(route["candidates"]):
             break
@@ -196,13 +204,14 @@ def _route_variants(
         try:
             advanced = advance_route_plan(
                 current,
+                assurance=assurance,
                 purpose=purpose,
                 judgment=judgment,
                 rejected_model=selected["model"],
                 rejected_effort=selected["effort"],
                 rejection_ticket=f"native:prethread-rejected-r{rank:02d}",
             )
-            next_route = _route_for(advanced, purpose, judgment)
+            next_route = _route_for(advanced, purpose, judgment, assurance)
             normalize_dispatch_decision(
                 decision,
                 selected_model=next_route["selected"]["model"],
@@ -217,7 +226,7 @@ def _route_variants(
 
 
 def _route_bindings(
-    variants: list[dict[str, Any]], *, purpose: str, judgment: str
+    variants: list[dict[str, Any]], *, purpose: str, judgment: str, assurance: str
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -226,7 +235,7 @@ def _route_bindings(
             "selected": dict(route["selected"]),
         }
         for variant in variants
-        for route in [_route_for(variant, purpose, judgment)]
+        for route in [_route_for(variant, purpose, judgment, assurance)]
     ]
 
 
@@ -321,6 +330,7 @@ def prepare_dispatch_graph(
                 "node": item["node"],
                 "route_bindings": _route_bindings(
                     item["route_plans"],
+                    assurance=str(item["decision"]["derived"]["assurance"]),
                     purpose=str(item["decision"]["derived"]["purpose"]),
                     judgment=str(item["decision"]["derived"]["judgment"]),
                 ),
@@ -368,6 +378,7 @@ def prepare_dispatch_graph(
         )
         spec: dict[str, Any] = {
             "acceptance": derived["acceptance"],
+            "assurance": derived["assurance"],
             "baseline": snapshot["state_id"],
             "contract": item["contract"],
             "decision": item["decision"],

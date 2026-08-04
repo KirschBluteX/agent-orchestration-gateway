@@ -36,7 +36,11 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertEqual(manifest["version"], "0.7.0")
+        self.assertEqual(manifest["version"], "0.8.0")
+        self.assertIn(
+            f'codex-cost-orchestrator/{manifest["version"]} routing-catalog',
+            text(PLUGIN / "scripts" / "routing_catalog.py"),
+        )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],

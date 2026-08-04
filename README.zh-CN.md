@@ -19,6 +19,7 @@ CCO 将经常被错误合并为“简单/复杂编程”的判断拆开：
 | Judgment | routine、complex | 闭合后是否仍有影响结果的有限选择 |
 | Placement | Primary、child | 新开原生轮次是否有结构收益 |
 | Route | 模型 + 思考强度 | 由哪个受支持组合执行 |
+| Assurance | deterministic、guarded | 现有验收事实是否允许使用经济型 worker 池 |
 | Acceptance | primary、independent | 完成需要哪类证据 |
 
 原子、确定、低风险的小修改留在 Primary。只有闭合执行、互不冲突的并行节点、上下文
@@ -33,7 +34,7 @@ CCO 将经常被错误合并为“简单/复杂编程”的判断拆开：
 任务事实 → 路由计划 → cco.v6 胶囊 → 原生 Agent
 ```
 
-- 单一 prepared-graph 入口从事实推导策略标签、捕获一份真实 workspace artifact、校验
+- 单一 prepared-graph 入口从事实推导策略与 assurance 标签、捕获一份真实 workspace artifact、校验
   完整 route plan，再按宿主可用容量选择 ready 节点，并在内存中生成全部 active 与合法
   fallback canonical capsule。
 - 不使用项目文件作为派遣临时文件。
@@ -47,17 +48,23 @@ CCO 将经常被错误合并为“简单/复杂编程”的判断拆开：
 ## 自适应模型路由
 
 用户指定的模型与思考强度始终优先。未指定时，一个本地批处理会同时解析工作图所需的
-所有 purpose × judgment 路由。路由阶段不创建 Agent，也不让 Primary 用自然语言逐个
+所有 purpose × judgment × assurance 路由。路由阶段不创建 Agent，也不让 Primary 用自然语言逐个
 比较候选。
 
 自动候选必须受当前 Codex Multi-Agent 后端支持、CodexRadar 观测 IQ 严格大于 90，并通过
-样本、同群和覆盖率检查。原生目录提供后端元数据时，CCO 只接受明确标记
-`multi_agent_version=v2` 的条目，不会依据模型名称猜测支持情况。算法使用 Wilson 区间、
+样本、同群和覆盖率检查。Luna 自动承接 complex 工作时，其 Wilson 95% 下界还必须严格
+大于 90；routine 工作仍使用点估计门槛与不确定性惩罚。原生目录提供后端元数据时，CCO 接受明确已知的多 Agent 后端版本
+（`v1` 或 `v2`），拒绝未标记条目，不会依据模型名称猜测支持情况。算法使用 Wilson 区间、
 Pareto 前沿以及质量/资源/时间/不确定性效用。
 
 worker 与 reviewer 默认优先 Luna/Terra。只有不存在合格的 Luna/Terra，或 Sol 的
 Wilson 95% 下界高于最佳 Luna/Terra 的上界时，Sol 才能自动胜出。用户明确指定 Sol 时
-始终照常执行。
+始终照常执行。Assurance 由现有验收事实推导：无声明风险、确定性覆盖完整且没有人工或
+非确定性证据时为 deterministic；guarded 路由不会自动选择 Luna，但用户固定的组合仍准确执行。
+
+若 Luna 出现有证据的执行失败、偏差或 scope surprise，CCO 会退役该 owner，并为同一工作
+创建新的 guarded generation；不会换一个 Luna effort 重试同一失败。该升级不会放宽 Sol
+必须具有明确统计优势的门槛。
 
 Radar TTL 默认为一小时。若 LKG 超过 TTL 但仍在 72 小时有效期内，CCO 会立即用它完成
 当前派遣，并刷新供后续派遣使用。fallback 只推进预排序计划的 rank，不重新评分、不重建
@@ -80,7 +87,7 @@ Primary 验收。只有真实风险、语义/人工证据、集成判断、失�
 
 ## 安全与状态
 
-胶囊绑定 purpose、judgment、route、上下文 fork、scope、合同、验收、证据、baseline、
+胶囊绑定 purpose、judgment、派生 assurance、route、上下文 fork、scope、合同、验收、证据、baseline、
 graph identity 和一个执行 generation。PreToolUse 必须找到完全匹配的 prepared artifact；
 SubagentStop 会按整张图的 scope 并集验证当前 workspace 后才记录结果。
 
@@ -122,6 +129,7 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --check --works
 
 ```powershell
 python -X utf8 -B -m unittest discover -s tests -v
+python -m ruff check plugins tests .github/scripts
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 

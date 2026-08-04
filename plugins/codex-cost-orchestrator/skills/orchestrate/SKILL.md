@@ -53,14 +53,19 @@ profile with `scripts/install_agents.py --check`; never check unused logical kin
 
 ## Adaptive route
 
-Exact user model/effort values always win. Otherwise call
-`routing_catalog.py resolve-plan` once for the whole graph.
+Exact user model/effort values always win. Otherwise derive one `assurance` value
+from each node's existing acceptance facts with `derive_route_assurance()` and call
+`routing_catalog.py resolve-plan` once for the whole graph. Every route request must
+carry that derived value; do not invent a subjective model-suitability label.
 Routing is local and invokes no model or Agent. It intersects native capabilities
 with Radar IQ strictly above 90, validates sample/cohort/coverage, and applies a
-Wilson-aware Pareto utility over quality, resource use, time, and uncertainty. For a
-Multi-Agent V2 task, the live bundled catalog contributes only entries explicitly
-marked `multi_agent_version=v2`; an older Luna or any unmarked model is not guessed
-to be spawnable and automatically returns when its live metadata becomes V2.
+Wilson-aware Pareto utility over quality, resource use, time, and uncertainty. When
+backend metadata is present, explicitly known `multi_agent_version=v1` and `v2`
+entries are eligible; unmarked or unknown versions are not guessed to be spawnable.
+Deterministic routine assurance permits Luna/Terra competition. A deterministic
+complex route admits Luna only when its Wilson lower bound is also strictly above
+the IQ floor. Guarded assurance excludes Luna from automatic selection; an exact
+user-fixed pair remains authoritative.
 
 Prefer eligible Luna/Terra for workers and reviewers. Admit Sol as the automatic
 leader only when no eligible Luna/Terra exists or Sol's Wilson lower bound is strictly
@@ -98,7 +103,7 @@ or a long native protection timeout.
 
 ## Capsule and lifecycle
 
-The capsule binds purpose, judgment, mode, contract, route, baseline, graph identity,
+The capsule binds purpose, judgment, derived assurance, mode, contract, route, baseline, graph identity,
 typed scopes, acceptance/evidence when applicable, context fork, one `generation`,
 and one continuation `cursor`. PreToolUse also resolves the exact prepared workspace
 artifact and binds its whole-graph scopes into the ledger. SubagentStop verifies the
@@ -116,6 +121,9 @@ runtime.
 Do not use fixed retry/follow-up limits. Continue or create a newer generation only
 when new actionable evidence changes the intervention. Normalize failure signatures;
 never repeat an unchanged failed prompt. Retire/fence the old owner before transfer.
+An evidence-backed Luna execution failure, deviation, or scope surprise must add the
+corresponding acceptance event and use a newer guarded generation; do not continue or
+retry another Luna effort for that failure. Do not waive the Sol advantage gate.
 
 ## Verify and accept
 

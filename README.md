@@ -22,6 +22,7 @@ complex coding”:
 | Judgment | routine, complex | Whether bounded choices can affect the result |
 | Placement | Primary, child | Whether another native turn adds structural value |
 | Route | model + effort | Which supported pair executes the closed task |
+| Assurance | deterministic, guarded | Whether existing acceptance facts permit the economical worker pool |
 | Acceptance | primary, independent | Which evidence is required to finish |
 
 An atomic deterministic edit stays in Primary. A child is created only for closed
@@ -37,7 +38,7 @@ Normal dispatch is one local graph compile followed by native spawns:
 authoring facts → route plan → cco.v6 capsule → native Agent
 ```
 
-- The single prepared-graph entry derives policy labels from facts, captures one real
+- The single prepared-graph entry derives policy and assurance labels from facts, captures one real
   workspace artifact, validates the whole route plan, selects ready nodes at observed
   native capacity, and builds every active and legal fallback capsule in memory.
 - Project files are never used as dispatch scratch space.
@@ -53,18 +54,30 @@ authoring facts → route plan → cco.v6 capsule → native Agent
 ## Adaptive routing
 
 User-selected model and reasoning effort always win. Otherwise, one local batch
-resolves every purpose/judgment route required by the graph. Routing never invokes
+resolves every purpose/judgment/assurance route required by the graph. Routing never invokes
 an Agent or asks Primary to compare candidates in natural language.
 
 Automatic candidates must be supported by the current Codex Multi-Agent backend,
 have observed CodexRadar IQ strictly above 90, and pass sample/cohort/coverage
-checks. When the native catalog exposes backend metadata, CCO accepts only entries
-marked `multi_agent_version=v2`; it never guesses support from a model name. A
-Wilson-aware Pareto utility balances quality, resource use, time, and uncertainty.
+checks. An automatic Luna candidate for complex work must also have a Wilson 95%
+lower bound strictly above 90; routine work keeps the point-estimate gate and
+uncertainty penalty. When the native catalog exposes backend metadata, CCO accepts explicitly known
+multi-agent backend versions (`v1` or `v2`) and rejects unmarked entries; it never
+guesses support from a model name. A Wilson-aware Pareto utility balances quality,
+resource use, time, and uncertainty.
 
 Luna and Terra are preferred for workers and reviewers. Sol may automatically win
 only when no eligible Luna/Terra exists or Sol’s Wilson 95% lower bound is above the
 best eligible Luna/Terra upper bound. A user-fixed Sol route is always honored.
+
+Assurance is derived from existing acceptance facts. A deterministic route has no
+declared risk, complete deterministic coverage, and no non-deterministic evidence;
+guarded routes remove Luna from automatic selection. An explicit user-fixed pair
+remains exact.
+
+An evidence-backed Luna execution failure, deviation, or scope surprise retires that
+owner and creates a newer guarded generation; another Luna effort is not retried for
+the same failure. This escalation does not waive the strict Sol advantage gate.
 
 The Radar TTL is one hour. If a bounded last-known-good snapshot is older than the
 TTL, CCO dispatches immediately from it and refreshes for a later dispatch. Route
@@ -93,7 +106,7 @@ retry counters are not carried through every packet.
 
 ## Safety and state
 
-The capsule binds purpose, judgment, route, context fork, scopes, contract,
+The capsule binds purpose, judgment, derived assurance, route, context fork, scopes, contract,
 acceptance, evidence, baseline, graph identity, and one execution generation.
 PreToolUse requires the matching prepared artifact; SubagentStop verifies the current
 workspace against the whole graph's scope union before recording a result.
@@ -139,6 +152,7 @@ are reloaded. Then describe an ordinary implementation request; explicit
 
 ```powershell
 python -X utf8 -B -m unittest discover -s tests -v
+python -m ruff check plugins tests .github/scripts
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 

@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Cost Orchestrator"
   short_description: "Implicitly route analysis, implementation, and acceptance"
-  default_prompt: "Classify purpose and judgment, choose Primary or a bounded adaptive child, then verify the exact resulting state."
+  default_prompt: "Classify purpose and judgment, derive assurance from acceptance facts, choose Primary or a bounded adaptive child, then verify the exact resulting state."
 
 policy:
   allow_implicit_invocation: true

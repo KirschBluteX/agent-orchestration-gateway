@@ -1,6 +1,6 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Implicit purpose-aware Codex orchestration with adaptive model-neutral routing, compact cco.v6 capsules, single-flight ownership, and exact-state acceptance.",
   "author": {
     "name": "KirschQAQ",
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Cost Orchestrator",
     "shortDescription": "Purpose-aware adaptive agents with exact-state acceptance.",
-    "longDescription": "Codex Cost Orchestrator implicitly controls visible subagent spawns, separates purpose, judgment, placement, model/effort routing, and acceptance, and keeps Primary authoritative. Users may select any supported worker or reviewer route; otherwise an IQ-gated policy prefers eligible Luna/Terra and admits Sol only for a clear intelligence advantage. A single prepared-graph entry, compact cco.v6 capsules, live Multi-Agent backend filtering, model-neutral read/write leaves, native-capacity parallelism, generation fencing, event-driven waiting, and exact-state workspace evidence protect completion without a second Agent runtime or billing/token history.",
+    "longDescription": "Codex Cost Orchestrator implicitly controls visible subagent spawns, separates purpose, judgment, derived assurance, placement, model/effort routing, and acceptance, and keeps Primary authoritative. Users may select any supported worker or reviewer route; otherwise an IQ-gated policy allows Luna for deterministic routine work and statistically confident deterministic complex work, guards risky or semantic work with the stronger pool, and admits Sol only for a clear intelligence advantage. A single prepared-graph entry, compact cco.v6 capsules, native Multi-Agent capability filtering, model-neutral read/write leaves, native-capacity parallelism, generation fencing, event-driven waiting, and exact-state workspace evidence protect completion without a second Agent runtime or billing/token history.",
     "developerName": "KirschQAQ",
     "category": "Productivity",
     "capabilities": [

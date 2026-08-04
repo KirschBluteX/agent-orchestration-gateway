@@ -192,6 +192,28 @@ class DecisionKernelTests(unittest.TestCase):
 
         self.assertEqual(decision, {"mode": "primary", "reasons": []})
 
+    def test_route_assurance_is_derived_from_existing_acceptance_facts(self) -> None:
+        facts = {
+            "acceptance_ids": ["A01"],
+            "deterministic_graph_coverage": ["A01"],
+            "events": ["explicit_independent_review"],
+            "required_verification_strengths": ["deterministic"],
+            "risk_assessment": self.complete_risks(),
+        }
+
+        self.assertEqual(
+            self.policy.derive_route_assurance(**facts),
+            "deterministic",
+        )
+        facts["events"] = ["failure"]
+        self.assertEqual(self.policy.derive_route_assurance(**facts), "guarded")
+        facts["events"] = []
+        facts["required_verification_strengths"] = ["manual"]
+        self.assertEqual(self.policy.derive_route_assurance(**facts), "guarded")
+        facts["required_verification_strengths"] = ["deterministic"]
+        facts["risk_assessment"]["security"] = "yes"
+        self.assertEqual(self.policy.derive_route_assurance(**facts), "guarded")
+
     def test_primary_owned_change_uses_model_neutral_acceptance_language(self) -> None:
         decision = self.policy.derive_acceptance(
             acceptance_ids=["A01"],

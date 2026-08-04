@@ -1389,7 +1389,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                 result["violations"], ["outside_lease:src/owned.txt"]
             )
 
-    def test_v2_baseline_requires_every_security_identity_field(self) -> None:
+    def test_v3_baseline_requires_every_security_identity_field(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -1426,7 +1426,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             )
 
             self.assertEqual(verify.returncode, 2)
-            self.assertIn("required fields", verify.stderr)
+            self.assertIn("exact v3 required fields", verify.stderr)
 
     def test_already_dirty_submodule_content_remains_observed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

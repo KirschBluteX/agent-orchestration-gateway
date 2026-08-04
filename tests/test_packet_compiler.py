@@ -51,9 +51,11 @@ def route(model: str = "gpt-5.6-luna", effort: str = "max") -> dict[str, object]
     ):
         routes.append(
             {
+                "assurance": "deterministic",
                 "candidates": [dict(candidate)],
                 "decision_sha256": "sha256:" + "d" * 64,
                 "dispatch": {"rank": 1, "rejection_tickets": []},
+                "fixed": True,
                 "judgment": judgment,
                 "placement": placement,
                 "purpose": purpose,
@@ -63,7 +65,7 @@ def route(model: str = "gpt-5.6-luna", effort: str = "max") -> dict[str, object]
     plan: dict[str, object] = {
         "native_catalog_sha256": "sha256:" + "e" * 64,
         "needs_refresh": False,
-        "protocol": "cco.route-plan.v1",
+        "protocol": "cco.route-plan.v2",
         "routes": routes,
     }
     plan["plan_sha256"] = route_plan_sha256(plan)

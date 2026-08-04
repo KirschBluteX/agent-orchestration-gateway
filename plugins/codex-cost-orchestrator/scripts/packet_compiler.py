@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from decision_policy import (
     DecisionPolicyError,
+    ROUTE_ASSURANCES,
     normalize_dispatch_decision,
     select_ready_nodes,
 )
@@ -159,6 +160,7 @@ def _route_binding(value: object) -> dict[str, Any]:
 def _route_from_plan(
     plan_value: object,
     *,
+    assurance: str,
     purpose: str,
     judgment: str,
 ) -> dict[str, Any]:
@@ -169,7 +171,9 @@ def _route_from_plan(
     matches = [
         route
         for route in plan["routes"]
-        if route["purpose"] == purpose and route["judgment"] == judgment
+        if route["purpose"] == purpose
+        and route["judgment"] == judgment
+        and route["assurance"] == assurance
     ]
     if len(matches) != 1:
         raise CapsuleError("route plan key is missing or ambiguous")
@@ -345,6 +349,9 @@ def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
     cursor = _integer(spec.get("cursor", 0), "spec.cursor")
     mode = spec.get("mode", "fresh" if kind == "review" else ("strict" if spec.get("strict") else "light"))
     mode = _enum(mode, MODES, "spec.mode")
+    assurance = _enum(
+        spec.get("assurance", "deterministic"), ROUTE_ASSURANCES, "spec.assurance"
+    )
     contract = _canonical(spec.get("contract"), "spec.contract")
     execution = {
         "cursor": cursor,
@@ -359,7 +366,10 @@ def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
         ),
     }
     route = _route_from_plan(
-        spec.get("route_plan"), purpose=purpose, judgment=judgment
+        spec.get("route_plan"),
+        assurance=assurance,
+        purpose=purpose,
+        judgment=judgment,
     )
     role = _role_for(purpose)
     capsule: dict[str, Any] = {
@@ -391,6 +401,8 @@ def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
             capsule["decision"] = normalize_dispatch_decision(
                 spec["decision"], selected_model=route["selected"]["model"]
             )
+            if capsule["decision"]["derived"]["assurance"] != assurance:
+                raise CapsuleError("spec assurance does not match decision facts")
         except DecisionPolicyError as error:
             raise CapsuleError(f"spec.decision is invalid: {error}") from error
     if kind == "review":

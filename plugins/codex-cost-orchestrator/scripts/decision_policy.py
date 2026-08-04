@@ -55,6 +55,7 @@ RISK_CATEGORIES = tuple(
 )
 RISK_ANSWERS = frozenset({"no", "yes"})
 VERIFICATION_STRENGTHS = frozenset({"deterministic", "manual", "nondeterministic"})
+ROUTE_ASSURANCES = frozenset({"deterministic", "guarded"})
 ACCEPTANCE_EVENTS = frozenset(
     {
         "concurrent_execution",
@@ -291,6 +292,27 @@ def derive_acceptance(
     }
 
 
+def derive_route_assurance(
+    *,
+    risk_assessment: object,
+    required_verification_strengths: object,
+    acceptance_ids: object,
+    deterministic_graph_coverage: object,
+    events: object,
+) -> str:
+    """Derive model eligibility from the acceptance facts already in the contract."""
+
+    acceptance = derive_acceptance(
+        risk_assessment=risk_assessment,
+        required_verification_strengths=required_verification_strengths,
+        acceptance_ids=acceptance_ids,
+        deterministic_graph_coverage=deterministic_graph_coverage,
+        events=events,
+    )
+    guarded_reasons = set(acceptance["reasons"]) - {"explicit_independent_review"}
+    return "guarded" if guarded_reasons else "deterministic"
+
+
 def normalize_dispatch_decision(
     value: object,
     *,
@@ -336,6 +358,7 @@ def normalize_dispatch_decision(
     if not isinstance(acceptance_facts, Mapping) or set(acceptance_facts) != acceptance_fields:
         raise DecisionPolicyError("dispatch acceptance facts are malformed")
     acceptance = derive_acceptance(**acceptance_facts)
+    assurance = derive_route_assurance(**acceptance_facts)
 
     placement_facts = value["placement"]
     if not isinstance(placement_facts, Mapping) or set(placement_facts) != {
@@ -356,6 +379,7 @@ def normalize_dispatch_decision(
     derived = value["derived"]
     expected_derived = {
         "acceptance": acceptance,
+        "assurance": assurance,
         "judgment": judgment,
         "placement": placement,
         "purpose": purpose,

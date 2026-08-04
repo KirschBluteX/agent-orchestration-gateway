@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -18,9 +19,13 @@ sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 import agent_preflight  # noqa: E402
 import ledger_runtime  # noqa: E402
 import subagent_stop  # noqa: E402
-from graph_compiler import prepare_dispatch_graph, verify_prepared_graph  # noqa: E402
+from graph_compiler import (  # noqa: E402
+    GraphCompilerError,
+    prepare_dispatch_graph,
+    verify_prepared_graph,
+)
 from packet_compiler import compile_continuation, compile_result, parse_message  # noqa: E402
-from routing_catalog import route_plan_sha256  # noqa: E402
+from routing_catalog import resolve_route_plan, route_plan_sha256  # noqa: E402
 from tests.v6_test_support import closed_graph_node, fixed_route_plan  # noqa: E402
 
 
@@ -33,12 +38,75 @@ class GraphCompilerBehaviorTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             (repo / "src").mkdir()
             (repo / "src" / "owned.txt").write_text("baseline\n", encoding="utf-8")
-            plan = fixed_route_plan(judgment="complex")
-            plan["routes"][0]["candidates"] = [
-                {"effort": "max", "model": "gpt-5.6-luna"},
-                {"effort": "max", "model": "gpt-5.6-terra"},
-            ]
-            plan["plan_sha256"] = route_plan_sha256(plan)
+            plan = resolve_route_plan(
+                [
+                    {
+                        "assurance": "deterministic",
+                        "judgment": "complex",
+                        "placement_benefits": [
+                            {
+                                "evidence": ["contract:fallback"],
+                                "kind": "closed_execution",
+                            }
+                        ],
+                        "purpose": "implementation",
+                    }
+                ],
+                {
+                    "fingerprint": "a" * 64,
+                    "history": {},
+                    "method": {"iq": "latest valid result per task; pass_rate * 150"},
+                    "metrics_source": "https://api.codexradar.com/api/v1/model-metrics",
+                    "models": 2,
+                    "points": [
+                        {
+                            "average_minutes": 30.0,
+                            "average_price_usd": 0.5,
+                            "duration_samples": 100,
+                            "effort": "max",
+                            "incomplete_cost_samples": 0,
+                            "iq": 108.0,
+                            "latest_graded_at": "2026-08-03T09:00:00+00:00",
+                            "model": "gpt-5.6-luna",
+                            "passed": 72,
+                            "price_samples": 100,
+                            "total_runs": 300,
+                            "valid_tasks": 100,
+                        },
+                        {
+                            "average_minutes": 25.0,
+                            "average_price_usd": 4.0,
+                            "duration_samples": 100,
+                            "effort": "max",
+                            "incomplete_cost_samples": 0,
+                            "iq": 109.5,
+                            "latest_graded_at": "2026-08-03T09:00:00+00:00",
+                            "model": "gpt-5.6-terra",
+                            "passed": 73,
+                            "price_samples": 100,
+                            "total_runs": 300,
+                            "valid_tasks": 100,
+                        },
+                    ],
+                    "schema": 2,
+                    "source": "https://api.codexradar.com/api/v1/table",
+                    "source_updated_at": "2026-08-03T09:00:00+00:00",
+                    "type": "distributed_intelligence_efficiency",
+                },
+                {
+                    "models": [
+                        {
+                            "slug": "gpt-5.6-luna",
+                            "supported_reasoning_levels": [{"effort": "max"}],
+                        },
+                        {
+                            "slug": "gpt-5.6-terra",
+                            "supported_reasoning_levels": [{"effort": "max"}],
+                        },
+                    ]
+                },
+                now=datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+            )
             with mock.patch.dict(
                 os.environ,
                 {
@@ -390,6 +458,104 @@ class GraphCompilerBehaviorTests(unittest.TestCase):
 
             self.assertEqual(continuation_outcome["decision"], "block")
             self.assertIn("baseline", continuation_outcome["reason"])
+
+    def test_graph_derives_assurance_and_binds_each_node_to_its_exact_route(self) -> None:
+        deterministic = closed_graph_node(
+            node="n01_deterministic",
+            path="src/deterministic.txt",
+            responsibility="deterministic-file",
+        )
+        guarded = closed_graph_node(
+            node="n02_guarded",
+            path="src/guarded.txt",
+            responsibility="guarded-file",
+        )
+        guarded["acceptance_facts"]["risk_assessment"]["security"] = "yes"
+        benefits = [{"evidence": ["contract:test"], "kind": "closed_execution"}]
+        plan = resolve_route_plan(
+            [
+                {
+                    "assurance": "deterministic",
+                    "fixed_effort": "max",
+                    "fixed_model": "gpt-5.6-luna",
+                    "judgment": "complex",
+                    "placement_benefits": benefits,
+                    "purpose": "implementation",
+                },
+                {
+                    "assurance": "guarded",
+                    "fixed_effort": "max",
+                    "fixed_model": "gpt-5.6-terra",
+                    "judgment": "complex",
+                    "placement_benefits": benefits,
+                    "purpose": "implementation",
+                },
+            ],
+            {},
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                ]
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            (repo / "src" / "deterministic.txt").write_text(
+                "one\n", encoding="utf-8"
+            )
+            (repo / "src" / "guarded.txt").write_text("two\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CCO_LEDGER_DIR": str(root / "ledger"),
+                    "CODEX_THREAD_ID": "assurance-session",
+                },
+            ):
+                mismatched = json.loads(json.dumps(plan))
+                mismatched["routes"] = [
+                    route
+                    for route in mismatched["routes"]
+                    if route["assurance"] == "deterministic"
+                ]
+                mismatched["plan_sha256"] = route_plan_sha256(mismatched)
+                with self.assertRaisesRegex(
+                    GraphCompilerError, "exact derived route key"
+                ):
+                    prepare_dispatch_graph(
+                        [guarded],
+                        route_plan=mismatched,
+                        native_capacity=1,
+                        repo=repo,
+                    )
+                prepared = prepare_dispatch_graph(
+                    [deterministic, guarded],
+                    route_plan=plan,
+                    native_capacity=2,
+                    repo=repo,
+                )
+
+        self.assertEqual(
+            {
+                parse_message(item["message"])["node"]: item["model"]
+                for item in prepared["dispatches"]
+            },
+            {
+                "n01_deterministic": "gpt-5.6-luna",
+                "n02_guarded": "gpt-5.6-terra",
+            },
+        )
 
 
 if __name__ == "__main__":

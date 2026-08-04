@@ -20,10 +20,11 @@ may advance only to the next request precompiled in the prepared graph. Never re
 Radar or rebuild a capsule after that rejection, and never silently substitute after
 a usable owner exists.
 
-The native loader mirrors Codex Multi-Agent V2: when bundled entries expose backend
-metadata, only `multi_agent_version=v2` is eligible. Do not infer support from a model
-name, Radar presence, or a v1/unmarked bundled entry. This filter is dynamic, so a
-model automatically returns when the installed Codex catalog marks it V2.
+When bundled entries expose backend metadata, explicitly known
+`multi_agent_version=v1` and `v2` entries are eligible. Do not infer support from a
+model name, Radar presence, or an unmarked/unknown entry. The native spawn response
+remains the final route evidence; adaptive rejection can use only the prepared
+fallback.
 
 Use the native spawn response as route evidence when it exposes role/model/effort.
 Only when a required dimension is absent—or before claiming OS read-only—run
@@ -79,6 +80,9 @@ required.
 - Pre-thread adaptive rejection: advance one bound candidate and rejection ticket.
 - Resident owner missing information: one evidence-bearing continuation cursor.
 - Completed, cold, fenced, or materially changed work: newer full generation.
+- Evidence-backed Luna execution failure, deviation, or scope surprise: retire it,
+  record the event, and compile a newer guarded generation; do not try another Luna
+  effort, and do not waive the Sol advantage gate.
 - Repeated failure signature: require a materially different intervention.
 - Auth, policy, sandbox, or malformed-request failure: do not auto-retry.
 - Scope surprise: preserve state, retire owner, and reclose the contract/baseline.

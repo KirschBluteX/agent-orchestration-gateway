@@ -88,6 +88,7 @@ def fixed_route_plan(
     effort: str = "max",
 ) -> dict[str, object]:
     request: dict[str, object] = {
+        "assurance": "deterministic",
         "fixed_effort": effort,
         "fixed_model": model,
         "judgment": judgment,
@@ -167,6 +168,7 @@ def dispatch_decision(
         "closure": closure,
         "derived": {
             "acceptance": acceptance,
+            "assurance": "deterministic",
             "judgment": judgment,
             "placement": placement,
             "purpose": purpose,

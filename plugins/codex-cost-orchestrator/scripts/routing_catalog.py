@@ -26,17 +26,19 @@ from urllib.request import Request, urlopen
 from decision_policy import (
     DecisionPolicyError,
     PLACEMENT_BENEFITS,
+    ROUTE_ASSURANCES,
     normalize_placement_benefits,
     select_placement as select_policy_placement,
 )
 
 
 PROTOCOL = "cco.routing.v1"
-ROUTE_PLAN_PROTOCOL = "cco.route-plan.v1"
-ROUTE_PLAN_DOMAIN = b"cco.route-plan.v1\0"
+ROUTE_DECISION_PROTOCOL = "cco.routing-decision.v2"
+ROUTE_PLAN_PROTOCOL = "cco.route-plan.v2"
+ROUTE_PLAN_DOMAIN = b"cco.route-plan.v2\0"
 SNAPSHOT_DOMAIN = b"cco.routing-snapshot.v1\0"
 MEASUREMENT_DOMAIN = b"cco.routing-measurement.v1\0"
-DECISION_DOMAIN = b"cco.routing-decision.v1\0"
+DECISION_DOMAIN = b"cco.routing-decision.v2\0"
 NATIVE_CATALOG_DOMAIN = b"cco.routing-native-catalog.v1\0"
 POLICY_DOMAIN = b"cco.routing-policy.v1\0"
 RADAR_URL = "https://codexradar.com/data/intelligence-efficiency.json"
@@ -61,6 +63,7 @@ LANES = frozenset({"routine", "complex"})
 PURPOSES = frozenset(
     {"analysis_inspect", "analysis_probe", "implementation", "acceptance"}
 )
+NATIVE_MULTI_AGENT_VERSIONS = frozenset({"v1", "v2"})
 CACHE_PROTOCOL = "cco.routing-cache.v1"
 CACHE_FILENAME = "radar-lkg-v1.json"
 CACHE_TEMP_GLOB = "radar-lkg-v1.*.tmp"
@@ -203,7 +206,7 @@ def fetch_radar(
 ) -> FetchResult:
     headers = {
         "Accept": "application/json",
-        "User-Agent": "codex-cost-orchestrator/0.6 routing-catalog",
+        "User-Agent": "codex-cost-orchestrator/0.8.0 routing-catalog",
     }
     if etag is not None:
         if not etag or len(etag) > 256 or "\r" in etag or "\n" in etag:
@@ -312,7 +315,10 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
             or MODEL_RE.fullmatch(model["slug"]) is None
         ):
             raise RoutingCatalogError("native model catalog is malformed")
-        if backend_annotated and model.get("multi_agent_version") != "v2":
+        if (
+            backend_annotated
+            and model.get("multi_agent_version") not in NATIVE_MULTI_AGENT_VERSIONS
+        ):
             continue
         levels = model.get("supported_reasoning_levels")
         if not isinstance(levels, list) or not 1 <= len(levels) <= 32:
@@ -939,6 +945,10 @@ def _preferred_family(model: str) -> bool:
     return "luna" in lowered or "terra" in lowered
 
 
+def _luna_family(model: str) -> bool:
+    return "luna" in model.casefold()
+
+
 def _sol_family(model: str) -> bool:
     return "sol" in model.casefold()
 
@@ -959,6 +969,46 @@ def apply_model_preference_gate(
         for candidate in candidates
         if not _sol_family(candidate["model"])
         or candidate["iq_lower_95"] > best_preferred_upper
+    ]
+
+
+def apply_route_assurance_gate(
+    candidates: list[dict[str, Any]],
+    *,
+    assurance: str,
+    fixed_model: str | None,
+) -> list[dict[str, Any]]:
+    """Keep Luna for deterministic work and require a stronger automatic pool otherwise."""
+
+    if assurance not in ROUTE_ASSURANCES:
+        raise RoutingCatalogError("route assurance is invalid")
+    if assurance == "deterministic" or fixed_model is not None:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if not _luna_family(candidate["model"])
+    ]
+
+
+def apply_judgment_confidence_gate(
+    candidates: list[dict[str, Any]],
+    *,
+    judgment: str,
+    fixed_model: str | None,
+    minimum_iq: float,
+) -> list[dict[str, Any]]:
+    """Require high-confidence Luna evidence for bounded-effect work."""
+
+    if judgment not in LANES:
+        raise RoutingCatalogError("routing judgment is invalid")
+    if judgment == "routine" or fixed_model is not None:
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if not _luna_family(candidate["model"])
+        or candidate["iq_lower_95"] > minimum_iq
     ]
 
 
@@ -1052,6 +1102,7 @@ def policy_sha256(
     judgment: str,
     policy: dict[str, float],
     *,
+    assurance: str,
     purpose: str,
     fixed_model: str | None,
     fixed_effort: str | None,
@@ -1059,6 +1110,7 @@ def policy_sha256(
     primary_effort: str | None,
 ) -> str:
     preimage = {
+        "assurance": assurance,
         "fixed_effort": fixed_effort,
         "fixed_model": fixed_model,
         "judgment": judgment,
@@ -1234,6 +1286,7 @@ def _fixed_route_hash(label: str, pair: tuple[str, str]) -> str:
 def _fixed_user_pair_decision(
     *,
     native_catalog: object,
+    assurance: str,
     purpose: str,
     judgment: str,
     fixed_model: str,
@@ -1260,7 +1313,8 @@ def _fixed_user_pair_decision(
     )
     selected = {"model": fixed_model, "effort": fixed_effort}
     decision = {
-        "protocol": PROTOCOL,
+        "assurance": assurance,
+        "protocol": ROUTE_DECISION_PROTOCOL,
         "lane": judgment,
         "purpose": purpose,
         "judgment": judgment,
@@ -1276,6 +1330,7 @@ def _fixed_user_pair_decision(
         "policy_sha256": policy_sha256(
             judgment,
             policy,
+            assurance=assurance,
             purpose=purpose,
             fixed_model=fixed_model,
             fixed_effort=fixed_effort,
@@ -1310,6 +1365,7 @@ def resolve_route(
     native_catalog: object,
     lane: str | None = None,
     *,
+    assurance: str = "deterministic",
     purpose: str | None = None,
     judgment: str | None = None,
     now: datetime | None = None,
@@ -1323,6 +1379,8 @@ def resolve_route(
     resolved_purpose, resolved_judgment = route_dimensions(
         lane, purpose=purpose, judgment=judgment
     )
+    if assurance not in ROUTE_ASSURANCES:
+        raise RoutingCatalogError("route assurance is invalid")
     current = now or datetime.now(timezone.utc)
     # A fully user-fixed pair is a native capability assertion.  It must not
     # fetch, parse, score, or otherwise depend on Radar availability.
@@ -1335,6 +1393,7 @@ def resolve_route(
                 raise RoutingCatalogError(f"{label} must be a non-empty string")
         return _fixed_user_pair_decision(
             native_catalog=native_catalog,
+            assurance=assurance,
             purpose=resolved_purpose,
             judgment=resolved_judgment,
             fixed_model=fixed_model,
@@ -1384,6 +1443,21 @@ def resolve_route(
     ]
     if not eligible:
         raise RoutingCatalogError("no candidate has sufficiently comparable metric coverage")
+    eligible = apply_route_assurance_gate(
+        eligible,
+        assurance=assurance,
+        fixed_model=fixed_model,
+    )
+    if not eligible:
+        raise RoutingCatalogError("no candidate satisfies the route assurance gate")
+    eligible = apply_judgment_confidence_gate(
+        eligible,
+        judgment=resolved_judgment,
+        fixed_model=fixed_model,
+        minimum_iq=policy["minimum_iq_exclusive"],
+    )
+    if not eligible:
+        raise RoutingCatalogError("no candidate satisfies the judgment confidence gate")
     eligible = apply_model_preference_gate(eligible, fixed_model=fixed_model)
     if not eligible:
         raise RoutingCatalogError("no candidate satisfies the model preference gate")
@@ -1426,6 +1500,7 @@ def resolve_route(
     policy_identity = policy_sha256(
         resolved_judgment,
         policy,
+        assurance=assurance,
         purpose=resolved_purpose,
         fixed_model=fixed_model,
         fixed_effort=fixed_effort,
@@ -1433,7 +1508,8 @@ def resolve_route(
         primary_effort=primary_effort,
     )
     decision = {
-        "protocol": PROTOCOL,
+        "assurance": assurance,
+        "protocol": ROUTE_DECISION_PROTOCOL,
         "lane": resolved_judgment,
         "purpose": resolved_purpose,
         "judgment": resolved_judgment,
@@ -1490,8 +1566,9 @@ def _normalize_route_plan_requests(value: object) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not value:
         raise RoutingCatalogError("route plan requests must be a non-empty list")
     normalized: list[dict[str, Any]] = []
-    keys: set[tuple[str, str]] = set()
+    keys: set[tuple[str, str, str]] = set()
     allowed = {
+        "assurance",
         "fixed_effort",
         "fixed_model",
         "judgment",
@@ -1508,12 +1585,20 @@ def _normalize_route_plan_requests(value: object) -> list[dict[str, Any]]:
             purpose=request.get("purpose"),
             judgment=request.get("judgment"),
         )
-        key = (purpose, judgment)
+        if "assurance" not in request:
+            raise RoutingCatalogError(
+                f"route plan request {index} requires derived assurance"
+            )
+        assurance = request["assurance"]
+        if assurance not in ROUTE_ASSURANCES:
+            raise RoutingCatalogError(f"route plan request {index} assurance is invalid")
+        key = (purpose, judgment, assurance)
         if key in keys:
-            raise RoutingCatalogError("route plan contains a duplicate purpose/judgment key")
+            raise RoutingCatalogError("route plan contains a duplicate route key")
         keys.add(key)
         normalized.append(
             {
+                "assurance": assurance,
                 "fixed_effort": request.get("fixed_effort"),
                 "fixed_model": request.get("fixed_model"),
                 "judgment": judgment,
@@ -1525,7 +1610,7 @@ def _normalize_route_plan_requests(value: object) -> list[dict[str, Any]]:
         )
     return sorted(
         normalized,
-        key=lambda item: (item["purpose"], item["judgment"]),
+        key=lambda item: (item["purpose"], item["judgment"], item["assurance"]),
     )
 
 
@@ -1535,9 +1620,11 @@ def _compact_route(decision: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(candidates, list) or not isinstance(selected, dict):
         raise RoutingCatalogError("route decision cannot be compacted")
     return {
+        "assurance": decision["assurance"],
         "candidates": [dict(candidate) for candidate in candidates[:3]],
         "decision_sha256": decision["decision_sha256"],
         "dispatch": {"rank": 1, "rejection_tickets": []},
+        "fixed": decision.get("selection_method") == "fixed_user_pair_native_capability",
         "judgment": decision["judgment"],
         "placement": decision["placement"],
         "purpose": decision["purpose"],
@@ -1554,7 +1641,7 @@ def _resolve_route_plan_with_state(
     needs_refresh: bool = False,
     state: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Resolve several purpose/judgment routes in one deterministic local batch."""
+    """Resolve several purpose/judgment/assurance routes in one local batch."""
 
     current = now or datetime.now(timezone.utc)
     normalized_requests = _normalize_route_plan_requests(requests)
@@ -1591,6 +1678,7 @@ def _resolve_route_plan_with_state(
         decision = resolve_route(
             normalized_radar,
             normalized_native,
+            assurance=request["assurance"],
             purpose=request["purpose"],
             judgment=request["judgment"],
             fixed_model=request["fixed_model"],
@@ -1608,9 +1696,7 @@ def _resolve_route_plan_with_state(
         "protocol": ROUTE_PLAN_PROTOCOL,
         "routes": routes,
     }
-    plan["plan_sha256"] = "sha256:" + hashlib.sha256(
-        b"cco.route-plan.v1\0" + canonical_bytes(plan)
-    ).hexdigest()
+    plan["plan_sha256"] = route_plan_sha256(plan)
     if next_state is None:  # requests is non-empty, kept for type narrowing
         next_state = {"protocol": STATE_PROTOCOL, "lanes": {}}
     return plan, next_state
@@ -1624,7 +1710,7 @@ def resolve_route_plan(
     now: datetime | None = None,
     needs_refresh: bool = False,
 ) -> dict[str, Any]:
-    """Resolve several purpose/judgment routes in one deterministic local batch."""
+    """Resolve several purpose/judgment/assurance routes in one local batch."""
 
     plan, _state = _resolve_route_plan_with_state(
         requests,
@@ -1697,15 +1783,22 @@ def resolve_graph_route_plan(
     return plan, loaded
 
 
+def routing_state_key(purpose: str, judgment: str, assurance: str) -> str:
+    if purpose not in PURPOSES or judgment not in LANES or assurance not in ROUTE_ASSURANCES:
+        raise RoutingCatalogError("routing state key is invalid")
+    return f"{purpose}:{judgment}:{assurance}"
+
+
 def stabilize_route(
     recommendation: dict[str, Any], state: dict[str, Any] | None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     lane = recommendation.get("lane")
     purpose = recommendation.get("purpose")
     judgment = recommendation.get("judgment")
+    assurance = recommendation.get("assurance")
     if lane not in LANES:
         raise RoutingCatalogError("route recommendation lane is invalid")
-    if purpose not in PURPOSES or judgment != lane:
+    if purpose not in PURPOSES or judgment != lane or assurance not in ROUTE_ASSURANCES:
         raise RoutingCatalogError("route recommendation purpose or judgment is invalid")
     if recommendation.get("decision_sha256") != route_decision_sha256(recommendation):
         raise RoutingCatalogError("route recommendation hash mismatch")
@@ -1721,7 +1814,7 @@ def stabilize_route(
             next_state: dict[str, Any] = {"protocol": STATE_PROTOCOL, "lanes": {}}
         else:
             next_state = json.loads(json.dumps(validate_routing_state(state)))
-        state_key = lane if purpose == "implementation" else f"{purpose}:{lane}"
+        state_key = routing_state_key(purpose, lane, assurance)
         next_state["lanes"][state_key] = {
             "active": {"model": selected["model"], "effort": selected["effort"]},
             "policy_sha256": recommendation["policy_sha256"],
@@ -1774,7 +1867,7 @@ def stabilize_route(
         next_state: dict[str, Any] = {"protocol": STATE_PROTOCOL, "lanes": {}}
     else:
         next_state = json.loads(json.dumps(validate_routing_state(state)))
-    state_key = lane if purpose == "implementation" else f"{purpose}:{lane}"
+    state_key = routing_state_key(purpose, lane, assurance)
     lane_state = next_state["lanes"].get(state_key)
     status = "initialized"
     actual_candidate = recommended_candidate
@@ -1866,6 +1959,7 @@ def render_resolution(decision: dict[str, Any], *, explain: bool) -> dict[str, A
     }
     if not explain:
         return quiet
+    quiet["assurance"] = decision.get("assurance")
     eligible = decision.get("eligible_candidates")
     if not isinstance(eligible, list) or not eligible:
         raise RoutingCatalogError("routing decision has no eligible candidates")
@@ -1918,6 +2012,7 @@ def render_resolution(decision: dict[str, Any], *, explain: bool) -> dict[str, A
 def validate_route_decision(
     value: object,
     *,
+    assurance: str | None = None,
     lane: str | None = None,
     purpose: str | None = None,
     model: str | None = None,
@@ -1925,6 +2020,7 @@ def validate_route_decision(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     required = {
+        "assurance",
         "constraints",
         "decision_sha256",
         "dispatch",
@@ -1952,7 +2048,7 @@ def validate_route_decision(
     }
     if not isinstance(value, dict) or set(value) != required:
         raise RoutingCatalogError("routing decision schema is malformed")
-    if value.get("protocol") != PROTOCOL:
+    if value.get("protocol") != ROUTE_DECISION_PROTOCOL:
         raise RoutingCatalogError("routing decision protocol is invalid")
     decision_lane = value.get("lane")
     if decision_lane not in LANES or (lane is not None and decision_lane != lane):
@@ -1965,6 +2061,12 @@ def validate_route_decision(
         or (purpose is not None and decision_purpose != purpose)
     ):
         raise RoutingCatalogError("routing decision purpose or judgment is invalid")
+    decision_assurance = value.get("assurance")
+    if (
+        decision_assurance not in ROUTE_ASSURANCES
+        or (assurance is not None and decision_assurance != assurance)
+    ):
+        raise RoutingCatalogError("routing decision assurance is invalid")
     for key in (
         "decision_sha256",
         "measurement_sha256",
@@ -2026,6 +2128,7 @@ def validate_route_decision(
         expected_policy_sha = policy_sha256(
             decision_lane,
             policy,
+            assurance=decision_assurance,
             purpose=decision_purpose,
             fixed_model=constraints["fixed_model"],
             fixed_effort=constraints["fixed_effort"],
@@ -2098,6 +2201,7 @@ def validate_route_decision(
     expected_policy_sha = policy_sha256(
         decision_lane,
         policy,
+        assurance=decision_assurance,
         purpose=decision_purpose,
         fixed_model=constraints["fixed_model"],
         fixed_effort=constraints["fixed_effort"],
@@ -2149,6 +2253,24 @@ def validate_route_decision(
         raise RoutingCatalogError("routing decision candidates are not canonical")
     if value.get("eligible_count") != len(candidates):
         raise RoutingCatalogError("routing decision eligible count is invalid")
+    if (
+        decision_assurance == "guarded"
+        and constraints["fixed_model"] is None
+        and any(_luna_family(candidate["model"]) for candidate in candidates)
+    ):
+        raise RoutingCatalogError("guarded routing decision contains Luna")
+    if (
+        decision_lane == "complex"
+        and constraints["fixed_model"] is None
+        and any(
+            _luna_family(candidate["model"])
+            and candidate["iq_lower_95"] <= policy["minimum_iq_exclusive"]
+            for candidate in candidates
+        )
+    ):
+        raise RoutingCatalogError(
+            "complex routing decision contains low-confidence Luna"
+        )
     cohort_reference = max(item["valid_tasks"] for item in candidates)
     if any(
         item["valid_tasks"] / cohort_reference < MIN_COHORT_RATIO
@@ -2407,6 +2529,7 @@ def advance_route(
 def advance_route_plan(
     plan: object,
     *,
+    assurance: str = "deterministic",
     purpose: str,
     judgment: str,
     rejected_model: str,
@@ -2415,15 +2538,15 @@ def advance_route_plan(
 ) -> dict[str, Any]:
     """Advance one compact route without rescoring or rebuilding its batch."""
 
+    if assurance not in ROUTE_ASSURANCES:
+        raise RoutingCatalogError("route plan assurance is invalid")
     if not isinstance(plan, dict) or plan.get("protocol") != ROUTE_PLAN_PROTOCOL:
         raise RoutingCatalogError("route plan is malformed")
     plan_hash = plan.get("plan_sha256")
     if not isinstance(plan_hash, str) or SHA256_RE.fullmatch(plan_hash) is None:
         raise RoutingCatalogError("route plan hash is malformed")
     plan_preimage = {key: value for key, value in plan.items() if key != "plan_sha256"}
-    expected_plan_hash = "sha256:" + hashlib.sha256(
-        b"cco.route-plan.v1\0" + canonical_bytes(plan_preimage)
-    ).hexdigest()
+    expected_plan_hash = route_plan_sha256(plan_preimage)
     if plan_hash != expected_plan_hash:
         raise RoutingCatalogError("route plan hash mismatch")
     routes = plan.get("routes")
@@ -2441,10 +2564,13 @@ def advance_route_plan(
         if isinstance(route, dict)
         and route.get("purpose") == purpose
         and route.get("judgment") == judgment
+        and route.get("assurance") == assurance
     ]
     if len(matches) != 1:
         raise RoutingCatalogError("route plan key is missing or ambiguous")
     route = matches[0]
+    if route.get("fixed") is True:
+        raise RoutingCatalogError("fixed route plan cannot advance")
     candidates = route.get("candidates")
     selected = route.get("selected")
     dispatch = route.get("dispatch")
@@ -2479,9 +2605,7 @@ def advance_route_plan(
     }
     route["selected"] = dict(candidates[rank])
     updated.pop("plan_sha256")
-    updated["plan_sha256"] = "sha256:" + hashlib.sha256(
-        b"cco.route-plan.v1\0" + canonical_bytes(updated)
-    ).hexdigest()
+    updated["plan_sha256"] = route_plan_sha256(updated)
     return updated
 
 
@@ -2535,29 +2659,39 @@ def validate_route_plan(value: object) -> dict[str, Any]:
     routes = value["routes"]
     if not isinstance(routes, list) or not routes:
         raise RoutingCatalogError("route plan routes are malformed")
-    if len(routes) > len(PURPOSES) * len(LANES):
+    if len(routes) > len(PURPOSES) * len(LANES) * len(ROUTE_ASSURANCES):
         raise RoutingCatalogError("route plan has too many routes")
 
     route_fields = {
+        "assurance",
         "candidates",
         "decision_sha256",
         "dispatch",
+        "fixed",
         "judgment",
         "placement",
         "purpose",
         "selected",
     }
     normalized_routes: list[dict[str, Any]] = []
-    route_keys: list[tuple[str, str]] = []
+    route_keys: list[tuple[str, str, str]] = []
     for index, route in enumerate(routes):
         if not isinstance(route, dict) or set(route) != route_fields:
             raise RoutingCatalogError(f"route plan entry {index} is malformed")
         purpose = route["purpose"]
         judgment = route["judgment"]
-        if purpose not in PURPOSES or judgment not in LANES:
+        assurance = route["assurance"]
+        if (
+            purpose not in PURPOSES
+            or judgment not in LANES
+            or assurance not in ROUTE_ASSURANCES
+        ):
             raise RoutingCatalogError("route plan purpose or judgment is invalid")
-        key = (purpose, judgment)
+        key = (purpose, judgment, assurance)
         route_keys.append(key)
+        fixed = route["fixed"]
+        if type(fixed) is not bool:
+            raise RoutingCatalogError("route plan fixed state is malformed")
         candidates = route["candidates"]
         if (
             not isinstance(candidates, list)
@@ -2573,6 +2707,12 @@ def validate_route_plan(value: object) -> dict[str, Any]:
             normalized_candidates
         ):
             raise RoutingCatalogError("route plan candidates must be duplicate-free")
+        if (
+            assurance == "guarded"
+            and not fixed
+            and any(_luna_family(pair["model"]) for pair in normalized_candidates)
+        ):
+            raise RoutingCatalogError("guarded route plan contains Luna")
         dispatch = route["dispatch"]
         if (
             not isinstance(dispatch, dict)
@@ -2583,6 +2723,12 @@ def validate_route_plan(value: object) -> dict[str, Any]:
         ):
             raise RoutingCatalogError("route plan dispatch state is malformed")
         tickets = dispatch["rejection_tickets"]
+        if fixed and (
+            len(normalized_candidates) != 1
+            or dispatch["rank"] != 1
+            or tickets
+        ):
+            raise RoutingCatalogError("fixed route plan entry is malformed")
         if (
             any(
                 not isinstance(ticket, str)
@@ -2613,12 +2759,14 @@ def validate_route_plan(value: object) -> dict[str, Any]:
             raise RoutingCatalogError("acceptance route plan placement is invalid")
         normalized_routes.append(
             {
+                "assurance": assurance,
                 "candidates": normalized_candidates,
                 "decision_sha256": decision_sha256,
                 "dispatch": {
                     "rank": dispatch["rank"],
                     "rejection_tickets": list(tickets),
                 },
+                "fixed": fixed,
                 "judgment": judgment,
                 "placement": {
                     "reason": placement["reason"],
@@ -2643,10 +2791,16 @@ def validate_route_plan(value: object) -> dict[str, Any]:
 
 
 def validate_routing_state(value: object) -> dict[str, Any]:
-    route_keys = set(LANES) | {
+    legacy_route_keys = set(LANES) | {
         f"{purpose}:{judgment}"
         for purpose in PURPOSES - {"implementation"}
         for judgment in LANES
+    }
+    route_keys = legacy_route_keys | {
+        routing_state_key(purpose, judgment, assurance)
+        for purpose in PURPOSES
+        for judgment in LANES
+        for assurance in ROUTE_ASSURANCES
     }
     if (
         not isinstance(value, dict)
@@ -2971,6 +3125,7 @@ def resolve_graph_route(
     cache_dir: Path,
     lane: str | None = None,
     *,
+    assurance: str = "deterministic",
     purpose: str | None = None,
     judgment: str | None = None,
     now: datetime | None = None,
@@ -3009,6 +3164,7 @@ def resolve_graph_route(
         loaded.snapshot,
         native_catalog,
         lane,
+        assurance=assurance,
         purpose=purpose,
         judgment=judgment,
         now=current,
@@ -3036,6 +3192,9 @@ def parser() -> argparse.ArgumentParser:
     subparsers = root.add_subparsers(dest="command", required=True)
     resolve = subparsers.add_parser("resolve")
     resolve.add_argument("--lane", choices=sorted(LANES))
+    resolve.add_argument(
+        "--assurance", choices=sorted(ROUTE_ASSURANCES), default="deterministic"
+    )
     resolve.add_argument("--purpose", choices=sorted(PURPOSES))
     resolve.add_argument("--judgment", choices=sorted(LANES))
     resolve.add_argument("--cache-dir", type=Path, default=default_cache_dir())
@@ -3071,7 +3230,7 @@ def parser() -> argparse.ArgumentParser:
     )
     resolve_plan = subparsers.add_parser(
         "resolve-plan",
-        help="Resolve an ordered batch of purpose/judgment route requests from stdin.",
+        help="Resolve ordered purpose/judgment/assurance requests from stdin.",
     )
     resolve_plan.add_argument("--cache-dir", type=Path, default=default_cache_dir())
     resolve_plan.add_argument("--refresh-ttl-minutes", type=int, default=60)
@@ -3094,6 +3253,9 @@ def parser() -> argparse.ArgumentParser:
     )
     advance_plan.add_argument("--purpose", choices=sorted(PURPOSES), required=True)
     advance_plan.add_argument("--judgment", choices=sorted(LANES), required=True)
+    advance_plan.add_argument(
+        "--assurance", choices=sorted(ROUTE_ASSURANCES), default="deterministic"
+    )
     advance_plan.add_argument("--rejected-model", required=True)
     advance_plan.add_argument("--rejected-effort", required=True)
     advance_plan.add_argument("--rejection-ticket", required=True)
@@ -3131,6 +3293,7 @@ def main() -> int:
             plan = load_json_bytes(raw, "route plan input")
             advanced = advance_route_plan(
                 plan,
+                assurance=args.assurance,
                 purpose=args.purpose,
                 judgment=args.judgment,
                 rejected_model=args.rejected_model,
@@ -3167,6 +3330,7 @@ def main() -> int:
         decision, _loaded = resolve_graph_route(
             args.cache_dir,
             args.lane,
+            assurance=args.assurance,
             purpose=args.purpose,
             judgment=args.judgment,
             refresh_interval=refresh,
