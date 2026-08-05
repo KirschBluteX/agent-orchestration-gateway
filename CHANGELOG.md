@@ -2,6 +2,17 @@
 
 The project follows semantic versioning.
 
+## 1.1.1 - 2026-08-05
+
+- Fixed global lifecycle hooks for desktop tasks whose host working directory is a
+  repository parent or is outside Git; an absent transaction now remains a no-op.
+- Bound pending context, exact spawn-reference expansion, workspace verification,
+  and event-first Stop protection to the transaction's prepare-time repository
+  identity instead of re-deriving authority from the host working directory.
+- Reduced the SessionEnd hook timeout to the desktop host's three-second limit and
+  kept its cleanup session-local, so hook loading no longer warns and stale sweeps
+  remain on SessionStart.
+
 ## 1.1.0 - 2026-08-05
 
 - Added a fail-closed graph dispatch transaction: the normal compiler path persists

@@ -86,10 +86,13 @@ def _ledger_root(payload: Mapping[str, Any]) -> Path:
     try:
         root = absolute_root.resolve()
         cwd = Path(payload.get("cwd")).resolve() if isinstance(payload.get("cwd"), str) else Path.cwd().resolve()
-        repo = repository_root(cwd)
-        if root == repo or repo in root.parents or root in repo.parents:
+        try:
+            protected_root = repository_root(cwd)
+        except StateError:
+            protected_root = cwd
+        if root == protected_root or protected_root in root.parents or root in protected_root.parents:
             raise ValueError("ledger directory must be outside repository")
-    except (OSError, StateError) as error:
+    except OSError as error:
         raise ValueError("ledger directory cannot be resolved") from error
     return root
 
@@ -106,13 +109,21 @@ def prepared_workspace_claim(payload: Mapping[str, Any], capsule: Mapping[str, A
     if not isinstance(session_id, str) or SESSION_ID.fullmatch(session_id) is None:
         raise LedgerConflict("prepared baseline requires exact session identity")
     try:
+        transaction_claim = spawn_claim_for_call(payload)
+        repo = (
+            Path(str(transaction_claim["repo"]))
+            if transaction_claim is not None
+            else Path(payload["cwd"])
+            if isinstance(payload.get("cwd"), str)
+            else Path.cwd()
+        )
         return dispatch_workspace_claim(
             ledger_root=_ledger_root(payload),
             session_id=session_id,
             capsule=capsule,
-            repo=Path(payload["cwd"]) if isinstance(payload.get("cwd"), str) else Path.cwd(),
+            repo=repo,
         )
-    except PreparedGraphError as error:
+    except (DispatchTransactionError, PreparedGraphError) as error:
         raise LedgerConflict("prepared baseline artifact is invalid") from error
 
 
@@ -489,17 +500,9 @@ def cleanup_task(payload: Mapping[str, Any]) -> None:
     terminal = ledger.cleanup_if_terminal() if ledger.path.exists() else True
     if terminal:
         cleanup_session_artifacts(ledger.root, session_id)
-    cleanup_stale_artifacts(
-        ledger.root,
-        keep_session_id=session_id,
-        max_age_seconds=LIVE_STALE_SECONDS,
-    )
-    TaskLedger.cleanup_stale(
-        ledger.root,
-        keep_session_id=session_id,
-        max_age_seconds=TERMINAL_STALE_SECONDS,
-        live_max_age_seconds=LIVE_STALE_SECONDS,
-    )
+    # SessionEnd has a three-second host ceiling.  Keep it session-local; the
+    # broader stale-session sweep remains on SessionStart, where a missed end
+    # event is already part of the recovery contract.
 
 
 def evaluate(payload: object) -> dict[str, Any]:

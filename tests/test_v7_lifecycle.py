@@ -123,6 +123,29 @@ def node(
 
 
 class V7LifecycleTests(unittest.TestCase):
+    def test_global_lifecycle_hooks_are_noops_outside_a_git_repository_without_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            ledger_root = root / "ledger"
+            payload = {
+                "cwd": str(workspace),
+                "session_id": "outside-repository",
+            }
+
+            with mock.patch.dict(os.environ, {"CCO_LEDGER_DIR": str(ledger_root)}):
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {**payload, "hook_event_name": "UserPromptSubmit"}
+                    ),
+                    {},
+                )
+                self.assertEqual(
+                    ledger_runtime.evaluate({**payload, "hook_event_name": "SessionEnd"}),
+                    {},
+                )
+
     def test_session_end_removes_terminal_session_artifacts_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

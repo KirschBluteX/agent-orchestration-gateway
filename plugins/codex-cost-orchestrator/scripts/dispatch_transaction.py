@@ -90,11 +90,8 @@ def _has_reparse_ancestor(path: Path) -> bool:
 
 
 def _external_root(ledger_root: Path, repo: Path) -> Path:
-    root = Path(os.path.abspath(Path(ledger_root).expanduser()))
-    if _has_reparse_ancestor(root):
-        raise DispatchTransactionError("transaction directory cannot use a reparse ancestor")
+    resolved = _resolved_ledger_root(ledger_root)
     try:
-        resolved = root.resolve()
         repository = repository_root(Path(repo)).resolve()
     except (OSError, StateError) as error:
         raise DispatchTransactionError("transaction directory cannot be resolved") from error
@@ -103,15 +100,21 @@ def _external_root(ledger_root: Path, repo: Path) -> Path:
     return resolved
 
 
+def _resolved_ledger_root(ledger_root: Path) -> Path:
+    root = Path(os.path.abspath(Path(ledger_root).expanduser()))
+    if _has_reparse_ancestor(root):
+        raise DispatchTransactionError("transaction directory cannot use a reparse ancestor")
+    try:
+        resolved = root.resolve()
+    except OSError as error:
+        raise DispatchTransactionError("transaction directory cannot be resolved") from error
+    return resolved
+
+
 def ledger_root_for_payload(payload: Mapping[str, Any]) -> Path:
     configured = os.environ.get("CCO_LEDGER_DIR")
     root = Path(configured).expanduser() if configured else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "ledger"
-    cwd = payload.get("cwd")
-    try:
-        repo = Path(cwd).resolve() if isinstance(cwd, str) else Path.cwd().resolve()
-    except OSError as error:
-        raise DispatchTransactionError("transaction workspace cannot be resolved") from error
-    return _external_root(root, repo)
+    return _resolved_ledger_root(root)
 
 
 def _session(value: object) -> str:
@@ -958,18 +961,23 @@ def _pending_records(root: Path, session_id: str, *, repo: Path | None = None) -
     return [record for record in records if _transaction_pending(record)]
 
 
-def _records_for_payload(payload: Mapping[str, Any]) -> tuple[Path, str, Path, list[dict[str, Any]]]:
+def _records_for_payload(payload: Mapping[str, Any]) -> tuple[Path, str, Path | None, list[dict[str, Any]]]:
     session = _session(payload.get("session_id"))
     root = ledger_root_for_payload(payload)
-    cwd = payload.get("cwd")
-    repo = repository_root(Path(cwd) if isinstance(cwd, str) else Path.cwd()).resolve()
+    if not _state_path(root, session).exists():
+        return root, session, None, []
     with _lock(root, session):
         document = _read_document(root, session)
         records = [
             _validate_transaction(transaction_id, value)
             for transaction_id, value in document["transactions"].items()
         ]
-    return root, session, repo, [record for record in records if record["repo"] == str(repo)]
+    # A desktop task may be rooted above the repository (or outside Git entirely).
+    # The session-bound transaction already contains the exact, prepare-time
+    # repository identity, so lifecycle discovery must not derive authority from
+    # the host cwd.  Gating every pending transaction in the session also prevents
+    # a cwd change from bypassing an unfinished dispatch batch.
+    return root, session, None, records
 
 
 def pending_transactions(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1046,8 +1054,6 @@ def claim_spawn_reference(payload: Mapping[str, Any]) -> dict[str, Any]:
     transaction_id, spawn_ref = parse_spawn_reference(tool_input.get("message"))
     session = _session(payload.get("session_id"))
     root = ledger_root_for_payload(payload)
-    cwd = payload.get("cwd")
-    repo = repository_root(Path(cwd) if isinstance(cwd, str) else Path.cwd()).resolve()
     call_id = payload.get("tool_use_id")
     if not isinstance(call_id, str) or not call_id:
         raise DispatchTransactionError("spawn reference has no exact tool call identity")
@@ -1057,6 +1063,13 @@ def claim_spawn_reference(payload: Mapping[str, Any]) -> dict[str, Any]:
         if raw is None:
             raise DispatchTransactionError("spawn reference transaction is absent")
         transaction = _validate_transaction(transaction_id, raw)
+        try:
+            repo = repository_root(Path(transaction["repo"])).resolve()
+        except (OSError, StateError) as error:
+            _fail_graph(root, session, document, transaction)
+            raise DispatchTransactionError(
+                "spawn reference repository is unavailable"
+            ) from error
         if transaction["repo"] != str(repo):
             _fail_graph(root, session, document, transaction)
             raise DispatchTransactionError("spawn reference repository does not match its transaction")
@@ -1144,6 +1157,7 @@ def spawn_claim_for_call(payload: Mapping[str, Any]) -> dict[str, Any] | None:
                     {
                         "node": node_name,
                         "owner": "/root/" + candidate["task_name"],
+                        "repo": transaction["repo"],
                         "state": node["state"],
                         "transaction_id": transaction_id,
                     }
@@ -1294,14 +1308,11 @@ def stop_outcome(payload: Mapping[str, Any]) -> dict[str, str]:
 
     session = _session(payload.get("session_id"))
     root = ledger_root_for_payload(payload)
-    cwd = payload.get("cwd")
-    repo = repository_root(Path(cwd) if isinstance(cwd, str) else Path.cwd()).resolve()
     with _lock(root, session):
         document = _read_document(root, session)
         records = [
             _validate_transaction(transaction_id, value)
             for transaction_id, value in document["transactions"].items()
-            if _validate_transaction(transaction_id, value)["repo"] == str(repo)
         ]
         in_flight = [
             record

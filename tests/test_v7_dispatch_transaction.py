@@ -170,6 +170,69 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertFalse(dispatch_transaction.bundle_path(root / "ledger", session_id, batch["transaction_id"], first_fallback_ref).exists())
             self.assertTrue(dispatch_transaction.bundle_path(root / "ledger", session_id, batch["transaction_id"], second_ref).exists())
 
+    def test_session_transaction_context_does_not_require_host_cwd_to_be_the_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_root = root / "state"
+            host_workspace = root / "workspace"
+            repo = host_workspace / "repo"
+            repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "one.txt").write_text("baseline\n", encoding="utf-8")
+            session_id = "txn-host-workspace"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CCO_LEDGER_DIR": str(state_root / "ledger"),
+                    "CODEX_THREAD_ID": session_id,
+                },
+            ):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_one", "one.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+            batch = self._transaction(state_root, repo, prepared, session_id)
+
+            context = ledger_runtime.evaluate(
+                {
+                    "cwd": str(host_workspace),
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": session_id,
+                }
+            )
+
+            self.assertEqual(batch["protocol"], "cco.dispatch-batch.v2")
+            self.assertIn("additionalContext", context["hookSpecificOutput"])
+            self.assertIn("pending=n01_one", context["hookSpecificOutput"]["additionalContext"])
+
+            spawn = agent_preflight.evaluate(
+                {
+                    "cwd": str(host_workspace),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": batch["dispatches"][0],
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-from-host-workspace",
+                }
+            )
+            self.assertIn("updatedInput", spawn["hookSpecificOutput"])
+            self.assertTrue(
+                spawn["hookSpecificOutput"]["updatedInput"]["message"].startswith(
+                    "CCO_DISPATCH cco.v7"
+                )
+            )
+            waiting = ledger_runtime.evaluate(
+                {
+                    "cwd": str(host_workspace),
+                    "hook_event_name": "Stop",
+                    "session_id": session_id,
+                }
+            )
+            self.assertEqual(waiting["decision"], "block")
+            self.assertIn("CCO_EVENT_FIRST_WAIT", waiting["reason"])
+
     def test_rejection_enables_only_its_precompiled_fallback_and_keeps_active_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

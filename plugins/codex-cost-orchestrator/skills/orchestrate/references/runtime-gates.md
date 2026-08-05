@@ -79,12 +79,17 @@ result tombstones. It is not encryption or authentication against a malicious
 Primary. It is also not a second Agent runtime, durable scheduler, or protection
 against a late filesystem write. Primary still inspects actual state.
 
-Spawn/continuation hooks keep a five-second bound. SubagentStop gets 120 seconds for a
-legitimate workspace scan; there is no ten-minute reviewer hard timeout. Large graph
-artifacts are deleted as soon as all graph owners are terminal. SessionEnd removes
-remaining task residue only when its ledger is terminal. A later SessionStart removes
-missed terminal residue after 24 hours and live/unknown abandoned state after seven
-days.
+Transactions retain the canonical repository captured at prepare time. Lifecycle
+discovery, exact spawn-reference expansion, and Stop protection use that identity;
+they do not assume the desktop task's host working directory is itself a Git
+repository. With no session transaction, a global hook outside Git is a no-op.
+
+Spawn/continuation hooks keep a five-second bound, SessionEnd uses the host's
+three-second ceiling, and SubagentStop gets 120 seconds for a legitimate workspace
+scan; there is no ten-minute reviewer hard timeout. Large graph artifacts are deleted
+as soon as all graph owners are terminal. SessionEnd removes remaining task residue
+only when its ledger is terminal. A later SessionStart removes missed terminal residue
+after 24 hours and live/unknown abandoned state after seven days.
 
 The read profile requests OS read-only, but describe it as isolated only when observed
 runtime metadata confirms the effective sandbox. If hard isolation is required and

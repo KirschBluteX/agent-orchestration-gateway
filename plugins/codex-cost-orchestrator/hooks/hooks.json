@@ -22,7 +22,7 @@
             "type": "command",
             "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
             "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "timeout": 5,
+            "timeout": 3,
             "async": false,
             "statusMessage": "Cleaning terminal CCO task state"
           }

@@ -233,8 +233,10 @@ CI 覆盖 Windows/Python 3.14 与 Linux/Python 3.11。基准方法见
 
 ## 项目状态
 
-1.1.0 保持稳定的 `cco.v7` wire protocol，同时加强派遣事务、workspace lease、DAG
-调度和 Primary 静默等待。它不是硬安全边界，也不能替代 Primary 的最终验收。欢迎提交 issue 与 PR，参见 [CONTRIBUTING.md](CONTRIBUTING.md)、
-[ROADMAP.md](ROADMAP.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+1.1.1 保持稳定的 `cco.v7` wire protocol，并修复桌面任务位于 Git 仓库父目录或仓库外时
+全局生命周期 hook 的兼容问题。即使宿主工作目录不同，派遣事务仍严格绑定准备时的真实
+仓库。它不是硬安全边界，也不能替代 Primary 的最终验收。欢迎提交 issue 与 PR，参见
+[CONTRIBUTING.md](CONTRIBUTING.md)、[ROADMAP.md](ROADMAP.md) 与
+[CHANGELOG.md](CHANGELOG.md)。
 
 MIT License。Copyright (c) 2026 KirschQAQ。

@@ -246,10 +246,12 @@ bill-savings percentage without workload-matched measurements.
 
 ## Project status
 
-Version 1.1.0 keeps the stable `cco.v7` wire protocol while tightening dispatch,
-workspace leases, DAG scheduling, and Primary quiescence. It is not a hard security
-boundary or a replacement for Primary review. Issues and pull requests are welcome;
-see [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and
+Version 1.1.1 keeps the stable `cco.v7` wire protocol while making global lifecycle
+hooks safe for desktop tasks rooted above or outside a Git repository. Dispatch
+transactions remain bound to their exact prepare-time repository even when the host
+working directory differs. It is not a hard security boundary or a replacement for
+Primary review. Issues and pull requests are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and
 [CHANGELOG.md](CHANGELOG.md).
 
 MIT License. Copyright (c) 2026 KirschQAQ.
