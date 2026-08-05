@@ -217,10 +217,10 @@ bypassed owner is outside CCO lifecycle and evidence guarantees.
   repository-wide so newly created out-of-scope deltas are still detected.
 - Worker result paths must exactly equal the real delta inside that node's scopes.
 - Large terminal graph artifacts are removed immediately. Small task tombstones stay
-  outside the repository for late-result fencing. A later SessionStart removes
-  SessionEnd removes terminal task residue immediately. A later SessionStart remains
-  the fallback: terminal residue expires after 24 hours and live/unknown abandoned
-  state after up to seven days.
+  outside the repository for late-result fencing. The next SessionStart immediately
+  removes validated terminal ledgers and their workspace artifacts from prior
+  sessions. Live, unknown, locked, or malformed abandoned state remains subject to
+  bounded stale cleanup of up to seven days.
 - CCO sends no CCO telemetry and stores no token counts, billing records, Radar data,
   or long-term route history. A temporary prepared artifact necessarily contains the
   closed node contracts, scopes, route bindings, and workspace fingerprints; it does
@@ -246,11 +246,11 @@ bill-savings percentage without workload-matched measurements.
 
 ## Project status
 
-Version 1.1.1 keeps the stable `cco.v7` wire protocol while making global lifecycle
-hooks safe for desktop tasks rooted above or outside a Git repository. Dispatch
-transactions remain bound to their exact prepare-time repository even when the host
-working directory differs. It is not a hard security boundary or a replacement for
-Primary review. Issues and pull requests are welcome; see
+Version 1.1.2 keeps the stable `cco.v7` wire protocol while exposing exactly seven
+desktop-visible hook definitions. Optional SessionEnd cleanup has moved to the next
+SessionStart so every required hook can be reviewed and trusted in the current Codex
+app. It is not a hard security boundary or a replacement for Primary review. Issues
+and pull requests are welcome; see
 [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and
 [CHANGELOG.md](CHANGELOG.md).
 

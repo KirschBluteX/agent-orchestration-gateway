@@ -26,7 +26,6 @@ PROFILES = {
 def trusted_hook_inventory(plugin_root: Path = PLUGIN) -> dict[str, object]:
     events = (
         "sessionStart",
-        "sessionEnd",
         "preToolUse",
         "preToolUse",
         "postToolUse",

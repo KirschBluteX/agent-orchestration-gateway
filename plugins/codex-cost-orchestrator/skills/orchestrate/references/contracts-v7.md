@@ -118,7 +118,8 @@ follow-ups remain fenced across turns.
 
 Full transaction bundles are deleted as their candidates settle. When every owner of
 one graph is terminal, its large prepared artifact is deleted.
-Small tombstones are retained across turns until SessionEnd observes a terminal
-ledger. A later SessionStart removes missed terminal residue after 24 hours and
-live/unknown abandoned state after seven days. Incomplete, blocked, deviating, or retired Luna
-results set the `node + role` guarded floor for a newer generation.
+Small tombstones are retained across turns until the next SessionStart confirms and
+removes terminal prior-session state. Live, unknown, locked, or malformed abandoned
+state remains subject to bounded stale cleanup of up to seven days. Incomplete,
+blocked, deviating, or retired Luna results set the `node + role` guarded floor for a
+newer generation.

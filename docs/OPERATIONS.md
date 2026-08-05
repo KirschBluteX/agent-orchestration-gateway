@@ -79,8 +79,7 @@ graph-level failure and fences the undispatched remainder.
 
 | Event | Purpose |
 | --- | --- |
-| SessionStart | Inject one compact mandatory CCO reminder; prune stale sessions |
-| SessionEnd | Remove task artifacts immediately only when its ledger is terminal |
+| SessionStart | Inject one compact mandatory CCO reminder; remove terminal prior sessions and prune stale state |
 | PreToolUse all tools | Gate a pending transaction; expand one exact short spawn reference |
 | PreToolUse continuation | Require exact next cursor for managed owners |
 | PreToolUse interrupt | Retire/fence before native interruption |
@@ -89,11 +88,12 @@ graph-level failure and fences the undispatched remainder.
 | UserPromptSubmit | Restore compact active/pending transaction context after user input |
 | SubagentStop | Validate result, acceptance evidence, role, scope, and exact delta |
 
-Large terminal artifacts and settled dispatch bundles delete immediately. SessionEnd
-removes the remaining task residue only after terminality; a later SessionStart is the
-fallback and removes terminal ledgers after 24
-hours and live/unknown abandoned artifacts and ledgers after seven days. This keeps
-fencing across multiple turns without adding per-turn hook latency.
+Large terminal artifacts and settled dispatch bundles delete immediately. The next
+SessionStart removes validated terminal ledgers and their workspace artifacts from
+prior sessions. Live, unknown, locked, or malformed abandoned artifacts and ledgers
+remain subject to bounded stale cleanup of up to seven days. This keeps fencing across
+multiple turns without adding an optional SessionEnd hook that the current desktop
+browser cannot expose for trust review.
 
 The state root defaults to the OS temporary directory under
 `codex-cost-orchestrator`. `CCO_LEDGER_DIR` may choose another external absolute

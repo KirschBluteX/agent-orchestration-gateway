@@ -141,36 +141,49 @@ class V7LifecycleTests(unittest.TestCase):
                     ),
                     {},
                 )
-                self.assertEqual(
-                    ledger_runtime.evaluate({**payload, "hook_event_name": "SessionEnd"}),
-                    {},
-                )
 
-    def test_session_end_removes_terminal_session_artifacts_immediately(self) -> None:
+    def test_session_start_removes_prior_terminal_state_and_preserves_live_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = root / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             ledger_root = root / "ledger"
+            ledger_root.mkdir()
+            terminal_ledger = ledger_root / "ended-task.json"
+            terminal_ledger.write_text(
+                '{"fenced_owners":[],"guarded_floors":[],"rows":{}}',
+                encoding="utf-8",
+            )
+            live_ledger = ledger_root / "live-task.json"
+            live_ledger.write_text(
+                '{"fenced_owners":[],"guarded_floors":[],"rows":{"n01":{"state":"owned"}}}',
+                encoding="utf-8",
+            )
             workspace = root / "workspace"
             workspace.mkdir()
-            artifact = workspace / ("ended-task-" + "a" * 64 + ".json")
-            artifact.write_text("{}", encoding="utf-8")
+            terminal_artifact = workspace / ("ended-task-" + "a" * 64 + ".json")
+            terminal_artifact.write_text("{}", encoding="utf-8")
+            live_artifact = workspace / ("live-task-" + "b" * 64 + ".json")
+            live_artifact.write_text("{}", encoding="utf-8")
 
             with mock.patch.dict(os.environ, {"CCO_LEDGER_DIR": str(ledger_root)}):
-                self.assertEqual(
-                    ledger_runtime.evaluate(
-                        {
-                            "cwd": str(repo),
-                            "hook_event_name": "SessionEnd",
-                            "session_id": "ended-task",
-                        }
-                    ),
-                    {},
+                outcome = ledger_runtime.evaluate(
+                    {
+                        "cwd": str(repo),
+                        "hook_event_name": "SessionStart",
+                        "session_id": "new-task",
+                    }
                 )
 
-            self.assertFalse(artifact.exists())
+            self.assertEqual(
+                outcome["hookSpecificOutput"]["hookEventName"],
+                "SessionStart",
+            )
+            self.assertFalse(terminal_ledger.exists())
+            self.assertFalse(terminal_artifact.exists())
+            self.assertTrue(live_ledger.exists())
+            self.assertTrue(live_artifact.exists())
 
     def test_corrected_second_subagent_stop_is_validated_and_retires_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -558,7 +571,7 @@ class V7LifecycleTests(unittest.TestCase):
                 self.assertEqual(raw_followup["decision"], "block")
                 self.assertIn("continuation capsule", raw_followup["reason"])
 
-    def test_session_start_injects_the_gate_once_and_cleans_only_stale_sessions(self) -> None:
+    def test_session_start_injects_the_gate_once_and_cleans_bounded_stale_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = root / "repo"

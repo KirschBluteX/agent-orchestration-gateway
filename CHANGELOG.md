@@ -2,6 +2,18 @@
 
 The project follows semantic versioning.
 
+## 1.1.2 - 2026-08-05
+
+- Removed the optional SessionEnd hook because the current desktop hook browser can
+  discover it without rendering the untrusted definition, leaving users no visible
+  trust action.
+- Consolidated cleanup under SessionStart: each new task immediately removes validated
+  terminal task ledgers and their workspace artifacts from prior sessions while
+  preserving live, unknown, locked, or malformed state for bounded stale recovery.
+- Reduced the public installation contract to six lifecycle events and seven visible,
+  independently trusted hook definitions without changing the stable `cco.v7` wire
+  protocol.
+
 ## 1.1.1 - 2026-08-05
 
 - Fixed global lifecycle hooks for desktop tasks whose host working directory is a

@@ -39,7 +39,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertEqual(manifest["version"], "1.1.1")
+        self.assertEqual(manifest["version"], "1.1.2")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -92,7 +92,6 @@ class ProjectContractTests(unittest.TestCase):
             set(hooks),
             {
                 "SessionStart",
-                "SessionEnd",
                 "PreToolUse",
                 "PostToolUse",
                 "Stop",
@@ -114,9 +113,9 @@ class ProjectContractTests(unittest.TestCase):
             for group in groups:
                 for hook in group["hooks"]:
                     count += 1
-                    limit = 120 if event == "SubagentStop" else 3 if event == "SessionEnd" else 5
+                    limit = 120 if event == "SubagentStop" else 5
                     self.assertLessEqual(hook["timeout"], limit)
-        self.assertEqual(count, 8)
+        self.assertEqual(count, 7)
 
     def test_current_protocol_is_v7_and_runtime_route_is_static_and_network_free(self) -> None:
         packet = text(PLUGIN / "scripts" / "packet_compiler.py")

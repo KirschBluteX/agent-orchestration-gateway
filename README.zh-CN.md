@@ -207,8 +207,9 @@ CCO 生命周期和证据保证。
   light 模式，也会保留全仓库 Git status 与 Git control state，以发现新产生的 scope 外变更。
 - worker 声明的 changed paths 必须与该节点 scope 内的真实 delta 完全一致。
 - 大型终态 graph artifact 会立即删除。用于迟到结果 fencing 的小型 tombstone 存放在
-  仓库外；SessionEnd 会立即清理已经终态的任务残留。后续 SessionStart 仍作为兜底：
-  超过 24 小时的终态残留会被清理，live/unknown 遗留状态最多保守保留 7 天。
+  仓库外；下一个 SessionStart 会立即删除先前 session 中已验证终态的 ledger 及其
+  workspace artifact。live、unknown、被锁定或格式异常的遗留状态仍按有界策略最多保守
+  保留 7 天。
 - CCO 不发送自身遥测，也不保存 token 数、账单、Radar 数据或长期路由历史。临时
   prepared artifact 必然包含闭合合同、scope、route binding 与 workspace 指纹，但
   不复制仓库文件正文或完整对话。
@@ -233,10 +234,10 @@ CI 覆盖 Windows/Python 3.14 与 Linux/Python 3.11。基准方法见
 
 ## 项目状态
 
-1.1.1 保持稳定的 `cco.v7` wire protocol，并修复桌面任务位于 Git 仓库父目录或仓库外时
-全局生命周期 hook 的兼容问题。即使宿主工作目录不同，派遣事务仍严格绑定准备时的真实
-仓库。它不是硬安全边界，也不能替代 Primary 的最终验收。欢迎提交 issue 与 PR，参见
-[CONTRIBUTING.md](CONTRIBUTING.md)、[ROADMAP.md](ROADMAP.md) 与
+1.1.2 保持稳定的 `cco.v7` wire protocol，并固定为桌面端可完整显示的 7 条 hook 定义。
+可选的 SessionEnd 清理已合并到下一次 SessionStart，使每条必需 hook 都能在当前 Codex
+桌面端查看并信任。它不是硬安全边界，也不能替代 Primary 的最终验收。欢迎提交 issue 与
+PR，参见 [CONTRIBUTING.md](CONTRIBUTING.md)、[ROADMAP.md](ROADMAP.md) 与
 [CHANGELOG.md](CHANGELOG.md)。
 
 MIT License。Copyright (c) 2026 KirschQAQ。

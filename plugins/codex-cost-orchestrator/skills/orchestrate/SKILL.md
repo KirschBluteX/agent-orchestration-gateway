@@ -143,9 +143,9 @@ Treat every result as a claim. `CCO_RESULT cco.v7` must cover acceptance IDs, de
 exact changed paths, and match the current workspace delta inside that node's scopes.
 Only a complete reviewer may return `accept`; explorer and worker never claim Primary
 acceptance. Large terminal graph artifacts are deleted immediately. Small owner
-tombstones remain across turns for fencing. SessionEnd removes terminal task residue;
-a later SessionStart removes missed terminal residue after 24 hours and live/unknown
-abandoned state after seven days.
+tombstones remain across turns for fencing. The next SessionStart immediately removes
+validated terminal state from prior sessions; live, unknown, locked, or malformed
+abandoned state remains subject to bounded stale cleanup of up to seven days.
 
 Normalize each failure into one stable failure signature. Retry only when new evidence
 changes the intervention. A confirmed pre-thread rejection uses a precompiled route

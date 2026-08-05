@@ -84,12 +84,14 @@ discovery, exact spawn-reference expansion, and Stop protection use that identit
 they do not assume the desktop task's host working directory is itself a Git
 repository. With no session transaction, a global hook outside Git is a no-op.
 
-Spawn/continuation hooks keep a five-second bound, SessionEnd uses the host's
-three-second ceiling, and SubagentStop gets 120 seconds for a legitimate workspace
-scan; there is no ten-minute reviewer hard timeout. Large graph artifacts are deleted
-as soon as all graph owners are terminal. SessionEnd removes remaining task residue
-only when its ledger is terminal. A later SessionStart removes missed terminal residue
-after 24 hours and live/unknown abandoned state after seven days.
+Spawn/continuation hooks keep a five-second bound and SubagentStop gets 120 seconds
+for a legitimate workspace scan; there is no ten-minute reviewer hard timeout. Large
+graph artifacts are deleted as soon as all graph owners are terminal. The next
+SessionStart immediately removes validated terminal state from prior sessions. Live,
+unknown, locked, or malformed abandoned state remains subject to bounded stale
+cleanup of up to seven days. CCO does not register the optional SessionEnd event
+because the current desktop hook browser cannot render its untrusted definition for
+review.
 
 The read profile requests OS read-only, but describe it as isolated only when observed
 runtime metadata confirms the effective sandbox. If hard isolation is required and

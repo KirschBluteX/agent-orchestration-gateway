@@ -38,11 +38,10 @@ PROFILE_AGENT_NAMES = {
     "write": "cost_orchestrator_write_leaf",
 }
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "1.1.1"
+PLUGIN_VERSION = "1.1.2"
 REQUIRED_HOOK_EVENTS = Counter(
     {
         "sessionStart": 1,
-        "sessionEnd": 1,
         "preToolUse": 2,
         "postToolUse": 1,
         "stop": 1,
@@ -817,7 +816,6 @@ def doctor(
             events = set(hook_document.get("hooks", {}))
             required_events = {
                 "SessionStart",
-                "SessionEnd",
                 "PreToolUse",
                 "PostToolUse",
                 "Stop",

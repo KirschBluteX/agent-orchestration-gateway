@@ -44,7 +44,7 @@ from dispatch_transaction import (  # noqa: E402
     user_prompt_context as transaction_user_prompt_context,
 )
 from protocol_hash import canonical_bytes, repository_scopes_overlap  # noqa: E402
-from task_ledger import LedgerConflict, TaskLedger  # noqa: E402
+from task_ledger import LedgerBusy, LedgerConflict, TaskLedger  # noqa: E402
 from workspace_state import StateError, repository_root  # noqa: E402
 
 
@@ -469,10 +469,42 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
         _cleanup_terminal_graph_artifact(ledger, payload, row)
 
 
+def cleanup_terminal_prior_sessions(
+    ledger_root: Path,
+    *,
+    keep_session_id: str,
+) -> list[Path]:
+    """Remove only validated terminal task ledgers from earlier sessions."""
+
+    directory = Path(ledger_root)
+    if not directory.is_dir():
+        return []
+    removed: list[Path] = []
+    for candidate in sorted(directory.glob("*.json"), key=lambda path: path.name):
+        if (
+            candidate.stem == keep_session_id
+            or candidate.name.endswith(".dispatch-transactions.json")
+        ):
+            continue
+        try:
+            ledger = TaskLedger(directory, candidate.stem)
+            terminal = ledger.cleanup_if_terminal()
+        except (LedgerBusy, LedgerConflict, OSError, ValueError):
+            continue
+        if terminal and not candidate.exists():
+            cleanup_session_artifacts(directory, candidate.stem)
+            removed.append(candidate)
+    return removed
+
+
 def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
     ledger = ledger_for(payload)
     if ledger is not None:
         session_id = str(payload.get("session_id"))
+        cleanup_terminal_prior_sessions(
+            ledger.root,
+            keep_session_id=session_id,
+        )
         cleanup_stale_artifacts(
             ledger.root,
             keep_session_id=session_id,
@@ -492,19 +524,6 @@ def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def cleanup_task(payload: Mapping[str, Any]) -> None:
-    ledger = ledger_for(payload)
-    if ledger is None:
-        return
-    session_id = str(payload.get("session_id"))
-    terminal = ledger.cleanup_if_terminal() if ledger.path.exists() else True
-    if terminal:
-        cleanup_session_artifacts(ledger.root, session_id)
-    # SessionEnd has a three-second host ceiling.  Keep it session-local; the
-    # broader stale-session sweep remains on SessionStart, where a missed end
-    # event is already part of the recovery contract.
-
-
 def evaluate(payload: object) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         return {}
@@ -512,9 +531,6 @@ def evaluate(payload: object) -> dict[str, Any]:
     tool_name = payload.get("tool_name")
     if event == "SessionStart":
         return start_task(payload)
-    if event == "SessionEnd":
-        cleanup_task(payload)
-        return {}
     if event == "Stop":
         return transaction_stop_outcome(payload)
     if event == "UserPromptSubmit":
