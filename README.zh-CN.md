@@ -28,7 +28,6 @@ Codex 负责；CCO 只编译并守卫这些原生调用。
   变化；pending scope 或图外变化一律 fail-closed。
 - 将 acceptance ID、结构化证据和真实 workspace delta 连接为一条验收链。
 - Primary 派遣后事件驱动等待；CCO 不再额外压低 Codex 原生并发容量。
-- 不依赖 Radar，不创建运行时路由缓存，也不记录 token、账单或成本统计。
 
 ## 决策流程
 
