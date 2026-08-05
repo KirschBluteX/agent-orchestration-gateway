@@ -66,10 +66,18 @@ the final capability evidence.
 1. Close the complete graph from facts already present in the user request and known
    repository policy. If one material fact is missing, use one narrow explorer.
 2. Put shared facts in graph `defaults` and invoke `graph_compiler.py` once.
+   A terminal worker can be handed to a reviewer with `review_source`; the compiler
+   reuses its ledger baseline, acceptance IDs, scopes, changed paths, and evidence.
 3. Issue every ready short spawn reference in the same Primary model turn. No other
    tool is allowed while the transaction still has pending references.
-4. Enter one long event wait. Do not poll or send progress-only requests. Child
+4. Call `wait_agent` once and enter one long event wait. Do not poll or send progress-only requests. Child
    completion, blocking input, or a user message wakes Primary.
+
+Only a native terminal event proves completion, failure, or interruption. An opaque
+or unreadable progress payload and an unchanged workspace prove nothing about Agent
+state. Do not copy protected payloads into `send_message` or `followup_task`; keep the
+owner active and wait. The 30-minute protection timeout is a recovery wakeup, not a
+forced Agent interruption or implicit completion.
 
 A confirmed pre-thread rejection advances only that node to its precompiled fallback.
 Active siblings continue. Graph identity, workspace, or transaction corruption is a
@@ -80,13 +88,13 @@ graph-level failure and fences the undispatched remainder.
 | Event | Purpose |
 | --- | --- |
 | SessionStart | Inject one compact mandatory CCO reminder; remove terminal prior sessions and prune stale state |
-| PreToolUse all tools | Gate a pending transaction; expand one exact short spawn reference |
-| PreToolUse continuation | Require exact next cursor for managed owners |
+| PreToolUse all tools | Exit cheaply when no transaction marker exists; otherwise gate pending work and expand one exact short spawn reference |
+| PreToolUse continuation | Require exact next cursor and reject opaque protected payload forwarding |
 | PreToolUse interrupt | Retire/fence before native interruption |
 | PostToolUse | Activate one owner, settle continuation, or release rejected spawn |
-| Stop | Request a 30-minute event wait or perform one bounded pending-batch recovery |
+| Stop | Concisely require `wait_agent` or perform one bounded pending-batch recovery without exposing transaction internals |
 | UserPromptSubmit | Restore compact active/pending transaction context after user input |
-| SubagentStop | Validate result, acceptance evidence, role, scope, and exact delta |
+| SubagentStop | Map native UUID to owner; validate result, evidence, role, scope, and exact delta; retire once without a formatting-only second response |
 
 Large terminal artifacts and settled dispatch bundles delete immediately. The next
 SessionStart removes validated terminal ledgers and their workspace artifacts from
@@ -132,6 +140,13 @@ workspace checks remain bound to the fresh state.
 Primary must still provide the closed contract, anchors, and evidence needed to
 inspect the delta. It is reviewer-only and cannot weaken current-state verification.
 
+For the normal terminal-worker path, prefer node `review_source` with the worker's
+`node` and `contract_rev`. The compiler resolves one exact current-task ledger row,
+validates its bounded result seed, and derives `review_baseline`, exact scopes,
+acceptance facts, source evidence, reviewer role, and `fork_turns: none`. Primary still
+supplies the new reviewer node, epoch, and closed semantic contract. Manually supplied
+derived fields must match the ledger or preparation fails closed.
+
 ## Failure behavior
 
 - Profile missing/shadowed/modified or hook untrusted: no delegation; run doctor.
@@ -139,8 +154,11 @@ inspect the delta. It is reviewer-only and cannot weaken current-state verificat
 - Confirmed pre-thread rejection: use the next precompiled fallback only.
 - Interrupted pending dispatch: one exact recovery; a second abandonment fences only
   nodes that never became active.
-- Managed malformed capsule, wrong owner/cursor, stale result, or raw follow-up: block.
-- Result path/evidence/workspace mismatch: keep owner fenced and return exact error.
+- Managed malformed capsule, wrong owner/cursor, or raw follow-up: block before delivery.
+- Invalid or stale SubagentStop result: retire and fence once, show Primary a concise
+  status, and do not trigger another child response merely to repair formatting.
+- Result path/evidence/workspace mismatch: retire and fence; Primary inspects the
+  actual state before replanning.
 - Incomplete, blocked, or deviation: record one failure signature and force a guarded
   newer generation.
 - Luna quality failure: Terra guarded. Terra quality failure: Primary replans.

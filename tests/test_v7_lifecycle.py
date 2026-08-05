@@ -186,7 +186,7 @@ class V7LifecycleTests(unittest.TestCase):
             self.assertTrue(live_ledger.exists())
             self.assertTrue(live_artifact.exists())
 
-    def test_corrected_second_subagent_stop_is_validated_and_retires_owner(self) -> None:
+    def test_invalid_subagent_stop_retires_once_without_a_second_model_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = root / "repo"
@@ -195,13 +195,13 @@ class V7LifecycleTests(unittest.TestCase):
             (repo / "owned.txt").write_text("ready\n", encoding="utf-8")
             env = {"CCO_LEDGER_DIR": str(root / "ledger"), "CODEX_THREAD_ID": "v7-stop-corrected"}
             with mock.patch.dict(os.environ, env):
-                dispatch = prepare_dispatch_graph(
+                prepared = prepare_dispatch_graph(
                     [node("n01_worker", "owned.txt")],
                     native_capacity=1,
                     native_catalog=native_catalog(),
                     repo=repo,
-                )["dispatches"][0]
-                capsule = parse_message(dispatch["message"])
+                )
+                dispatch = prepared["dispatches"][0]
                 owner = "/root/" + dispatch["task_name"]
                 preflight = {
                     "cwd": str(repo),
@@ -226,31 +226,13 @@ class V7LifecycleTests(unittest.TestCase):
                     "stop_hook_active": False,
                 }
                 first_outcome = subagent_stop.evaluate(first_stop)
-                self.assertEqual(first_outcome["decision"], "block")
-                self.assertEqual(ledger_runtime.ledger_for(first_stop).read_rows()[0]["state"], "owned")
-
-                (repo / "owned.txt").write_text("corrected\n", encoding="utf-8")
-                corrected = compile_result(
-                    capsule,
-                    status="complete",
-                    disposition="retire",
-                    blockers=[],
-                    changed_paths=["owned.txt"],
-                    deviations=[],
-                    evidence={"A01": "corrected second stop has the exact owned-file delta"},
-                    failure_signature=None,
-                    summary="corrected result",
-                )
-                self.assertEqual(
-                    subagent_stop.evaluate(
-                        {**first_stop, "last_assistant_message": corrected, "stop_hook_active": True}
-                    ),
-                    {},
-                )
+                self.assertNotIn("decision", first_outcome)
+                self.assertIn("CCO result was rejected", first_outcome["systemMessage"])
                 self.assertEqual(
                     ledger_runtime.ledger_for(first_stop).read_rows()[0]["state"],
                     "retired",
                 )
+                self.assertFalse(Path(str(prepared["baseline_path"])).exists())
 
     def test_reviewer_can_bind_the_worker_old_baseline_while_guarding_current_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -343,14 +325,21 @@ class V7LifecycleTests(unittest.TestCase):
                     {},
                 )
 
-    def test_still_invalid_second_subagent_stop_retires_fences_and_warns(self) -> None:
+    def test_invalid_uuid_subagent_stop_retires_and_sets_guarded_floor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = root / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
             (repo / "owned.txt").write_text("ready\n", encoding="utf-8")
-            env = {"CCO_LEDGER_DIR": str(root / "ledger"), "CODEX_THREAD_ID": "v7-stop-invalid"}
+            session_id = "019fc182-69b7-7421-8dba-0b49338f57d3"
+            child_id = "019fd229-244e-75f1-83cd-b13108dfc5a3"
+            codex_home = root / "codex-home"
+            env = {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_HOME": str(codex_home),
+                "CODEX_THREAD_ID": session_id,
+            }
             with mock.patch.dict(os.environ, env):
                 prepared = prepare_dispatch_graph(
                     [node("n01_worker", "owned.txt", decision_space="bounded_effect")],
@@ -364,7 +353,7 @@ class V7LifecycleTests(unittest.TestCase):
                 preflight = {
                     "cwd": str(repo),
                     "hook_event_name": "PreToolUse",
-                    "session_id": "v7-stop-invalid",
+                    "session_id": session_id,
                     "tool_input": dispatch,
                     "tool_name": "spawn_agent",
                     "tool_use_id": "spawn-stop-invalid",
@@ -374,21 +363,43 @@ class V7LifecycleTests(unittest.TestCase):
                     {**preflight, "hook_event_name": "PostToolUse", "tool_response": {"task_path": owner}}
                 )
 
+                transcript = (
+                    codex_home
+                    / "sessions"
+                    / "2026"
+                    / "08"
+                    / "05"
+                    / f"rollout-{child_id}.jsonl"
+                )
+                transcript.parent.mkdir(parents=True)
+                transcript.write_text(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "agent_path": owner,
+                                "id": child_id,
+                                "parent_thread_id": session_id,
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
                 invalid_stop = {
-                    "agent_id": owner,
+                    "agent_id": child_id,
+                    "agent_transcript_path": str(transcript),
                     "agent_type": dispatch["agent_type"],
                     "cwd": str(repo),
                     "hook_event_name": "SubagentStop",
                     "last_assistant_message": "still not a CCO result",
-                    "session_id": "v7-stop-invalid",
+                    "session_id": session_id,
                     "stop_hook_active": False,
                 }
-                self.assertEqual(subagent_stop.evaluate(invalid_stop)["decision"], "block")
-                self.assertTrue(artifact.exists())
-
-                warning = subagent_stop.evaluate({**invalid_stop, "stop_hook_active": True})
+                warning = subagent_stop.evaluate(invalid_stop)
                 self.assertNotIn("decision", warning)
-                self.assertIn("WARNING", warning["systemMessage"])
+                self.assertIn("CCO result was rejected", warning["systemMessage"])
                 self.assertFalse(artifact.exists())
 
                 ledger = ledger_runtime.ledger_for(invalid_stop)
@@ -509,7 +520,7 @@ class V7LifecycleTests(unittest.TestCase):
                     failure_signature=None,
                     summary="claimed completion",
                 )
-                blocked = subagent_stop.evaluate(
+                rejected = subagent_stop.evaluate(
                     {
                         "agent_id": owner,
                         "agent_type": dispatch["agent_type"],
@@ -520,8 +531,14 @@ class V7LifecycleTests(unittest.TestCase):
                         "stop_hook_active": False,
                     }
                 )
-                self.assertEqual(blocked["decision"], "block")
-                self.assertIn("outside_lease:outside.txt", blocked["reason"])
+                self.assertNotIn("decision", rejected)
+                self.assertIn("CCO result was rejected", rejected["systemMessage"])
+                self.assertEqual(
+                    ledger_runtime.ledger_for(
+                        {"cwd": str(repo), "session_id": "v7-outside"}
+                    ).read_rows()[0]["state"],
+                    "retired",
+                )
 
     def test_terminal_graph_keeps_tombstones_and_deletes_artifact_only_after_last_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -602,22 +619,6 @@ class V7LifecycleTests(unittest.TestCase):
                     "session_id": "v7-lifecycle",
                     "stop_hook_active": False,
                 }
-                wrong_paths = compile_result(
-                    first_capsule,
-                    status="complete",
-                    disposition="retire",
-                    blockers=[],
-                    changed_paths=["two.txt"],
-                    deviations=[],
-                    evidence={"A01": "claimed the wrong file"},
-                    failure_signature=None,
-                    summary="incorrect path claim",
-                )
-                mismatch = subagent_stop.evaluate(
-                    {**first_stop, "last_assistant_message": wrong_paths}
-                )
-                self.assertEqual(mismatch["decision"], "block")
-                self.assertIn("exact node workspace delta", mismatch["reason"])
                 self.assertEqual(subagent_stop.evaluate(first_stop), {})
                 self.assertTrue(artifact.exists())
 
@@ -643,8 +644,8 @@ class V7LifecycleTests(unittest.TestCase):
                 ledger = ledger_runtime.ledger_for(first_stop)
                 self.assertEqual([row["state"] for row in ledger.read_rows()], ["retired", "retired"])
                 late = subagent_stop.evaluate(first_stop)
-                self.assertEqual(late["decision"], "block")
-                self.assertIn("stale", late["reason"])
+                self.assertNotIn("decision", late)
+                self.assertIn("CCO result was rejected", late["systemMessage"])
 
                 self.assertEqual(
                     ledger_runtime.evaluate(

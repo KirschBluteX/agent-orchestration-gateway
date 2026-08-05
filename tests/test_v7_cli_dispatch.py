@@ -33,6 +33,119 @@ def no_risks() -> dict[str, str]:
 
 
 class V7CliDispatchTests(unittest.TestCase):
+    def test_reviewer_fast_path_reuses_ledger_baseline_scopes_and_result_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("implemented\n", encoding="utf-8")
+            session_id = "review-fast-path"
+            ledger_root = root / "ledger"
+            ledger_root.mkdir()
+            old_baseline = "sha256:" + ("a" * 64)
+            (ledger_root / f"{session_id}.json").write_text(
+                json.dumps(
+                    {
+                        "fenced_owners": [],
+                        "guarded_floors": [],
+                        "rows": {
+                            "n01_worker@1": {
+                                "acceptance_ids": ["A01"],
+                                "baseline": old_baseline,
+                                "contract_rev": 1,
+                                "input_sha256": "sha256:" + ("b" * 64),
+                                "node": "n01_worker",
+                                "review_seed": {
+                                    "disposition": "retire",
+                                    "payload": {
+                                        "blockers": [],
+                                        "changed_paths": ["owned.txt"],
+                                        "deviations": [],
+                                        "evidence": {"A01": "focused worker check passed"},
+                                        "failure_signature": None,
+                                        "summary": "implemented owned.txt",
+                                    },
+                                    "status": "complete",
+                                },
+                                "scopes": [{"kind": "exact", "path": "owned.txt"}],
+                                "role": "worker",
+                                "state": "retired",
+                            }
+                        },
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            document = {
+                "native_catalog": {
+                    "models": [
+                        {
+                            "multi_agent_version": "v2",
+                            "slug": "gpt-5.6-terra",
+                            "supported_reasoning_levels": [{"effort": "max"}],
+                        }
+                    ]
+                },
+                "nodes": [
+                    {
+                        "contract": {
+                            "acceptance": [
+                                {
+                                    "criterion": "Review the exact worker delta and evidence.",
+                                    "id": "A01",
+                                }
+                            ],
+                            "contract_rev": 1,
+                            "node": "review_release",
+                            "objective": "review n01_worker",
+                        },
+                        "epoch": "e01",
+                        "node": "review_release",
+                        "review_source": {"contract_rev": 1, "node": "n01_worker"},
+                    }
+                ],
+            }
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(SCRIPT),
+                    "--repo",
+                    str(repo),
+                    "--native-capacity",
+                    "1",
+                    "--full",
+                ],
+                input=json.dumps(document),
+                text=True,
+                capture_output=True,
+                env={
+                    **os.environ,
+                    "CCO_LEDGER_DIR": str(ledger_root),
+                    "CODEX_THREAD_ID": session_id,
+                },
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            prepared = json.loads(completed.stdout)
+            capsule = json.loads(
+                prepared["dispatches"][0]["message"].split("\n", 2)[2][
+                    len("CAPSULE_JSON: ") :
+                ]
+            )
+            self.assertEqual(capsule["role"], "reviewer")
+            self.assertEqual(capsule["baseline"], old_baseline)
+            self.assertRegex(capsule["current_state"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(capsule["scopes"], [{"kind": "exact", "path": "owned.txt"}])
+            self.assertEqual(capsule["acceptance_ids"], ["A01"])
+            self.assertEqual(
+                capsule["evidence"]["source_result"]["payload"]["changed_paths"],
+                ["owned.txt"],
+            )
+
     def test_normal_cli_commits_transaction_and_emits_only_short_spawn_refs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -226,7 +339,13 @@ class V7CliDispatchTests(unittest.TestCase):
                     "generation": 1,
                     "placement": {
                         "benefits": [
-                            {"evidence": ["contract:A01"], "kind": "context_partition"}
+                            {
+                                "evidence": [
+                                    "capsule:self-contained",
+                                    "context:history-not-required",
+                                ],
+                                "kind": "context_partition",
+                            }
                         ],
                         "direct_action_count": 1,
                         "direct_verification_count": 1,

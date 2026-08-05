@@ -38,6 +38,7 @@ _POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
 _WORKSPACE_FIELDS = frozenset({"baseline", "baseline_path", "graph_scopes", "graph_sha256", "scopes", "workspace_backend", "workspace_mode"})
 _LOCK_WAIT_SECONDS = 0.25
 _STALE_LOCK_SECONDS = 60.0
+_MAX_REVIEW_SEED_BYTES = 64 * 1024
 
 
 class TaskLedger:
@@ -354,6 +355,7 @@ class TaskLedger:
             if accepted:
                 row["input_sha256"] = pending["next_input_sha256"]
                 row["cursor"] = pending["cursor"]
+                row.pop("review_seed", None)
             self._write(document)
             return self._public(row)
 
@@ -365,6 +367,7 @@ class TaskLedger:
                 raise LedgerConflict("owner cannot be retired")
             row["state"] = "retired"
             row.pop("_pending", None)
+            row.pop("review_seed", None)
             self._fence_owner(document, owner)
             self._set_guarded_floor(document, row)
             self._write(document)
@@ -387,6 +390,7 @@ class TaskLedger:
                 raise LedgerConflict("owner cannot be retired")
             row["state"] = "retired"
             row.pop("_pending", None)
+            row.pop("review_seed", None)
             self._fence_owner(document, owner)
             self._set_guarded_floor(document, row)
             self._write(document)
@@ -404,12 +408,26 @@ class TaskLedger:
                 raise LedgerConflict("owner cannot be retired")
             row["state"] = "retired"
             row.pop("_pending", None)
+            row.pop("review_seed", None)
             self._fence_owner(document, owner)
             self._set_guarded_floor(document, row, force=True)
             self._write(document)
             return self._public(row)
 
-    def record_result(self, *, node: str, contract_rev: int, run: str, generation: int, input_sha256: str, owner: str, disposition: str, cursor: int | None = None, require_guarded: bool = False) -> dict[str, Any]:
+    def record_result(
+        self,
+        *,
+        node: str,
+        contract_rev: int,
+        run: str,
+        generation: int,
+        input_sha256: str,
+        owner: str,
+        disposition: str,
+        cursor: int | None = None,
+        require_guarded: bool = False,
+        review_seed: Mapping[str, object] | None = None,
+    ) -> dict[str, Any]:
         if disposition not in {"continuable", "retired"} or _TASK_PATH.fullmatch(owner) is None:
             raise ValueError("result identity is invalid")
         if type(require_guarded) is not bool:
@@ -419,9 +437,27 @@ class TaskLedger:
             row = document["rows"].get(f"{node}@{contract_rev}")
             if not isinstance(row, Mapping) or row.get("state") not in {"owned", "continuable"} or row.get("owner") != owner or row.get("run") != run or row.get("generation") != generation or row.get("input_sha256") != input_sha256 or (cursor is not None and row.get("cursor") != cursor):
                 raise LedgerConflict("result identity is stale")
-            if row.get("state") == "continuable" and disposition == "continuable":
-                return self._public(row)
             row["state"] = disposition
+            if review_seed is not None:
+                if set(review_seed) != {"disposition", "payload", "status"}:
+                    raise LedgerConflict("result review seed is malformed")
+                try:
+                    encoded_seed = json.dumps(
+                        review_seed,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                    if len(encoded_seed) > _MAX_REVIEW_SEED_BYTES:
+                        raise LedgerConflict("result review seed exceeds the size limit")
+                    normalized_seed = json.loads(
+                        encoded_seed.decode("utf-8")
+                    )
+                except (TypeError, ValueError) as error:
+                    raise LedgerConflict("result review seed is malformed") from error
+                row["review_seed"] = normalized_seed
+            else:
+                row.pop("review_seed", None)
             if disposition == "retired":
                 self._fence_owner(document, owner)
                 self._set_guarded_floor(document, row, force=require_guarded)

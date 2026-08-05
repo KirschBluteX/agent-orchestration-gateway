@@ -111,6 +111,125 @@ class V7DecisionPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(DecisionPolicyError, "unresolved closure"):
             derive_node_decision(unresolved)
 
+    def test_self_contained_microtask_uses_context_partition_child(self) -> None:
+        decision = derive_node_decision(
+            {
+                "acceptance_facts": {
+                    "acceptance_ids": ["A01"],
+                    "deterministic_graph_coverage": ["A01"],
+                    "events": [],
+                    "required_verification_strengths": ["deterministic"],
+                    "risk_assessment": no_risks(),
+                },
+                "closure": {
+                    "acceptance_closed": True,
+                    "criteria_closed": True,
+                    "decision_space": "acceptance_equivalent",
+                    "interfaces_closed": True,
+                    "objective_closed": True,
+                    "ownership_closed": True,
+                },
+                "placement": {
+                    "benefits": [
+                        {
+                            "evidence": [
+                                "capsule:self-contained",
+                                "context:history-not-required",
+                            ],
+                            "kind": "context_partition",
+                        }
+                    ],
+                    "direct_action_count": 1,
+                    "direct_verification_count": 1,
+                },
+                "role": "worker",
+            }
+        )
+
+        self.assertEqual(
+            decision["placement"],
+            {"reason": "context_partition", "target": "child"},
+        )
+        self.assertEqual(decision["assurance"], "mechanical")
+
+    def test_microtask_context_partition_requires_history_isolation_evidence(self) -> None:
+        decision = derive_node_decision(
+            {
+                "acceptance_facts": {
+                    "acceptance_ids": ["A01"],
+                    "deterministic_graph_coverage": ["A01"],
+                    "events": [],
+                    "required_verification_strengths": ["deterministic"],
+                    "risk_assessment": no_risks(),
+                },
+                "closure": {
+                    "acceptance_closed": True,
+                    "criteria_closed": True,
+                    "decision_space": "acceptance_equivalent",
+                    "interfaces_closed": True,
+                    "objective_closed": True,
+                    "ownership_closed": True,
+                },
+                "placement": {
+                    "benefits": [
+                        {
+                            "evidence": ["contract:A01"],
+                            "kind": "context_partition",
+                        }
+                    ],
+                    "direct_action_count": 1,
+                    "direct_verification_count": 1,
+                },
+                "role": "worker",
+            }
+        )
+
+        self.assertEqual(
+            decision["placement"],
+            {"reason": "microtask", "target": "primary"},
+        )
+
+    def test_invalid_context_partition_cannot_hide_behind_closed_chain(self) -> None:
+        decision = derive_node_decision(
+            {
+                "acceptance_facts": {
+                    "acceptance_ids": ["A01"],
+                    "deterministic_graph_coverage": ["A01"],
+                    "events": [],
+                    "required_verification_strengths": ["deterministic"],
+                    "risk_assessment": no_risks(),
+                },
+                "closure": {
+                    "acceptance_closed": True,
+                    "criteria_closed": True,
+                    "decision_space": "acceptance_equivalent",
+                    "interfaces_closed": True,
+                    "objective_closed": True,
+                    "ownership_closed": True,
+                },
+                "placement": {
+                    "benefits": [
+                        {
+                            "evidence": ["contract:A01"],
+                            "kind": "closed_chain",
+                        },
+                        {
+                            "evidence": ["contract:A01"],
+                            "kind": "context_partition",
+                        },
+                    ],
+                    "direct_action_count": 1,
+                    "direct_verification_count": 1,
+                },
+                "role": "worker",
+            }
+        )
+
+        self.assertEqual(
+            decision["placement"],
+            {"reason": "microtask", "target": "primary"},
+        )
+
     def test_only_real_risk_events_require_independent_acceptance(self) -> None:
         facts = {
             "acceptance_ids": ["A01"],

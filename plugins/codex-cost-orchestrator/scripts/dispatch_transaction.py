@@ -1455,12 +1455,11 @@ def stop_outcome(payload: Mapping[str, Any]) -> dict[str, str]:
             if any(node["state"] in {"active", "dispatching"} for node in record["nodes"].values())
         ]
         if in_flight:
-            detail = "; ".join(_compact_context(record) for record in in_flight)
             return {
                 "decision": "block",
                 "reason": (
-                    "CCO_EVENT_FIRST_WAIT 1800000 ms requested for active native owner(s) or in-flight spawn(s); "
-                    "wait for a native event and do not emit a progress-only response. " + detail
+                    "CCO_EVENT_FIRST_WAIT: native Agent work is still active (up to 1800000 ms). "
+                    "Call wait_agent once and remain silent until a terminal, blocking-input, or user event."
                 ),
             }
         pending = [record for record in records if _transaction_pending(record)]
@@ -1474,8 +1473,8 @@ def stop_outcome(payload: Mapping[str, Any]) -> dict[str, str]:
             return {
                 "decision": "block",
                 "reason": (
-                    "CCO dispatch recovery continuation is available exactly once for undispatched work; "
-                    "use its exact pending reference, then wait for a native event. " + _compact_context(first)
+                    "CCO_DISPATCH_PENDING: one recovery is available; use the exact pending "
+                    "spawn reference already available, then call wait_agent once."
                 ),
             }
         for record in pending:
@@ -1485,7 +1484,7 @@ def stop_outcome(payload: Mapping[str, Any]) -> dict[str, str]:
         for record in pending:
             _cleanup_settled_bundles(root, session, record)
         return {
-            "systemMessage": "CCO dispatch recovery was already used; remaining undispatched nodes were fenced.",
+            "systemMessage": "CCO pending dispatch was fenced after recovery was not completed.",
         }
 
 

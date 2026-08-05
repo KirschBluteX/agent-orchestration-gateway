@@ -2,6 +2,39 @@
 
 The project follows semantic versioning.
 
+## 1.2.0 - 2026-08-05
+
+- Added a graph-level decision fast path: shared facts are closed once, self-contained
+  one-action context partitions may be delegated without inherited history, and no
+  per-node model-classifier request is needed.
+- Changed normal static routing to resolve the complete ready graph once. Per-node
+  probes now run only after a combined-route failure to isolate invalid nodes.
+- Clarified that native `explorer`, `worker`, and `reviewer` are the only execution
+  roles; CCO remains a policy and lifecycle layer over the Codex Agent runtime.
+- Made dispatch-to-wait semantics explicit: issue every ready spawn in the same model
+  turn, then wait for authoritative native events without progress polling.
+- Added a PreToolUse guard that prevents opaque protected collaboration payloads from
+  being copied into plain `send_message` or `followup_task` strings. Unreadable
+  progress, elapsed time, and an unchanged workspace no longer justify interruption.
+- Added a lightweight ordinary-tool fast exit when no transaction marker exists, so
+  the global hook avoids loading graph, workspace, packet, and ledger runtimes.
+- Added a reviewer `review_source` fast path that reuses a terminal worker's ledger
+  baseline, acceptance IDs, scopes, exact changed paths, and validated evidence.
+- Updated SubagentStop for current Desktop UUID identities. Valid `continue` results
+  now end the native transaction while retaining only a continuable task owner;
+  invalid results retire once without triggering a formatting-only second response.
+- Added exact role-aware result templates to both model-neutral leaf profiles and
+  shortened Stop-hook feedback so Primary can enter one `wait_agent` call quietly.
+- Added exact published 1.1.3 read/write profile hashes so `--bootstrap` upgrades an
+  unchanged previous installation while still preserving unknown user modifications.
+- Invalidated reviewer seed evidence whenever a continuation advances dispatch
+  identity or a valid result is too large to retain, preventing stale evidence from
+  being rebound to a newer capsule.
+- Kept deterministic routine acceptance in Primary and reserved independent review
+  for real risk, semantic/manual evidence, deviation, or an explicit user request.
+- Reworked the English and Simplified Chinese READMEs around installation, default
+  routes, everyday use, workspace boundaries, and concise visitor-facing behavior.
+
 ## 1.1.3 - 2026-08-05
 
 - Added bounded non-Git directory workspaces without automatic `git init`: workers

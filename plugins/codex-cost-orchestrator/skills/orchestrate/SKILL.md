@@ -26,6 +26,14 @@ independent review. Keep reference prose out of leaf messages.
 
 ## Close, place, route
 
+Make **one graph-level decision** after the user goal, repository facts, and
+acceptance contract are closed. The graph decision derives assurance, placement,
+and acceptance for the ready set once; it is the only classifier pass. There is
+**no per-node model classifier** and no repeated model request merely to choose a child.
+The compiler validates and derives every node locally inside that one graph pass.
+Put facts shared by several nodes in graph `defaults`, then describe each node only
+by its contract, typed scopes, dependencies, and real responsibility differences.
+
 Assign one logical role:
 
 - `explorer`: bounded read-only inspection or probe;
@@ -47,6 +55,14 @@ benefit exists: `parallel_ready`, `context_partition`, `closed_chain`,
 `explicit_delegation`. A task with at most one direct action and one direct check stays
 in Primary when `closed_chain` is its only benefit. File count, price, model name,
 estimated tokens, or a vague claim that delegation is helpful never proves placement.
+
+The single-action fast path is deliberately narrow. A one-action/one-check worker may
+use `context_partition` only when its capsule carries both
+`capsule:self-contained` and `context:history-not-required`; otherwise it remains in
+Primary. A low-risk open-ended document task may first be closed by Primary with a
+minimal outline and deterministic acceptance, then send only the document contract to
+the same fast path. This keeps long history out of the leaf without handing unresolved
+content choices to it.
 
 Re-evaluate closure and ownership only after a material fact changes. Reclaim
 duplicate, overlapping, or no-longer-useful work before routing.
@@ -88,7 +104,10 @@ python -B <PLUGIN_ROOT>/scripts/graph_compiler.py --repo <REPO> --native-capacit
 ```
 
 Pass the JSON object on stdin. It contains `nodes` and may contain host `native_catalog` and route
-`policy`. The compiler derives decisions, captures one scope-limited workspace
+`policy`. A reviewer node may use `review_source` to bind a terminal worker ledger
+row; the compiler then reuses its baseline, acceptance IDs, exact scopes, changed
+paths, and result evidence without another repository inspection. The compiler
+derives decisions, captures one scope-limited workspace
 baseline, maximizes useful dependency-ready non-conflicting work up to native
 capacity, and returns exact spawn inputs plus precompiled fallbacks. It never spawns.
 Git and bounded non-Git directory roots use the same entry and capsule; CCO never
@@ -107,6 +126,12 @@ context. If they close the graph, do not read the repository again before prepar
 it. If one material fact is missing, dispatch one narrow explorer for that fact; do
 not make Primary perform an open-ended inspection first.
 
+All three roles use this same preparation entry. Give an explorer one exact question,
+repository anchors, and required evidence. Give a worker the already-closed plan node
+and exact write scopes; never infer a worker scope. Give a reviewer a closed review
+contract plus `review_source` when a terminal worker ledger row is available. Do not
+reconstruct facts that the compiler can bind from that row.
+
 For one ready graph, close once, compile once, dispatch every returned ready reference
 in the same model turn, then enter one long event wait. Do not insert route
 explanations, status checks, file reads, tests, edits, or baseline recaptures between
@@ -114,11 +139,11 @@ the compiler result and those spawn calls. The transaction gate makes this seque
 fail closed. A confirmed pre-thread rejection may consume only its already-prepared
 fallback in that same dispatch turn.
 
-Use graph-level `defaults` for facts shared by nodes. Describe each node only by its
-contract, typed scopes, responsibility, dependencies, and genuine differences. Do
-not construct separate graphs merely to use different models; routing is a compiler
-output. Do not repeat capability lookup, closure derivation, or route selection per
-node.
+Use graph-level `defaults` for facts shared by nodes. Do not construct separate graphs
+merely to use different models; routing is a compiler output. The compiler performs
+one combined route resolution on the normal path. It probes individual nodes only
+after that combined operation fails, so a malformed node can be isolated without
+making every successful graph pay for duplicate local work.
 
 ## Dispatch and wait
 
@@ -128,9 +153,17 @@ splits. A CCO leaf never delegates; Primary owns the complete graph.
 
 After dispatch, Primary may continue only a node already proven unsuitable for a
 child when it cannot overlap, conflict with, or depend on active leaf work. Otherwise
-enter one long event wait. Do not poll status, emit progress-only model turns, or
+call `wait_agent` once and enter one long event wait. Do not poll status, emit progress-only model turns, or
 duplicate a leaf. Wake only for completion, blocking input, user input, or the long
 native protection timeout.
+
+Only an **authoritative native terminal event** proves that an Agent completed,
+failed, or was interrupted. An explicit blocking-input event may wake Primary without
+retiring its owner. Unreadable or protected progress, an unchanged workspace, elapsed
+time, and missing commentary are not completion evidence. Preserve the owner and wait
+again after a protection timeout unless the native runtime reports a terminal state.
+Never forward opaque protected payloads through plain-text `send_message` or
+`followup_task`; the PreToolUse gate blocks such a type-boundary violation.
 
 ## Lifecycle and recovery
 
@@ -141,6 +174,12 @@ canonical task path or releases a confirmed pre-thread rejection. A continuation
 increments only the cursor and preserves owner, generation, contract, route, and
 baseline. Interrupt retires and fences the owner before native interruption.
 
+Current Codex hosts identify SubagentStop with a native thread UUID. CCO maps it to
+the reserved canonical owner through the bounded session metadata record and exact
+dispatch identity; older canonical owner IDs remain compatible. Every valid
+SubagentStop retires the native dispatch transaction. A `continue` disposition keeps
+only the TaskLedger owner continuable for an explicit later delta.
+
 Treat every result as a claim. `CCO_RESULT cco.v7` must cover acceptance IDs, declare
 exact changed paths, and match the current workspace delta inside that node's scopes.
 Only a complete reviewer may return `accept`; explorer and worker never claim Primary
@@ -148,6 +187,12 @@ acceptance. Large terminal graph artifacts are deleted immediately. Small owner
 tombstones remain across turns for fencing. The next SessionStart immediately removes
 validated terminal state from prior sessions; live, unknown, locked, or malformed
 abandoned state remains subject to bounded stale cleanup of up to seven days.
+
+Leaf profiles receive the exact three-line result shape before execution. If a result
+still fails structural, identity, evidence, scope, or workspace validation, the hook
+retires and fences that child in the same terminal callback and returns control to
+Primary. It never blocks SubagentStop merely to purchase a second formatting response
+from the same child.
 
 Normalize each failure into one stable failure signature. Retry only when new evidence
 changes the intervention. A confirmed pre-thread rejection uses a precompiled route
@@ -168,7 +213,8 @@ Primary acceptance is allowed when every acceptance ID has deterministic evidenc
 one unchanged state and no review trigger exists. Use a fresh reviewer only for a real
 risk, manual/semantic evidence, failure/deviation, contract or scope surprise,
 unresolved integration choice, Primary-owned implementation, or an explicit user
-request. Ordinary Primary micro-edits do not trigger review.
+request. Ordinary Primary micro-edits do not trigger review, and a routine child with
+complete deterministic evidence **does not require a reviewer**.
 
 A reviewer is a fresh read leaf with `fork_turns: none`. A contract-preserving evidence
 delta may continue that reviewer. Architecture, interface, ownership, schema, safety,

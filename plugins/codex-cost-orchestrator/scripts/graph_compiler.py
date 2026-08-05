@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from decision_policy import (
     DecisionPolicyError,
+    RISK_CATEGORIES,
     derive_node_decision,
     normalize_risk_assessment,
     select_ready_nodes,
@@ -25,7 +26,12 @@ from dispatch_transaction import (
     DispatchTransactionError,
     prepare_dispatch_batch as prepare_transaction_batch,
 )
-from packet_compiler import CapsuleError, compile_dispatch
+from packet_compiler import (
+    CapsuleError,
+    compile_dispatch,
+    result_sha256,
+    validate_result_for_dispatch,
+)
 from prepared_graph import (
     artifact_path,
     graph_scopes,
@@ -43,7 +49,12 @@ from directory_state import (
     directory_root,
     normalize_directory_scope,
 )
-from protocol_hash import ProtocolHashError, canonical_bytes, require_repository_scope
+from protocol_hash import (
+    ProtocolHashError,
+    canonical_bytes,
+    repository_scopes_overlap,
+    require_repository_scope,
+)
 from routing_catalog import (
     RoutingCatalogError,
     advance_route_plan,
@@ -52,6 +63,7 @@ from routing_catalog import (
     load_route_policy,
     resolve_route_plan,
 )
+from task_ledger import LedgerConflict, TaskLedger
 from workspace_state import (
     DEFAULT_IGNORED_MAX_BYTES,
     DEFAULT_IGNORED_MAX_FILES,
@@ -680,22 +692,47 @@ def prepare_dispatch_graph(
             policy_error = error
 
     routable_items: list[dict[str, Any]] = []
+    route_plan: dict[str, Any] | None = None
     if catalog_error is not None or policy_error is not None:
         error = catalog_error or policy_error
         for item in child_items:
             route_errors[item["node"]] = str(error)
     else:
-        for item in child_items:
-            try:
-                resolve_route_plan(
-                    [_route_request(item)],
-                    native_catalog,
-                    policy=loaded_policy,
-                )
-            except RoutingCatalogError as error:
-                route_errors[item["node"]] = str(error)
-            else:
-                routable_items.append(item)
+        # Resolve the ready graph once on the normal path.  Individual probes are
+        # deliberately a failure-isolation fallback: one malformed or unsupported
+        # node must not return otherwise valid siblings to Primary, but it should
+        # never make the common path pay for duplicate local route work.
+        try:
+            route_plan = resolve_route_plan(
+                [_route_request(item) for item in child_items],
+                native_catalog,
+                policy=loaded_policy,
+            )
+        except RoutingCatalogError:
+            for item in child_items:
+                try:
+                    resolve_route_plan(
+                        [_route_request(item)],
+                        native_catalog,
+                        policy=loaded_policy,
+                    )
+                except RoutingCatalogError as error:
+                    route_errors[item["node"]] = str(error)
+                else:
+                    routable_items.append(item)
+            if routable_items:
+                try:
+                    route_plan = resolve_route_plan(
+                        [_route_request(item) for item in routable_items],
+                        native_catalog,
+                        policy=loaded_policy,
+                    )
+                except RoutingCatalogError as error:
+                    raise GraphCompilerError(
+                        f"combined route plan is inconsistent after isolation: {error}"
+                    ) from error
+        else:
+            routable_items = list(child_items)
     for item in child_items:
         if item["node"] in route_errors:
             item["decision"]["placement"] = {
@@ -709,18 +746,6 @@ def prepare_dispatch_graph(
         for member in item["member_nodes"]
     }
     child_items = routable_items
-    try:
-        route_plan = (
-            resolve_route_plan(
-                [_route_request(item) for item in child_items],
-                native_catalog,
-                policy=loaded_policy,
-            )
-            if child_items
-            else None
-        )
-    except RoutingCatalogError as error:  # defensive: per-node probes already passed
-        raise GraphCompilerError(f"combined route plan is inconsistent: {error}") from error
     if not child_items:
         return _no_dispatch_result(
             normalized,
@@ -1071,6 +1096,181 @@ def compact_dispatch_batch(prepared: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _review_source_row(source: object) -> dict[str, Any]:
+    if (
+        not isinstance(source, Mapping)
+        or set(source) != {"contract_rev", "node"}
+        or not isinstance(source.get("node"), str)
+        or NODE_ID.fullmatch(str(source["node"])) is None
+        or isinstance(source.get("contract_rev"), bool)
+        or not isinstance(source.get("contract_rev"), int)
+        or int(source["contract_rev"]) < 1
+    ):
+        raise GraphCompilerError("review_source must identify one exact ledger node revision")
+    session_id = os.environ.get("CODEX_THREAD_ID")
+    if not isinstance(session_id, str) or SESSION_ID.fullmatch(session_id) is None:
+        raise GraphCompilerError("CODEX_THREAD_ID is required for review_source")
+    configured = os.environ.get("CCO_LEDGER_DIR")
+    ledger_root = (
+        Path(configured).expanduser()
+        if configured
+        else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "ledger"
+    )
+    try:
+        rows = TaskLedger(ledger_root.resolve(), session_id).read_rows()
+    except (LedgerConflict, OSError, ValueError) as error:
+        raise GraphCompilerError("review_source ledger is unavailable") from error
+    matches = [
+        row
+        for row in rows
+        if row.get("node") == source["node"]
+        and row.get("contract_rev") == source["contract_rev"]
+    ]
+    if len(matches) != 1:
+        raise GraphCompilerError("review_source ledger row is absent or ambiguous")
+    row = matches[0]
+    if row.get("role") != "worker" or row.get("state") not in {"continuable", "retired"}:
+        raise GraphCompilerError("review_source must be a terminal worker result")
+    acceptance_ids = row.get("acceptance_ids")
+    baseline = row.get("baseline")
+    scopes = row.get("scopes")
+    input_sha256 = row.get("input_sha256")
+    seed = row.get("review_seed")
+    if (
+        not isinstance(acceptance_ids, list)
+        or not acceptance_ids
+        or acceptance_ids != sorted(set(acceptance_ids))
+        or not isinstance(baseline, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", baseline) is None
+        or not isinstance(input_sha256, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", input_sha256) is None
+        or not isinstance(scopes, list)
+        or not isinstance(seed, Mapping)
+        or set(seed) != {"disposition", "payload", "status"}
+    ):
+        raise GraphCompilerError("review_source ledger row has no complete review seed")
+    try:
+        normalized_scopes = [
+            require_repository_scope(scope, f"review_source.scopes[{index}]")
+            for index, scope in enumerate(scopes)
+        ]
+        if normalized_scopes != scopes or normalized_scopes != sorted(
+            normalized_scopes,
+            key=lambda item: (item["kind"], item["path"]),
+        ):
+            raise GraphCompilerError("review_source scopes are not canonical")
+        result: dict[str, Any] = {
+            "dispatch_sha256": input_sha256,
+            "disposition": seed["disposition"],
+            "payload": seed["payload"],
+            "protocol": "cco.v7",
+            "status": seed["status"],
+        }
+        result["result_sha256"] = result_sha256(result)
+        normalized_result = validate_result_for_dispatch(
+            result,
+            role="worker",
+            acceptance_ids=acceptance_ids,
+        )
+    except (CapsuleError, ProtocolHashError, TypeError, ValueError) as error:
+        raise GraphCompilerError("review_source result evidence is invalid") from error
+    if any(
+        not any(
+            repository_scopes_overlap(scope, {"kind": "exact", "path": path})
+            for scope in normalized_scopes
+        )
+        for path in normalized_result["payload"]["changed_paths"]
+    ):
+        raise GraphCompilerError("review_source changed path is outside its worker scopes")
+    return {
+        "acceptance_ids": list(acceptance_ids),
+        "baseline": baseline,
+        "result": normalized_result,
+        "scopes": normalized_scopes,
+        "source": {"contract_rev": source["contract_rev"], "node": source["node"]},
+    }
+
+
+def _expand_review_source(value: Mapping[str, Any], index: int) -> dict[str, Any]:
+    if "review_source" not in value:
+        return dict(value)
+    row = _review_source_row(value["review_source"])
+    expanded = {name: deepcopy(item) for name, item in value.items() if name != "review_source"}
+    node = expanded.get("node")
+    if not isinstance(node, str) or NODE_ID.fullmatch(node) is None:
+        raise GraphCompilerError(f"graph node {index}.node is invalid")
+    contract = expanded.get("contract")
+    acceptance = contract.get("acceptance") if isinstance(contract, Mapping) else None
+    if (
+        not isinstance(acceptance, list)
+        or not acceptance
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"criterion", "id"}
+            or not isinstance(item.get("criterion"), str)
+            or not str(item["criterion"]).strip()
+            or not isinstance(item.get("id"), str)
+            for item in acceptance
+        )
+        or sorted(str(item["id"]) for item in acceptance) != row["acceptance_ids"]
+    ):
+        raise GraphCompilerError(
+            f"graph node {index}.contract must close every review_source acceptance ID"
+        )
+    derived = {
+        "acceptance_facts": {
+            "acceptance_ids": row["acceptance_ids"],
+            "deterministic_graph_coverage": [],
+            "events": ["explicit_independent_review"],
+            "required_verification_strengths": ["manual"],
+            "risk_assessment": {name: "no" for name in RISK_CATEGORIES},
+        },
+        "closure": {
+            "acceptance_closed": True,
+            "criteria_closed": True,
+            "decision_space": "bounded_effect",
+            "interfaces_closed": True,
+            "objective_closed": True,
+            "ownership_closed": True,
+        },
+        "evidence": {
+            "source": row["source"],
+            "source_result": row["result"],
+        },
+        "fork_turns": "none",
+        "placement": {
+            "benefits": [
+                {
+                    "evidence": [
+                        f"ledger:{row['source']['node']}@{row['source']['contract_rev']}"
+                    ],
+                    "kind": "independent_evidence",
+                }
+            ],
+            "direct_action_count": 1,
+            "direct_verification_count": 1,
+        },
+        "review_baseline": row["baseline"],
+        "role": "reviewer",
+        "scopes": row["scopes"],
+    }
+    for name, expected in derived.items():
+        if name in expanded and expanded[name] != expected:
+            raise GraphCompilerError(
+                f"graph node {index}.{name} conflicts with review_source"
+            )
+        expanded[name] = expected
+    expanded.setdefault("generation", 1)
+    expanded.setdefault(
+        "selection",
+        {
+            "depends_on": [],
+            "responsibility": f"review:{row['source']['node']}",
+        },
+    )
+    return expanded
+
+
 def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, Any]:
     if not isinstance(document, Mapping):
         raise GraphCompilerError("prepare input must be a JSON object")
@@ -1105,7 +1305,7 @@ def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, A
             raise GraphCompilerError(f"graph node {index} must be an object")
         merged = {name: deepcopy(item) for name, item in defaults.items()}
         merged.update({name: deepcopy(item) for name, item in value.items()})
-        nodes.append(merged)
+        nodes.append(_expand_review_source(merged, index))
     prepared = prepare_dispatch_graph(
         nodes,
         completed_nodes=document.get("completed_nodes"),

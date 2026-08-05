@@ -55,6 +55,9 @@ from workspace_state import StateError, repository_root  # noqa: E402
 
 
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+THREAD_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 TASK_NAME = re.compile(
     r"^(?:(?:explorer|worker)_[a-z0-9][a-z0-9_]*_g[0-9]{2,}|review_e[0-9]{2,}_[a-z0-9][a-z0-9_]*_g[0-9]{2,})$"
@@ -62,10 +65,12 @@ TASK_NAME = re.compile(
 V7_HEADER = "CCO_DISPATCH cco.v7"
 TERMINAL_STALE_SECONDS = 24 * 60 * 60
 LIVE_STALE_SECONDS = 7 * TERMINAL_STALE_SECONDS
+REVIEW_SEED_MAX_BYTES = 64 * 1024
 SESSION_CONTEXT = (
     "CCO is mandatory for every native Agent spawn. Prepare one closed cco.v7 "
     "graph before dispatch. Only an explicit user-authorized CCO_NATIVE_BYPASS v1 "
-    "may use native inheritance. CCO leaves never delegate."
+    "may use native inheritance. CCO leaves never delegate. After dispatch, wait for "
+    "a native terminal, blocking-input, or user event; never forward opaque progress."
 )
 
 
@@ -75,7 +80,9 @@ def _is_reparse(path: Path) -> bool:
     except FileNotFoundError:
         return False
     attributes = getattr(metadata, "st_file_attributes", 0)
-    return bool(metadata.st_mode & 0o120000) or bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
 
 
 def _has_reparse_ancestor(path: Path) -> bool:
@@ -108,6 +115,85 @@ def ledger_for(payload: Mapping[str, Any]) -> TaskLedger | None:
     if not isinstance(session_id, str) or SESSION_ID.fullmatch(session_id) is None:
         return None
     return TaskLedger(_ledger_root(payload), session_id)
+
+
+def _sessions_root() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    codex_home = Path(configured).expanduser() if configured else Path.home() / ".codex"
+    return Path(os.path.abspath(codex_home / "sessions")).resolve()
+
+
+def _transcript_owner(payload: Mapping[str, Any], agent_id: str) -> str:
+    transcript_value = payload.get("agent_transcript_path")
+    if not isinstance(transcript_value, str) or not transcript_value:
+        raise LedgerConflict("UUID result has no agent transcript")
+    transcript = Path(os.path.abspath(Path(transcript_value).expanduser()))
+    sessions_root = _sessions_root()
+    if _is_reparse(transcript):
+        raise LedgerConflict("agent transcript cannot be a reparse point")
+    try:
+        resolved = transcript.resolve(strict=True)
+        normalized_root = os.path.normcase(str(sessions_root))
+        normalized_transcript = os.path.normcase(str(resolved))
+        if (
+            os.path.commonpath((normalized_root, normalized_transcript))
+            != normalized_root
+        ):
+            raise LedgerConflict("agent transcript is outside the Codex sessions root")
+    except (OSError, ValueError) as error:
+        if isinstance(error, LedgerConflict):
+            raise
+        raise LedgerConflict("agent transcript is unavailable") from error
+    if not resolved.name.endswith(f"-{agent_id}.jsonl"):
+        raise LedgerConflict("agent transcript does not match the native thread")
+    try:
+        with resolved.open("rb") as stream:
+            line = stream.readline(65_537)
+    except OSError as error:
+        raise LedgerConflict("agent transcript is unavailable") from error
+    if not line or len(line) > 65_536:
+        raise LedgerConflict("agent session metadata is missing or oversized")
+    try:
+        record = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LedgerConflict("agent session metadata is invalid") from error
+    metadata = record.get("payload") if isinstance(record, Mapping) else None
+    if record.get("type") != "session_meta" or not isinstance(metadata, Mapping):
+        raise LedgerConflict("agent transcript does not begin with session metadata")
+    if metadata.get("id") != agent_id:
+        raise LedgerConflict("agent session metadata does not match the native thread")
+    session_id = payload.get("session_id")
+    if metadata.get("parent_thread_id") != session_id:
+        raise LedgerConflict("agent session metadata does not match the parent task")
+    owner_values: list[str] = []
+    direct_owner = metadata.get("agent_path")
+    if isinstance(direct_owner, str):
+        owner_values.append(direct_owner)
+    source = metadata.get("source")
+    if isinstance(source, Mapping):
+        subagent = source.get("subagent")
+        if isinstance(subagent, Mapping):
+            spawn = subagent.get("thread_spawn")
+            if isinstance(spawn, Mapping) and isinstance(spawn.get("agent_path"), str):
+                owner_values.append(str(spawn["agent_path"]))
+    owners = set(owner_values)
+    if len(owners) != 1:
+        raise LedgerConflict("agent session metadata has no unique canonical owner")
+    owner = owners.pop()
+    if TASK_PATH.fullmatch(owner) is None:
+        raise LedgerConflict("agent session metadata owner is not canonical")
+    return owner
+
+
+def _result_owner(payload: Mapping[str, Any]) -> str:
+    agent_id = payload.get("agent_id")
+    if not isinstance(agent_id, str):
+        raise LedgerConflict("result has no native agent identity")
+    if TASK_PATH.fullmatch(agent_id) is not None:
+        return agent_id
+    if THREAD_ID.fullmatch(agent_id) is not None:
+        return _transcript_owner(payload, agent_id)
+    raise LedgerConflict("result has no canonical owner mapping")
 
 
 def prepared_workspace_claim(payload: Mapping[str, Any], capsule: Mapping[str, Any]) -> dict[str, Any]:
@@ -413,9 +499,7 @@ def retire_invalid_subagent_stop(payload: Mapping[str, Any]) -> None:
     ledger = ledger_for(payload)
     if ledger is None or not ledger.path.exists():
         raise LedgerConflict("v7 result has no live dispatch ledger")
-    owner = payload.get("agent_id")
-    if not isinstance(owner, str) or TASK_PATH.fullmatch(owner) is None:
-        raise LedgerConflict("result has no canonical owner")
+    owner = _result_owner(payload)
     row = ledger.retire_after_invalid_stop(owner)
     retire_transaction_owner(payload, owner, fenced=True)
     _cleanup_terminal_graph_artifact(ledger, payload, row)
@@ -426,9 +510,7 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
     parsed = fields or parse_result_message(payload.get("last_assistant_message"))
     if ledger is None or not ledger.path.exists():
         raise LedgerConflict("v7 result has no live dispatch ledger")
-    owner = payload.get("agent_id")
-    if not isinstance(owner, str) or TASK_PATH.fullmatch(owner) is None:
-        raise LedgerConflict("result has no canonical owner")
+    owner = _result_owner(payload)
     rows = [row for row in ledger.read_rows() if row.get("owner") == owner and row.get("input_sha256") == parsed.get("dispatch_sha256")]
     if len(rows) != 1:
         raise LedgerConflict("v7 result dispatch identity is stale")
@@ -481,6 +563,13 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
         or bool(result_payload["blockers"])
         or bool(result_payload["deviations"])
     )
+    review_seed: dict[str, Any] | None = {
+        "disposition": parsed["disposition"],
+        "payload": parsed["payload"],
+        "status": parsed["status"],
+    }
+    if len(canonical_bytes(review_seed)) > REVIEW_SEED_MAX_BYTES:
+        review_seed = None
     ledger.record_result(
         node=str(row["node"]),
         contract_rev=int(row["contract_rev"]),
@@ -491,9 +580,11 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
         disposition=disposition,
         cursor=int(row["cursor"]),
         require_guarded=require_guarded,
+        review_seed=review_seed,
     )
-    if disposition == "retired":
-        retire_transaction_owner(payload, owner)
+    # SubagentStop is a native terminal event even when the TaskLedger retains
+    # a continuable owner for an explicit later follow-up.
+    retire_transaction_owner(payload, owner)
     if disposition == "retired":
         _cleanup_terminal_graph_artifact(ledger, payload, row)
 

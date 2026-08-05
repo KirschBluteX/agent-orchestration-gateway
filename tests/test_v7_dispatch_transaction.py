@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -17,11 +18,12 @@ sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 
 import agent_preflight  # noqa: E402
 import dispatch_transaction  # noqa: E402
+import graph_compiler  # noqa: E402
 import ledger_runtime  # noqa: E402
 import prepared_graph  # noqa: E402
 import subagent_stop  # noqa: E402
 from graph_compiler import compact_dispatch_batch, prepare_dispatch_graph  # noqa: E402
-from packet_compiler import compile_result, parse_message  # noqa: E402
+from packet_compiler import compile_continuation, compile_result, parse_message  # noqa: E402
 
 
 def native_catalog() -> dict[str, object]:
@@ -60,8 +62,15 @@ def no_risks() -> dict[str, str]:
     }
 
 
-def node(name: str, path: str, *, generation: int = 1) -> dict[str, object]:
-    return {
+def node(
+    name: str,
+    path: str,
+    *,
+    generation: int = 1,
+    role: str = "worker",
+    epoch: str | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
         "acceptance_facts": {
             "acceptance_ids": ["A01"],
             "deterministic_graph_coverage": ["A01"],
@@ -85,13 +94,83 @@ def node(name: str, path: str, *, generation: int = 1) -> dict[str, object]:
             "direct_action_count": 2,
             "direct_verification_count": 1,
         },
-        "role": "worker",
+        "role": role,
         "scopes": [{"kind": "exact", "path": path}],
         "selection": {"depends_on": [], "responsibility": name},
     }
+    if epoch is not None:
+        value["epoch"] = epoch
+    return value
 
 
 class DispatchTransactionTests(unittest.TestCase):
+    def test_ordinary_pretool_without_transaction_uses_lightweight_fast_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.dict(os.environ, {"CCO_LEDGER_DIR": temp_dir}),
+                mock.patch.object(
+                    agent_preflight,
+                    "_transaction_module",
+                    side_effect=AssertionError("heavy transaction runtime was loaded"),
+                ),
+            ):
+                self.assertEqual(
+                    agent_preflight.evaluate(
+                        {
+                            "cwd": temp_dir,
+                            "hook_event_name": "PreToolUse",
+                            "session_id": "fast-path-session",
+                            "tool_input": {"command": "git status --short"},
+                            "tool_name": "shell_command",
+                            "tool_use_id": "ordinary-fast-path",
+                        }
+                    ),
+                    {},
+                )
+
+    def test_protected_collaboration_payload_is_never_forwarded_as_plain_text(self) -> None:
+        payloads = (
+            "gAAAAAB-protected-agent-payload-" + ("x" * 96),
+            '{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}',
+            '[{"type":"input_text","text":"Payload:"},{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}]',
+            '{"type":"agent_message","content":[{"type":"input_text","text":"Payload:"},{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}]}',
+        )
+        tools = (
+            "send_message",
+            "followup_task",
+            "collaborationsend_message",
+            "collaborationfollowup_task",
+        )
+        for tool_name in tools:
+            for index, message in enumerate(payloads, start=1):
+                outcome = agent_preflight.evaluate(
+                    {
+                        "cwd": str(Path.cwd()),
+                        "hook_event_name": "PreToolUse",
+                        "session_id": f"protected-message-{index}",
+                        "tool_input": {"message": message, "target": "/root/worker"},
+                        "tool_name": tool_name,
+                        "tool_use_id": f"protected-message-{index}",
+                    }
+                )
+                self.assertEqual(outcome["decision"], "block")
+                self.assertIn("CCO_PROTECTED_MESSAGE", outcome["reason"])
+
+        explanatory_text = agent_preflight.evaluate(
+            {
+                "cwd": str(Path.cwd()),
+                "hook_event_name": "PreToolUse",
+                "session_id": "protected-message-explanation",
+                "tool_input": {
+                    "message": "The host may persist an opaque token beginning with gAAAA.",
+                    "target": "/root/unmanaged",
+                },
+                "tool_name": "send_message",
+                "tool_use_id": "protected-message-explanation",
+            }
+        )
+        self.assertEqual(explanatory_text, {})
+
     def _prepared(self, root: Path, session_id: str, *nodes: dict[str, object]) -> tuple[Path, dict[str, object]]:
         repo = root / "repo"
         repo.mkdir(parents=True, exist_ok=True)
@@ -114,7 +193,13 @@ class DispatchTransactionTests(unittest.TestCase):
         return repo, prepared
 
     def _transaction(self, root: Path, repo: Path, prepared: dict[str, object], session_id: str) -> dict[str, object]:
-        environment = mock.patch.dict(os.environ, {"CCO_LEDGER_DIR": str(root / "ledger")})
+        environment = mock.patch.dict(
+            os.environ,
+            {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_THREAD_ID": session_id,
+            },
+        )
         environment.start()
         self.addCleanup(environment.stop)
         return dispatch_transaction.prepare_dispatch_batch(
@@ -123,6 +208,172 @@ class DispatchTransactionTests(unittest.TestCase):
             repo=repo,
             session_id=session_id,
         )
+
+    def test_uuid_subagent_stop_maps_transcript_owner_and_retires_native_transaction_on_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "019fc182-69b7-7421-8dba-0b49338f57d3"
+            child_id = "019fd229-244e-75f1-83cd-b13108dfc5a3"
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_worker", "review.txt"),
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            dispatch = batch["dispatches"][0]
+            preflight = {
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": dispatch,
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-review-uuid",
+            }
+            expanded = agent_preflight.evaluate(preflight)["hookSpecificOutput"]["updatedInput"]
+            owner = "/root/" + expanded["task_name"]
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {
+                        **preflight,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"task_path": owner},
+                    }
+                ),
+                {},
+            )
+            capsule = parse_message(expanded["message"])
+            result = compile_result(
+                capsule,
+                status="complete",
+                disposition="continue",
+                blockers=[],
+                changed_paths=[],
+                deviations=[],
+                evidence={"A01": "worker completed its bounded check"},
+                failure_signature=None,
+                summary="worker completed with a follow-up available",
+            )
+            codex_home = root / "codex-home"
+            transcript = codex_home / "sessions" / "2026" / "08" / "05" / f"rollout-{child_id}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "agent_path": owner,
+                            "id": child_id,
+                            "parent_thread_id": session_id,
+                            "source": {
+                                "subagent": {
+                                    "thread_spawn": {"agent_path": owner}
+                                }
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+                self.assertEqual(
+                    subagent_stop.evaluate(
+                        {
+                            "agent_id": child_id,
+                            "agent_transcript_path": str(transcript),
+                            "agent_type": expanded["agent_type"],
+                            "cwd": str(repo),
+                            "hook_event_name": "SubagentStop",
+                            "last_assistant_message": result,
+                            "session_id": session_id,
+                            "stop_hook_active": False,
+                        }
+                    ),
+                    {},
+                )
+
+            row = ledger_runtime.ledger_for({"cwd": str(repo), "session_id": session_id}).read_rows()[0]
+            self.assertEqual(row["state"], "continuable")
+            self.assertEqual(row["review_seed"]["status"], "complete")
+            self.assertEqual(
+                row["review_seed"]["payload"]["changed_paths"],
+                [],
+            )
+            transaction = dispatch_transaction.read_transaction_state(
+                root / "ledger", session_id, batch["transaction_id"]
+            )
+            self.assertEqual(transaction["nodes"]["n01_worker"]["state"], "terminal")
+            self.assertEqual(
+                dispatch_transaction.stop_outcome(
+                    {"cwd": str(repo), "session_id": session_id}
+                ),
+                {},
+            )
+
+            continuation = compile_continuation(
+                capsule,
+                target=owner,
+                delta={"evidence": "check one additional bounded worker fact"},
+            )
+            continuation_payload = {
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": continuation,
+                "tool_name": "followup_task",
+                "tool_use_id": "continue-review-uuid",
+            }
+            self.assertEqual(agent_preflight.evaluate(continuation_payload), {})
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {
+                        **continuation_payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"delivered": True},
+                    }
+                ),
+                {},
+            )
+            continued_capsule = parse_message(continuation["message"])
+            oversized_result = compile_result(
+                continued_capsule,
+                status="complete",
+                disposition="continue",
+                blockers=[],
+                changed_paths=[],
+                deviations=[],
+                evidence={"A01": "x" * 70_000},
+                failure_signature=None,
+                summary="completed with evidence too large for a bounded review seed",
+            )
+            with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+                self.assertEqual(
+                    subagent_stop.evaluate(
+                        {
+                            "agent_id": child_id,
+                            "agent_transcript_path": str(transcript),
+                            "agent_type": expanded["agent_type"],
+                            "cwd": str(repo),
+                            "hook_event_name": "SubagentStop",
+                            "last_assistant_message": oversized_result,
+                            "session_id": session_id,
+                            "stop_hook_active": False,
+                        }
+                    ),
+                    {},
+                )
+            continued_row = ledger_runtime.ledger_for(
+                {"cwd": str(repo), "session_id": session_id}
+            ).read_rows()[0]
+            self.assertEqual(continued_row["input_sha256"], continued_capsule["capsule_sha256"])
+            self.assertNotIn("review_seed", continued_row)
+            with self.assertRaisesRegex(
+                graph_compiler.GraphCompilerError,
+                "no complete review seed",
+            ):
+                graph_compiler._review_source_row(
+                    {"contract_rev": 1, "node": "n01_worker"}
+                )
 
     def test_ref_expands_before_reservation_and_activation_discards_only_its_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -271,6 +522,9 @@ class DispatchTransactionTests(unittest.TestCase):
             )
             self.assertEqual(waiting["decision"], "block")
             self.assertIn("CCO_EVENT_FIRST_WAIT", waiting["reason"])
+            self.assertIn("wait_agent", waiting["reason"])
+            self.assertNotIn("transaction", waiting["reason"].casefold())
+            self.assertNotIn("/root/", waiting["reason"])
 
     def test_non_git_worker_spawn_and_result_enforce_full_root_scope_fencing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -413,8 +667,14 @@ class DispatchTransactionTests(unittest.TestCase):
                         "stop_hook_active": False,
                     }
                 )
-                self.assertEqual(rejected["decision"], "block")
-                self.assertIn("outside_scope:outside.txt", rejected["reason"])
+                self.assertNotIn("decision", rejected)
+                self.assertIn("CCO result was rejected", rejected["systemMessage"])
+                self.assertEqual(
+                    ledger_runtime.ledger_for(
+                        {"cwd": str(second_workspace), "session_id": second_session}
+                    ).read_rows()[0]["state"],
+                    "retired",
+                )
 
     def test_rejection_enables_only_its_precompiled_fallback_and_keeps_active_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

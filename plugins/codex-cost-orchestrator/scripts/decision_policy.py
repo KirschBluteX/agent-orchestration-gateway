@@ -299,8 +299,29 @@ def select_v7_placement(
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise DecisionPolicyError(f"{label} must be a non-negative integer")
     facts = normalize_placement_benefits(benefits)
+    required_partition_evidence = {
+        "capsule:self-contained",
+        "context:history-not-required",
+    }
+    invalid_context_partition = any(
+        item["kind"] == "context_partition"
+        and not required_partition_evidence <= set(item["evidence"])
+        for item in facts
+    )
+    facts = [
+        item
+        for item in facts
+        if item["kind"] != "context_partition"
+        or required_partition_evidence <= set(item["evidence"])
+    ]
     kinds = {item["kind"] for item in facts}
     if not kinds:
+        if (
+            invalid_context_partition
+            and direct_action_count <= 1
+            and direct_verification_count <= 1
+        ):
+            return {"reason": "microtask", "target": "primary"}
         return {"reason": "no_structural_benefit", "target": "primary"}
     if (
         kinds == {"closed_chain"}

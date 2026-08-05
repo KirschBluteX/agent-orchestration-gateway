@@ -1,6 +1,6 @@
 # Roadmap
 
-## 1.1 adoption
+## 1.2 adoption
 
 - Validate clean install, update, trust, first dispatch, and uninstall with Windows and
   Linux users.
@@ -10,6 +10,8 @@
   capability differences, and scope attribution; add no plugin telemetry.
 - Measure user-visible prepare-to-spawn latency and transaction recovery behavior with
   reproducible local traces before adding another orchestration layer.
+- Track protected collaboration-content handling across Codex releases and remove the
+  compatibility guard only if the native string-tool boundary makes it unnecessary.
 - Publish workload-matched benchmark inputs and raw observations before making any
   cost or quality claim.
 

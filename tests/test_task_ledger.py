@@ -122,6 +122,66 @@ class TaskLedgerTests(unittest.TestCase):
             self.assertEqual(row["cursor"], 0)
             self.assertEqual(row["input_sha256"], "sha256:" + "b" * 64)
 
+    def test_continuation_and_unseeded_result_clear_stale_review_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = TaskLedger(Path(directory), "session-a")
+            owner = "/root/worker_n01_worker_g01"
+            ledger.reserve("spawn", identity())
+            ledger.activate("spawn", owner)
+            seed = {
+                "disposition": "continue",
+                "payload": {"evidence": "old"},
+                "status": "complete",
+            }
+            ledger.record_result(
+                node="n01_worker",
+                contract_rev=1,
+                run="worker_n01_worker_g01",
+                generation=1,
+                input_sha256="sha256:" + "b" * 64,
+                owner=owner,
+                disposition="continuable",
+                review_seed=seed,
+            )
+            self.assertEqual(ledger.read_rows()[0]["review_seed"], seed)
+
+            ledger.prepare_continuation(
+                "continue-1",
+                owner,
+                previous_input_sha256="sha256:" + "b" * 64,
+                next_input_sha256="sha256:" + "e" * 64,
+                cursor=1,
+            )
+            ledger.settle_pending_continuation("continue-1", accepted=True)
+            row = ledger.read_rows()[0]
+            self.assertEqual(row["input_sha256"], "sha256:" + "e" * 64)
+            self.assertNotIn("review_seed", row)
+
+            ledger.record_result(
+                node="n01_worker",
+                contract_rev=1,
+                run="worker_n01_worker_g01",
+                generation=1,
+                input_sha256="sha256:" + "e" * 64,
+                owner=owner,
+                disposition="continuable",
+                cursor=1,
+                review_seed=seed,
+            )
+            self.assertIn("review_seed", ledger.read_rows()[0])
+            ledger.record_result(
+                node="n01_worker",
+                contract_rev=1,
+                run="worker_n01_worker_g01",
+                generation=1,
+                input_sha256="sha256:" + "e" * 64,
+                owner=owner,
+                disposition="continuable",
+                cursor=1,
+                review_seed=None,
+            )
+            self.assertNotIn("review_seed", ledger.read_rows()[0])
+
     def test_retired_and_superseded_owners_remain_fenced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = TaskLedger(Path(directory), "session-a")

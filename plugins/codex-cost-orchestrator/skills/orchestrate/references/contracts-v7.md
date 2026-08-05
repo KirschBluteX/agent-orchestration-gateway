@@ -18,11 +18,20 @@ new task and prepare a new graph; v6 and v7 owners never share a ledger.
 
 It derives assurance, acceptance mode, placement, the dependency-ready frontier,
 downstream priority, safe compatible microtask aggregation, static routes, fallback
-requests, one whole-graph baseline, and native spawn inputs. The normal CLI commits a
+requests, one whole-graph baseline, and native spawn inputs. Closure and placement
+are derived once for the ready graph; callers never run a per-node model-classifier
+request. A one-action context-partition node is child-eligible only with both
+`capsule:self-contained` and `context:history-not-required` evidence. The normal CLI commits a
 `cco.dispatch-batch.v2` transaction and returns only short spawn references;
 `--full` exposes the diagnostic `cco.graph.v4` manifest, full capsules, and route
 plan without committing a transaction. No caller supplies a selected route pair or
 graph hash.
+
+A CLI reviewer node may replace repeated worker-state fields with `review_source`
+(`node` plus `contract_rev`). It must identify one terminal worker row in the current
+task ledger. The compiler derives reviewer role, guarded acceptance facts, exact
+scopes, `review_baseline`, source evidence, no-history fork, and default selection;
+Primary still supplies the reviewer node, epoch, and closed semantic review contract.
 
 The prepared-workspace layer has two adapters without changing the capsule: `git`
 uses Git/control-state identity; `directory` binds the exact non-Git root. Directory
@@ -39,6 +48,17 @@ verifies the prepared workspace and sibling leases, reserves the owner, and then
 Codex perform the native spawn. A successful sibling remains active if another node
 gets a confirmed pre-thread rejection; only that node may use its next precompiled
 fallback. Graph-level identity or workspace failure fences the remaining batch.
+
+The dispatch fast path is one compiler call followed by all ready native spawns in the
+same model turn. Primary then waits for a completion, user message, blocking input, or
+the protection timeout; progress-only turns are not part of the protocol.
+
+Completion, failure, and interruption are established only by authoritative native
+terminal events. Protected or unreadable progress content, no workspace delta, no
+commentary, and elapsed time do not settle a node. A protection timeout wakes Primary
+for recovery but preserves the owner unless the host also reports a terminal state.
+Opaque protected content remains in the host's typed field and must never be copied
+into a plain `send_message` or `followup_task` string.
 
 ## Dispatch envelope
 
@@ -116,10 +136,18 @@ subset. Read-only leaves declare no changed paths. A blocked result has a blocke
 Any non-complete, blocked, or deviating result has one stable lowercase canonical
 failure signature; a successful exact result uses `null`.
 
-SubagentStop matches the result to the current owner, capsule, role, cursor, graph,
-workspace, and node scopes. Declared worker paths must equal the real delta inside
+SubagentStop maps a current native thread UUID to the canonical owner using the
+bounded first `session_meta` record from `agent_transcript_path`; older hosts that
+send the canonical owner directly remain compatible. It then matches the result to
+the current owner, capsule, role, cursor, graph, workspace, and node scopes. Declared worker paths must equal the real delta inside
 that node's scopes. Only a complete reviewer may return `accept`; that is still a
 review claim until Primary confirms the exact state.
+
+SubagentStop is authoritative native terminality. Every valid result retires the
+dispatch transaction, including `continue`; the TaskLedger alone retains a
+continuable owner for an explicit later capsule. A structurally or semantically
+invalid result is retired and fenced in the same callback, so validation never forces
+the leaf to generate a second formatting-only response.
 
 ## Ledger and cleanup
 
@@ -127,7 +155,9 @@ PreToolUse claims one exact transaction reference and reserves one
 `node@contract_rev`; PostToolUse activates exactly one canonical native owner or
 releases a confirmed pre-thread rejection. Continuations
 reserve and settle one next cursor. Interrupt retires and fences before native
-interruption. Terminal results leave small owner tombstones so late results and raw
+interruption. A validated result keeps a bounded review seed (status, disposition,
+payload, and evidence) in the task row so `review_source` can bind it without reading
+the repository again. Terminal results leave owner tombstones so late results and raw
 follow-ups remain fenced across turns.
 
 Full transaction bundles are deleted as their candidates settle. An exhausted route

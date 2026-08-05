@@ -16,6 +16,7 @@ HOOKS = ROOT / "plugins" / "codex-cost-orchestrator" / "hooks"
 sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 
 import agent_preflight  # noqa: E402
+import graph_compiler  # noqa: E402
 import ledger_runtime  # noqa: E402
 from graph_compiler import (  # noqa: E402
     GraphCompilerError,
@@ -63,6 +64,75 @@ def no_risks() -> dict[str, str]:
 
 
 class V7PrepareTests(unittest.TestCase):
+    def test_valid_graph_resolves_static_routes_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+            node = {
+                "acceptance_facts": {
+                    "acceptance_ids": ["A01"],
+                    "deterministic_graph_coverage": ["A01"],
+                    "events": [],
+                    "required_verification_strengths": ["deterministic"],
+                    "risk_assessment": no_risks(),
+                },
+                "closure": {
+                    "acceptance_closed": True,
+                    "criteria_closed": True,
+                    "decision_space": "acceptance_equivalent",
+                    "interfaces_closed": True,
+                    "objective_closed": True,
+                    "ownership_closed": True,
+                },
+                "contract": {
+                    "contract_rev": 1,
+                    "node": "n01_route_once",
+                    "objective": "change owned.txt",
+                },
+                "generation": 1,
+                "node": "n01_route_once",
+                "placement": {
+                    "benefits": [
+                        {
+                            "evidence": [
+                                "capsule:self-contained",
+                                "context:history-not-required",
+                            ],
+                            "kind": "context_partition",
+                        }
+                    ],
+                    "direct_action_count": 1,
+                    "direct_verification_count": 1,
+                },
+                "role": "worker",
+                "scopes": [{"kind": "exact", "path": "owned.txt"}],
+                "selection": {
+                    "depends_on": [],
+                    "responsibility": "single-route-resolution",
+                },
+            }
+            with (
+                mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "v7-route-once"}),
+                mock.patch(
+                    "graph_compiler.resolve_route_plan",
+                    wraps=graph_compiler.resolve_route_plan,
+                ) as resolver,
+            ):
+                prepared = prepare_dispatch_graph(
+                    [node],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+
+        self.assertEqual(prepared["route_errors"], {})
+        self.assertEqual(len(prepared["dispatches"]), 1)
+        self.assertEqual(resolver.call_count, 1)
+
     def test_toml_policy_routes_through_graph_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

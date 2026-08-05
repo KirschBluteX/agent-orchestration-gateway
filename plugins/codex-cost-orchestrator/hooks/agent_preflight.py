@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any
 
 from protocol_envelope import load_utf8_json
@@ -15,40 +17,69 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from ledger_runtime import (  # noqa: E402
-    preflight_continuation,
-    prepared_workspace_claim,
-    reserve_spawn,
-)
-from dispatch_transaction import (  # noqa: E402
-    CONTINUATION_TOOL_NAMES,
-    DispatchTransactionError,
-    SPAWN_TOOL_NAMES,
-    abort_pending_transaction,
-    claim_spawn_reference,
-    exact_abort_for_payload,
-    has_pending_transaction,
-    release_spawn_claim,
-)
-from packet_compiler import (  # noqa: E402
-    DISPATCH_HEADER,
-    READ_ROLE,
-    WRITE_ROLE,
-    parse_message,
-)
-
-
 SPAWN_FIELDS = frozenset(
     {"agent_type", "fork_turns", "message", "model", "reasoning_effort", "task_name"}
 )
+SPAWN_TOOL_NAMES = frozenset({"Agent", "spawn_agent", "collaborationspawn_agent"})
+CONTINUATION_TOOL_NAMES = frozenset(
+    {
+        "send_message",
+        "followup_task",
+        "collaborationsend_message",
+        "collaborationfollowup_task",
+    }
+)
 CONTINUATION_FIELDS = frozenset({"message", "target"})
+SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
+PROTECTED_TOKEN = re.compile(r"^gAAAA[A-Za-z0-9_-]{80,}={0,2}$")
+DISPATCH_HEADER = "CCO_DISPATCH cco.v7"
+READ_ROLE = "cost_orchestrator_read_leaf"
+WRITE_ROLE = "cost_orchestrator_write_leaf"
 BYPASS_HEADER = "CCO_NATIVE_BYPASS v1"
 OLD_HEADER = "CCO_DISPATCH cco.v6"
 
 
 class PacketError(ValueError):
     """Native arguments do not match a canonical v7 capsule."""
+
+
+def _transaction_module() -> Any:
+    import dispatch_transaction
+
+    return dispatch_transaction
+
+
+def _ledger_module() -> Any:
+    import ledger_runtime
+
+    return ledger_runtime
+
+
+def _packet_module() -> Any:
+    import packet_compiler
+
+    return packet_compiler
+
+
+def _transaction_state_may_exist(payload: dict[str, Any]) -> bool:
+    """Cheap negative check used before importing workspace and ledger runtimes."""
+
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str):
+        return False
+    if SESSION_ID.fullmatch(session_id) is None:
+        return True
+    configured = os.environ.get("CCO_LEDGER_DIR")
+    root = (
+        Path(configured).expanduser()
+        if configured
+        else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "ledger"
+    )
+    try:
+        return (root / f"{session_id}.dispatch-transactions.json").exists()
+    except OSError:
+        return True
 
 
 def block_outcome(error: Exception | None = None, *, code: str = "CCO_INVALID") -> dict[str, str]:
@@ -77,16 +108,56 @@ def _bypass_outcome(tool_input: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_protected_payload_text(message: object) -> bool:
+    """Reject opaque host payloads that were copied into a plain-string tool field."""
+
+    if not isinstance(message, str):
+        return False
+    stripped = message.strip()
+    if PROTECTED_TOKEN.fullmatch(stripped) is not None:
+        return True
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+
+    def protected(item: object) -> bool:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "encrypted_content"
+            and isinstance(item.get("encrypted_content"), str)
+            and bool(item["encrypted_content"])
+            and set(item) == {"type", "encrypted_content"}
+        ):
+            return True
+        if isinstance(item, dict):
+            return any(protected(child) for child in item.values())
+        if isinstance(item, list):
+            return any(protected(child) for child in item)
+        return False
+
+    return protected(value)
+
+
 def _expanded_reference_outcome(payload: dict[str, Any]) -> dict[str, Any]:
     """Turn one persisted exact v2 ref into the canonical native v7 input."""
 
-    expanded = claim_spawn_reference(payload)
+    transaction = _transaction_module()
+    ledger = _ledger_module()
+    expanded = transaction.claim_spawn_reference(payload)
     try:
         capsule = validate_dispatch(expanded)
-        workspace = prepared_workspace_claim(payload, capsule)
-        reserve_spawn(payload, capsule, str(expanded["agent_type"]), workspace=workspace)
+        workspace = ledger.prepared_workspace_claim(payload, capsule)
+        ledger.reserve_spawn(
+            payload,
+            capsule,
+            str(expanded["agent_type"]),
+            workspace=workspace,
+        )
     except Exception:
-        release_spawn_claim(payload)
+        transaction.release_spawn_claim(payload)
         raise
     return {
         "hookSpecificOutput": {
@@ -100,9 +171,10 @@ def _expanded_reference_outcome(payload: dict[str, Any]) -> dict[str, Any]:
 def _pending_transaction_outcome(payload: dict[str, Any]) -> dict[str, Any]:
     """Gate every local tool while a managed transaction still has work."""
 
-    transaction_id = exact_abort_for_payload(payload)
+    transaction = _transaction_module()
+    transaction_id = transaction.exact_abort_for_payload(payload)
     if transaction_id is not None:
-        abort_pending_transaction(payload, transaction_id)
+        transaction.abort_pending_transaction(payload, transaction_id)
         # The hook performs the exact fencing action itself.  Block the carrier
         # tool so a message/continuation cannot also become unrelated work.
         return block_outcome(
@@ -120,7 +192,7 @@ def _pending_transaction_outcome(payload: dict[str, Any]) -> dict[str, Any]:
 def validate_dispatch(tool_input: object) -> dict[str, Any]:
     if not isinstance(tool_input, dict) or set(tool_input) != SPAWN_FIELDS:
         raise PacketError("v7 native spawn shape is invalid")
-    capsule = parse_message(tool_input.get("message"))
+    capsule = _packet_module().parse_message(tool_input.get("message"))
     expected_role = WRITE_ROLE if capsule["role"] == "worker" else READ_ROLE
     expected = {
         "agent_type": expected_role,
@@ -140,7 +212,7 @@ def validate_dispatch(tool_input: object) -> dict[str, Any]:
 def validate_v7_continuation(tool_input: object) -> dict[str, Any]:
     if not isinstance(tool_input, dict) or set(tool_input) != CONTINUATION_FIELDS:
         raise PacketError("v7 continuation shape is invalid")
-    capsule = parse_message(tool_input.get("message"))
+    capsule = _packet_module().parse_message(tool_input.get("message"))
     target = tool_input.get("target")
     if (
         capsule["execution"]["cursor"] < 1
@@ -157,12 +229,16 @@ def evaluate(value: object) -> dict[str, Any]:
         return {}
     tool_input = value.get("tool_input")
     tool_name = value.get("tool_name")
+    managed_tool = tool_name in SPAWN_TOOL_NAMES | CONTINUATION_TOOL_NAMES
+    if not managed_tool and not _transaction_state_may_exist(value):
+        return {}
     try:
         # PreToolUse now runs for every local tool.  A pending transaction gates
         # all of them, including ordinary tools and native-bypass attempts.
+        transaction = _transaction_module()
         try:
-            pending = has_pending_transaction(value)
-        except DispatchTransactionError as error:
+            pending = transaction.has_pending_transaction(value)
+        except transaction.DispatchTransactionError as error:
             # Older direct-v7 callers/tests have no host session identity.  The
             # host always supplies one for transaction enforcement; a v2 ref is
             # still fail-closed below because it cannot be a direct v7 packet.
@@ -191,17 +267,31 @@ def evaluate(value: object) -> dict[str, Any]:
                     ),
                 )
             capsule = validate_dispatch(tool_input)
-            workspace = prepared_workspace_claim(value, capsule)
-            reserve_spawn(value, capsule, str(tool_input["agent_type"]), workspace=workspace)
+            ledger = _ledger_module()
+            workspace = ledger.prepared_workspace_claim(value, capsule)
+            ledger.reserve_spawn(
+                value,
+                capsule,
+                str(tool_input["agent_type"]),
+                workspace=workspace,
+            )
             return {}
         if tool_name in CONTINUATION_TOOL_NAMES:
             message = tool_input.get("message")
+            if _is_protected_payload_text(message):
+                return block_outcome(
+                    PacketError(
+                        "opaque host collaboration content must remain in its native protected field; "
+                        "wait for an authoritative native event instead of forwarding it"
+                    ),
+                    code="CCO_PROTECTED_MESSAGE",
+                )
             if isinstance(message, str) and message.startswith(DISPATCH_HEADER):
                 capsule = validate_v7_continuation(tool_input)
-                preflight_continuation(value, capsule)
+                _ledger_module().preflight_continuation(value, capsule)
                 return {}
             # Native-bypass owners are unmanaged. Managed owners still fail closed.
-            preflight_continuation(value)
+            _ledger_module().preflight_continuation(value)
             return {}
         return {}
     except Exception as error:

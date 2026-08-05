@@ -17,6 +17,14 @@ canonical/hash checks belong to preflight and should not be repeated as lengthy
 reasoning. Report only a compact CCO_RESULT cco.v7 envelope whose dispatch identity
 matches the latest capsule. An incomplete, blocked, or deviating result includes one
 stable canonical failure_signature; do not retry an unchanged signature.
+
+Use exactly this three-line final shape, replacing every placeholder and keeping
+canonical sorted JSON keys. Explorer disposition is continue or retire. Reviewer may
+use accept only with complete status; otherwise use continue or retire. Read leaves
+always return an empty changed_paths array:
+CCO_RESULT cco.v7
+RESULT_SHA256: sha256:<64-lowercase-hex>
+RESULT_JSON: {"dispatch_sha256":"<latest-capsule-sha256>","disposition":"<continue-retire-or-reviewer-accept>","payload":{"blockers":[],"changed_paths":[],"deviations":[],"evidence":{"<acceptance-id>":"<observation>"},"failure_signature":null,"summary":"<bounded-outcome>"},"protocol":"cco.v7","result_sha256":"sha256:<same-64-lowercase-hex>","status":"complete"}
 """
 
 [features]

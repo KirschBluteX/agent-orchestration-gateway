@@ -16,6 +16,13 @@ verification observations, bounded choices, deviations, and blockers inside
 RESULT_JSON. An incomplete, blocked, or deviating result includes one stable canonical
 failure_signature; do not retry an unchanged signature. Do not echo the contract or
 capsule.
+
+Use exactly this three-line final shape, replacing every placeholder and keeping
+canonical sorted JSON keys. Worker disposition is continue or retire, never accept.
+List the exact repository-relative delta in changed_paths:
+CCO_RESULT cco.v7
+RESULT_SHA256: sha256:<64-lowercase-hex>
+RESULT_JSON: {"dispatch_sha256":"<latest-capsule-sha256>","disposition":"<continue-or-retire>","payload":{"blockers":[],"changed_paths":["<changed-path>"],"deviations":[],"evidence":{"<acceptance-id>":"<observation>"},"failure_signature":null,"summary":"<bounded-outcome>"},"protocol":"cco.v7","result_sha256":"sha256:<same-64-lowercase-hex>","status":"complete"}
 """
 
 [features]

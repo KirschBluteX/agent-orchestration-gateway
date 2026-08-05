@@ -29,28 +29,19 @@ def evaluate(payload: object) -> dict[str, str]:
         return {}
     try:
         accept_subagent_result(payload)
-    except Exception as error:
-        if payload["stop_hook_active"]:
-            try:
-                retire_invalid_subagent_stop(payload)
-            except Exception as retirement_error:
-                return {
-                    "systemMessage": (
-                        "WARNING: CCO result remained invalid on its final stop pass; "
-                        f"the owner could not be fully fenced ({retirement_error}). "
-                        f"Validation error: {error}"
-                    ),
-                }
+    except Exception:
+        try:
+            retire_invalid_subagent_stop(payload)
+        except Exception:
             return {
                 "systemMessage": (
-                    "WARNING: CCO result remained invalid on its final stop pass; "
-                    "the owner was retired and fenced, and its next generation requires guarded assurance. "
-                    f"Validation error: {error}"
+                    "CCO result was rejected; Primary must recover the child lifecycle state."
                 ),
             }
         return {
-            "decision": "block",
-            "reason": f"Return one structurally complete CCO_RESULT cco.v7 packet ({error}); do not redo completed work.",
+            "systemMessage": (
+                "CCO result was rejected and the child was retired; Primary must inspect the actual state."
+            ),
         }
     return {}
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import tomllib
 import unittest
@@ -40,7 +41,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertRegex(
-            manifest["version"], r"^1\.1\.3\+codex\.[a-z0-9-]+$"
+            manifest["version"], r"^1\.2\.0\+codex\.[a-z0-9-]+$"
         )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
@@ -49,6 +50,22 @@ class ProjectContractTests(unittest.TestCase):
         )
         for unrelated in ("OpenSquilla", "sol-advisor", "DannyMac180"):
             self.assertNotIn(unrelated, english + chinese + text(SKILL))
+
+    def test_release_identity_is_consistent_across_runtime_and_docs(self) -> None:
+        manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
+        release = manifest["version"].split("+", 1)[0]
+        installer = text(PLUGIN / "scripts" / "install_agents.py")
+        changelog = text(REPO / "CHANGELOG.md")
+        compatibility = text(REFERENCES / "runtime-gates.md")
+        installer_match = re.search(r'^PLUGIN_VERSION = "([^"]+)"$', installer, re.MULTILINE)
+        changelog_match = re.search(r"^## ([0-9]+\.[0-9]+\.[0-9]+) - ", changelog, re.MULTILINE)
+
+        self.assertIsNotNone(installer_match)
+        self.assertIsNotNone(changelog_match)
+        self.assertEqual(installer_match.group(1), release)
+        self.assertEqual(changelog_match.group(1), release)
+        release_line = ".".join(release.split(".")[:2])
+        self.assertIn(f"The {release_line} release contract", compatibility)
 
     def test_installation_uses_current_codex_plugin_commands_and_explicit_trust(self) -> None:
         combined = text(REPO / "README.md") + text(REPO / "README.zh-CN.md")
@@ -83,6 +100,17 @@ class ProjectContractTests(unittest.TestCase):
             self.assertFalse(profile["features"]["multi_agent"])
             self.assertEqual(profile["features"]["multi_agent_v2"], {"enabled": False})
             self.assertIn("CCO_DISPATCH cco.v7", profile["developer_instructions"])
+            self.assertIn("RESULT_SHA256: sha256:<64-lowercase-hex>", profile["developer_instructions"])
+            self.assertIn('RESULT_JSON: {"dispatch_sha256":', profile["developer_instructions"])
+            for field in (
+                '"blockers"',
+                '"changed_paths"',
+                '"deviations"',
+                '"evidence"',
+                '"failure_signature"',
+                '"summary"',
+            ):
+                self.assertIn(field, profile["developer_instructions"])
         self.assertEqual(
             profiles["codex-cost-orchestrator-read-leaf.toml"]["sandbox_mode"],
             "read-only",
@@ -165,6 +193,14 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("same model turn", skill)
         self.assertIn("one long event wait", skill)
         self.assertIn("do not read the repository again", skill.casefold())
+        self.assertIn("one graph-level decision", skill.casefold())
+        self.assertIn("no per-node model classifier", skill.casefold())
+        self.assertIn("capsule:self-contained", skill)
+        self.assertIn("context:history-not-required", skill)
+        self.assertIn("does not require a reviewer", skill.casefold())
+        self.assertIn("authoritative native terminal event", skill.casefold())
+        self.assertIn("never forward opaque protected payloads", skill.casefold())
+        self.assertIn("CCO_PROTECTED_MESSAGE", text(PLUGIN / "hooks" / "agent_preflight.py"))
 
     def test_no_accounting_encryption_or_second_runtime_is_shipped(self) -> None:
         lowered = current_runtime_text().casefold()
