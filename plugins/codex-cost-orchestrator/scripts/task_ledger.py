@@ -23,7 +23,9 @@ class LedgerBusy(RuntimeError):
 
 
 _TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
-_STATES = frozenset({"reserved", "rejected", "owned", "continuable", "retired"})
+_STATES = frozenset(
+    {"reserved", "rejected", "exhausted", "owned", "continuable", "retired"}
+)
 _ROLES = frozenset({"explorer", "worker", "reviewer"})
 _PHYSICAL_ROLES = frozenset({"cost_orchestrator_read_leaf", "cost_orchestrator_write_leaf"})
 _ASSURANCES = frozenset({"mechanical", "bounded", "guarded"})
@@ -33,7 +35,7 @@ _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _EFFORT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 _EPOCH = re.compile(r"^e[0-9]{2,}$")
 _POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
-_WORKSPACE_FIELDS = frozenset({"baseline", "baseline_path", "graph_scopes", "graph_sha256", "scopes", "workspace_mode"})
+_WORKSPACE_FIELDS = frozenset({"baseline", "baseline_path", "graph_scopes", "graph_sha256", "scopes", "workspace_backend", "workspace_mode"})
 _LOCK_WAIT_SECONDS = 0.25
 _STALE_LOCK_SECONDS = 60.0
 
@@ -203,7 +205,7 @@ class TaskLedger:
         if present:
             if present != _WORKSPACE_FIELDS:
                 raise ValueError("claim workspace identity is incomplete")
-            if not isinstance(identity["baseline"], str) or _SHA256.fullmatch(identity["baseline"]) is None or not isinstance(identity["graph_sha256"], str) or _SHA256.fullmatch(identity["graph_sha256"]) is None or not isinstance(identity["baseline_path"], str) or not Path(identity["baseline_path"]).is_absolute() or identity["workspace_mode"] not in {"light", "strict"} or not isinstance(identity["scopes"], list) or not isinstance(identity["graph_scopes"], list):
+            if not isinstance(identity["baseline"], str) or _SHA256.fullmatch(identity["baseline"]) is None or not isinstance(identity["graph_sha256"], str) or _SHA256.fullmatch(identity["graph_sha256"]) is None or not isinstance(identity["baseline_path"], str) or not Path(identity["baseline_path"]).is_absolute() or identity["workspace_backend"] not in {"git", "directory"} or identity["workspace_mode"] not in {"light", "strict"} or not isinstance(identity["scopes"], list) or not isinstance(identity["graph_scopes"], list):
                 raise ValueError("claim workspace identity is invalid")
             for scope_set in (identity["scopes"], identity["graph_scopes"]):
                 if scope_set != sorted(scope_set, key=lambda item: (item.get("kind", ""), item.get("path", ""))):
@@ -264,6 +266,12 @@ class TaskLedger:
                 document["rows"][key] = row
                 self._write(document)
                 return self._public(row)
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("state") in {"exhausted", "retired"}
+                and row["route"]["rank"] != 1
+            ):
+                raise LedgerConflict(f"{key} new generation must restart at rank 1")
             if isinstance(existing, Mapping) and (row["generation"] <= existing.get("generation", 0) or row["run"] == existing.get("run") or row["contract_sha256"] != existing.get("contract_sha256")):
                 raise LedgerConflict(f"{key} requires a newer generation")
             if isinstance(existing, Mapping) and isinstance(existing.get("owner"), str):
@@ -302,6 +310,21 @@ class TaskLedger:
             row["owner"] = None
             row.pop("_pending", None)
             self._write(document)
+
+    def exhaust_rejection(self, call_id: str) -> dict[str, Any]:
+        """Turn a rejected pre-thread candidate chain into a terminal tombstone."""
+
+        with self._lock():
+            document = self._read()
+            row = self._find_by_call(document, call_id)
+            if row.get("state") == "exhausted":
+                return self._public(row)
+            if row.get("state") != "rejected" or row.get("owner") is not None:
+                raise LedgerConflict("only an unowned rejection can be exhausted")
+            row["state"] = "exhausted"
+            row.pop("_pending", None)
+            self._write(document)
+            return self._public(row)
 
     def prepare_continuation(self, call_id: str, owner: str, *, previous_input_sha256: str, next_input_sha256: str, cursor: int) -> dict[str, Any]:
         with self._lock():
@@ -425,7 +448,10 @@ class TaskLedger:
             if not self.path.exists():
                 return True
             document = self._read()
-            if force or all(row.get("state") == "retired" for row in document["rows"].values()):
+            if force or all(
+                row.get("state") in {"exhausted", "retired"}
+                for row in document["rows"].values()
+            ):
                 self.path.unlink(missing_ok=True)
                 return True
             return False

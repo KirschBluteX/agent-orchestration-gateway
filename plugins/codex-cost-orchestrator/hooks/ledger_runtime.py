@@ -31,11 +31,17 @@ from prepared_graph import (  # noqa: E402
     cleanup_session_artifacts,
     cleanup_stale_artifacts,
     dispatch_workspace_claim,
+    load_artifact,
     verify_artifact_workspace,
 )
 from dispatch_transaction import (  # noqa: E402
+    CONTINUATION_TOOL_NAMES,
+    cleanup_stale_dispatch_state,
     DispatchTransactionError,
+    INTERRUPT_TOOL_NAMES,
+    SPAWN_TOOL_NAMES,
     fence_spawn_call,
+    graph_has_live_transaction,
     retire_owner as retire_transaction_owner,
     settle_spawn_rejection,
     settle_spawn_success,
@@ -153,6 +159,7 @@ def claim_from_fields(fields: Mapping[str, Any], *, role: str | None = None, wor
             "graph_sha256": workspace.get("graph_sha256"),
             "scopes": workspace.get("scopes"),
             "workspace_mode": workspace.get("workspace_mode"),
+            "workspace_backend": workspace.get("workspace_backend"),
         })
     return claim
 
@@ -232,7 +239,10 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
         if transaction_claim["state"] != "dispatching":
             try:
                 ledger.release(call_id)
-            except LedgerConflict:
+                row = ledger.exhaust_rejection(call_id)
+                fence_spawn_call(payload)
+                _cleanup_terminal_graph_artifact(ledger, payload, row)
+            except (LedgerConflict, DispatchTransactionError):
                 pass
             return {"decision": "block", "reason": "CCO transaction spawn was fenced before native activation"}
         paths = _task_paths(payload.get("tool_response"))
@@ -251,7 +261,10 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
         if not paths and _native_rejection(payload.get("tool_response")):
             try:
                 ledger.release(call_id)
-                settle_spawn_rejection(payload)
+                fallback_available = settle_spawn_rejection(payload)
+                if not fallback_available:
+                    row = ledger.exhaust_rejection(call_id)
+                    _cleanup_terminal_graph_artifact(ledger, payload, row)
                 return {}
             except (LedgerConflict, DispatchTransactionError) as error:
                 try:
@@ -325,6 +338,7 @@ def preflight_continuation(payload: Mapping[str, Any], fields: Mapping[str, Any]
         "run",
         "scopes",
         "workspace_mode",
+        "workspace_backend",
     )
     if any(row.get(name) != candidate.get(name) for name in immutable):
         raise LedgerConflict("continuation immutable dispatch fields do not match owner")
@@ -365,12 +379,27 @@ def _cleanup_terminal_graph_artifact(
     if not row.get("baseline_path"):
         return
     graph_identity = str(row["graph_sha256"])
+    try:
+        artifact = load_artifact(Path(str(row["baseline_path"])))
+    except PreparedGraphError:
+        return
+    dispatch_nodes = set(artifact["dispatch_nodes"])
     graph_rows = [
         candidate
         for candidate in ledger.read_rows()
         if candidate.get("graph_sha256") == graph_identity
     ]
-    if graph_rows and all(candidate.get("state") == "retired" for candidate in graph_rows):
+    terminal_nodes = {
+        str(candidate["node"])
+        for candidate in graph_rows
+        if candidate.get("state") in {"exhausted", "retired"}
+    }
+    if dispatch_nodes <= terminal_nodes and all(
+        candidate.get("state") in {"exhausted", "retired"}
+        for candidate in graph_rows
+    ):
+        if graph_has_live_transaction(payload, graph_identity):
+            return
         cleanup_graph_artifact(
             ledger.root,
             str(payload["session_id"]),
@@ -510,6 +539,11 @@ def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
             keep_session_id=session_id,
             max_age_seconds=LIVE_STALE_SECONDS,
         )
+        cleanup_stale_dispatch_state(
+            ledger.root,
+            keep_session_id=session_id,
+            max_age_seconds=LIVE_STALE_SECONDS,
+        )
         TaskLedger.cleanup_stale(
             ledger.root,
             keep_session_id=session_id,
@@ -536,11 +570,11 @@ def evaluate(payload: object) -> dict[str, Any]:
     if event == "UserPromptSubmit":
         return transaction_user_prompt_context(payload)
     if event == "PostToolUse":
-        if tool_name in {"spawn_agent", "Agent"}:
+        if tool_name in SPAWN_TOOL_NAMES:
             return postflight_spawn(payload)
-        if tool_name in {"send_message", "followup_task"}:
+        if tool_name in CONTINUATION_TOOL_NAMES:
             postflight_continuation(payload)
-    elif event == "PreToolUse" and tool_name in {"interrupt_agent", "interruptAgent"}:
+    elif event == "PreToolUse" and tool_name in INTERRUPT_TOOL_NAMES:
         preflight_interrupt(payload)
     return {}
 

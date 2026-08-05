@@ -25,6 +25,7 @@ from typing import Any, Iterator, Mapping
 from packet_compiler import parse_message
 from protocol_hash import ProtocolHashError, canonical_bytes, require_repository_scope
 from workspace_state import StateError, repository_root
+from directory_state import DirectoryStateError, directory_root
 
 from prepared_graph import (
     graph_scopes,
@@ -46,13 +47,32 @@ TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 SPAWN_FIELDS = frozenset(
     {"agent_type", "fork_turns", "message", "model", "reasoning_effort", "task_name"}
 )
-NODE_STATES = frozenset({"prepared", "dispatching", "active", "rejected", "fenced", "terminal"})
-TRANSACTION_STATES = NODE_STATES
+SPAWN_TOOL_NAMES = frozenset({"Agent", "spawn_agent", "collaborationspawn_agent"})
+CONTINUATION_TOOL_NAMES = frozenset(
+    {
+        "send_message",
+        "followup_task",
+        "collaborationsend_message",
+        "collaborationfollowup_task",
+    }
+)
+INTERRUPT_TOOL_NAMES = frozenset(
+    {"interrupt_agent", "interruptAgent", "collaborationinterrupt_agent"}
+)
+NODE_STATES = frozenset(
+    {"prepared", "dispatching", "active", "rejected", "exhausted", "fenced", "terminal"}
+)
+TRANSACTION_STATES = NODE_STATES - {"exhausted"}
 _LOCK_WAIT_SECONDS = 0.25
 _STALE_LOCK_SECONDS = 60.0
 _MAX_STATE_BYTES = 4 * 1024 * 1024
 _MAX_BUNDLE_BYTES = 2 * 1024 * 1024
 _MAX_TRANSACTIONS = 32
+_STATE_SUFFIX = ".dispatch-transactions.json"
+_BUNDLE_DIRECTORY = re.compile(
+    r"^(?P<session>[A-Za-z0-9][A-Za-z0-9._-]{0,255})-(?P<transaction>[0-9a-f]{64})$"
+)
+_BUNDLE_FILE = re.compile(r"^[0-9a-f]{64}\.json$")
 
 
 class DispatchTransactionError(RuntimeError):
@@ -92,12 +112,21 @@ def _has_reparse_ancestor(path: Path) -> bool:
 def _external_root(ledger_root: Path, repo: Path) -> Path:
     resolved = _resolved_ledger_root(ledger_root)
     try:
-        repository = repository_root(Path(repo)).resolve()
-    except (OSError, StateError) as error:
+        repository = workspace_root(Path(repo))
+    except (OSError, DirectoryStateError, StateError) as error:
         raise DispatchTransactionError("transaction directory cannot be resolved") from error
     if resolved == repository or repository in resolved.parents or resolved in repository.parents:
         raise DispatchTransactionError("transaction directory must be outside repository")
     return resolved
+
+
+def workspace_root(path: Path) -> Path:
+    """Resolve the exact Git work tree or exact non-Git directory workspace."""
+
+    try:
+        return repository_root(Path(path)).resolve()
+    except (OSError, StateError):
+        return directory_root(Path(path))
 
 
 def _resolved_ledger_root(ledger_root: Path) -> Path:
@@ -177,14 +206,29 @@ def bundle_path(ledger_root: Path, session_id: str, transaction_id: str, spawn_r
     session = _session(session_id)
     transaction = _sha(transaction_id, "transaction identity")
     reference = _sha(spawn_ref, "spawn reference")
-    root = Path(os.path.abspath(Path(ledger_root).expanduser())).resolve()
-    return root.parent / "dispatch-bundles" / f"{session}-{transaction[7:]}" / f"{reference[7:]}.json"
+    root = _resolved_ledger_root(Path(ledger_root))
+    bundle_root = root.parent / "dispatch-bundles"
+    if _has_reparse_ancestor(bundle_root):
+        raise DispatchTransactionError(
+            "transaction bundle directory cannot use a reparse ancestor"
+        )
+    return (
+        bundle_root
+        / f"{session}-{transaction[7:]}"
+        / f"{reference[7:]}.json"
+    )
 
 
 def _write_atomic(path: Path, value: Mapping[str, Any]) -> None:
+    if _has_reparse_ancestor(path.parent):
+        raise DispatchTransactionError(
+            "transaction output directory uses a reparse ancestor"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    if _is_reparse(path.parent):
-        raise DispatchTransactionError("transaction output directory is a reparse point")
+    if _has_reparse_ancestor(path.parent):
+        raise DispatchTransactionError(
+            "transaction output directory uses a reparse ancestor"
+        )
     payload = canonical_bytes(dict(value))
     descriptor, temporary_name = tempfile.mkstemp(prefix=".cco-transaction-", dir=path.parent)
     temporary = Path(temporary_name)
@@ -265,7 +309,39 @@ def _read_document(root: Path, session_id: str) -> dict[str, Any]:
 def _write_document(root: Path, session_id: str, document: Mapping[str, Any]) -> None:
     if set(document) != {"protocol", "session_id", "transactions"}:
         raise DispatchTransactionError("transaction state cannot be committed")
+    transactions = document.get("transactions")
+    if not isinstance(transactions, Mapping) or len(transactions) > _MAX_TRANSACTIONS:
+        raise DispatchTransactionError("transaction state capacity is exhausted")
     _write_atomic(_state_path(root, session_id), document)
+
+
+def _prune_terminal_transactions(
+    root: Path, session_id: str, document: dict[str, Any], *, reserve: int = 1
+) -> None:
+    """Evict oldest validated terminal records before committing new state."""
+
+    required = max(0, len(document["transactions"]) + reserve - _MAX_TRANSACTIONS)
+    if required == 0:
+        return
+    terminal: list[tuple[float, str, dict[str, Any]]] = []
+    for transaction_id, value in document["transactions"].items():
+        record = _validate_transaction(transaction_id, value)
+        has_unsettled_native_call = any(
+            node["call_id"] is not None or node["dispatch_ref"] is not None
+            for node in record["nodes"].values()
+        )
+        if (
+            record["state"] in {"fenced", "terminal"}
+            and not _transaction_pending(record)
+            and not has_unsettled_native_call
+        ):
+            terminal.append((float(record["created_at"]), transaction_id, record))
+    terminal.sort(key=lambda item: (item[0], item[1]))
+    if len(terminal) < required:
+        raise DispatchTransactionError("transaction state capacity is exhausted")
+    for _created_at, transaction_id, record in terminal[:required]:
+        _remove_transaction_bundles(root, session_id, record)
+        del document["transactions"][transaction_id]
 
 
 def _candidate(value: object, *, node: str) -> dict[str, Any]:
@@ -359,6 +435,20 @@ def _node_state(value: object, *, expected_node: str) -> dict[str, Any]:
     elif state == "fenced":
         if value["owner"] is not None or eligible is not None or active or prepared or dispatching:
             raise DispatchTransactionError("transaction fenced node state is corrupted")
+    elif state == "exhausted":
+        if (
+            value["owner"] is not None
+            or value["call_id"] is not None
+            or dispatch_ref is not None
+            or eligible is not None
+            or active
+            or prepared
+            or dispatching
+            or any(candidate["state"] != "rejected" for candidate in candidates)
+        ):
+            raise DispatchTransactionError(
+                "transaction exhausted node state is corrupted"
+            )
     elif state == "terminal":
         if value["owner"] is not None or value["call_id"] is not None or dispatch_ref is not None or eligible is not None or active or prepared or dispatching:
             raise DispatchTransactionError("transaction terminal node state is corrupted")
@@ -517,7 +607,7 @@ def _canonical_dispatch(value: object, *, batch: Mapping[str, Any], fallback: bo
         capsule = parse_message(dispatch["message"])
     except Exception as error:
         raise DispatchTransactionError("prepared native dispatch is not a canonical v7 input") from error
-    if capsule["baseline"] != batch["baseline"] or capsule["graph_sha256"] != batch["graph_sha256"]:
+    if capsule["graph_sha256"] != batch["graph_sha256"]:
         raise DispatchTransactionError("prepared native dispatch does not match its graph identity")
     expected_agent_type = (
         "cost_orchestrator_write_leaf"
@@ -679,6 +769,26 @@ def _transaction_pending(transaction: Mapping[str, Any]) -> bool:
     )
 
 
+def graph_has_live_transaction(
+    payload: Mapping[str, Any], graph_sha256_value: str
+) -> bool:
+    """Return whether a graph still owns pending, dispatching, or active work."""
+
+    identity = _sha(graph_sha256_value, "graph identity")
+    _root, _session_id, _repo, records = _records_for_payload(payload)
+    return any(
+        record["graph_sha256"] == identity
+        and (
+            _transaction_pending(record)
+            or any(
+                node["state"] in {"dispatching", "active"}
+                for node in record["nodes"].values()
+            )
+        )
+        for record in records
+    )
+
+
 def _refresh_transaction_state(transaction: dict[str, Any]) -> None:
     nodes = list(transaction["nodes"].values())
     if any(node["state"] == "active" for node in nodes):
@@ -734,7 +844,7 @@ def _workspace_verdict(
             active_sibling_scopes = [
                 scope
                 for node_name, node in transaction["nodes"].items()
-                if node_name != pending_node and node["state"] == "active"
+                if node_name != pending_node and node["state"] in {"active", "terminal"}
                 for scope in node["scopes"]
             ]
             result = verify_pre_spawn_workspace(
@@ -808,7 +918,7 @@ def prepare_dispatch_batch(
 
     session = _session(session_id)
     root = _external_root(Path(ledger_root), Path(repo))
-    resolved_repo = repository_root(Path(repo)).resolve()
+    resolved_repo = workspace_root(Path(repo))
     batch, raw_candidates = _normalize_batch(prepared_batch)
     if not raw_candidates:
         empty = {
@@ -828,6 +938,19 @@ def prepare_dispatch_batch(
             if name in batch:
                 empty[name] = deepcopy(batch[name])
         return empty
+    artifact = load_artifact(Path(str(batch["baseline_path"])))
+    if artifact["snapshot"]["state_id"] != batch["baseline"]:
+        raise DispatchTransactionError(
+            "prepared batch workspace baseline does not match its artifact"
+        )
+    if any(
+        artifact["dispatch_baselines"].get(str(candidate["node"]))
+        != candidate["capsule"]["baseline"]
+        for candidate in raw_candidates
+    ):
+        raise DispatchTransactionError(
+            "prepared native dispatch baseline does not match its artifact"
+        )
     transaction_id = _transaction_identity(
         session_id=session,
         repo=resolved_repo,
@@ -902,7 +1025,7 @@ def prepare_dispatch_batch(
         "repo": str(resolved_repo),
         "state": "prepared",
         "transaction_id": transaction_id,
-        "workspace_mode": load_artifact(Path(str(batch["baseline_path"]))) ["manifest"]["workspace_mode"],
+        "workspace_mode": artifact["manifest"]["workspace_mode"],
     }
     # Verify before publishing any reference.  An artifact, Git control, or scope
     # failure is graph-fatal and never gets a committed transaction marker.
@@ -922,6 +1045,7 @@ def prepare_dispatch_batch(
             for item in document["transactions"].values()
         ):
             raise DispatchTransactionError("another managed dispatch transaction is pending")
+        _prune_terminal_transactions(root, session, document)
         # Write every immutable full input first.  The following state write is the
         # commit marker observed by hooks.
         for candidate in candidates:
@@ -956,7 +1080,7 @@ def _pending_records(root: Path, session_id: str, *, repo: Path | None = None) -
         document = _read_document(root, session_id)
         records = [_validate_transaction(transaction_id, value) for transaction_id, value in document["transactions"].items()]
     if repo is not None:
-        expected = str(repository_root(repo).resolve())
+        expected = str(workspace_root(repo))
         records = [record for record in records if record["repo"] == expected]
     return [record for record in records if _transaction_pending(record)]
 
@@ -1046,7 +1170,7 @@ def _fail_graph(root: Path, session_id: str, document: dict[str, Any], transacti
 def claim_spawn_reference(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one exact short ref, verify its workspace, and mark it dispatching."""
 
-    if payload.get("tool_name") not in {"spawn_agent", "Agent"}:
+    if payload.get("tool_name") not in SPAWN_TOOL_NAMES:
         raise DispatchTransactionError("pending transaction requires an exact native spawn reference")
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, Mapping):
@@ -1064,8 +1188,8 @@ def claim_spawn_reference(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise DispatchTransactionError("spawn reference transaction is absent")
         transaction = _validate_transaction(transaction_id, raw)
         try:
-            repo = repository_root(Path(transaction["repo"])).resolve()
-        except (OSError, StateError) as error:
+            repo = workspace_root(Path(transaction["repo"]))
+        except (OSError, DirectoryStateError, StateError) as error:
             _fail_graph(root, session, document, transaction)
             raise DispatchTransactionError(
                 "spawn reference repository is unavailable"
@@ -1205,7 +1329,7 @@ def settle_spawn_success(payload: Mapping[str, Any], owner: str) -> None:
         _cleanup_settled_bundles(root, session, transaction)
 
 
-def settle_spawn_rejection(payload: Mapping[str, Any]) -> None:
+def settle_spawn_rejection(payload: Mapping[str, Any]) -> bool:
     session = _session(payload.get("session_id"))
     root = ledger_root_for_payload(payload)
     call_id = payload.get("tool_use_id")
@@ -1229,15 +1353,18 @@ def settle_spawn_rejection(payload: Mapping[str, Any]) -> None:
         node["dispatch_ref"] = None
         next_candidate = next((item for item in node["candidates"] if item["state"] == "prepared"), None)
         node["eligible_ref"] = next_candidate["ref"] if next_candidate is not None else None
-        node["state"] = "rejected"
+        node["state"] = "rejected" if next_candidate is not None else "exhausted"
         _refresh_transaction_state(transaction)
         _mark_terminal_if_done(transaction)
         document["transactions"][transaction_id] = transaction
         _write_document(root, session, document)
         _cleanup_settled_bundles(root, session, transaction)
+        return next_candidate is not None
 
 
 def fence_spawn_call(payload: Mapping[str, Any]) -> None:
+    """Fence one failed native call and settle its late-call tombstone."""
+
     session = _session(payload.get("session_id"))
     root = ledger_root_for_payload(payload)
     call_id = payload.get("tool_use_id")
@@ -1248,8 +1375,16 @@ def fence_spawn_call(payload: Mapping[str, Any]) -> None:
         changed = False
         for transaction_id, raw in document["transactions"].items():
             transaction = _validate_transaction(transaction_id, raw)
-            if any(node["call_id"] == call_id for node in transaction["nodes"].values()):
+            matches = [
+                node
+                for node in transaction["nodes"].values()
+                if node["call_id"] == call_id
+            ]
+            if matches:
                 _fence_transaction(root, session, transaction, graph_fatal=True)
+                for node in matches:
+                    node["call_id"] = None
+                    node["dispatch_ref"] = None
                 document["transactions"][transaction_id] = transaction
                 changed = True
         if changed:
@@ -1373,12 +1508,115 @@ def user_prompt_context(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def exact_abort_for_payload(payload: Mapping[str, Any]) -> str | None:
     tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, Mapping) or set(tool_input) - {"message", "target"}:
+    if not isinstance(tool_input, Mapping):
         return None
     message = tool_input.get("message")
+    if message is None:
+        message = tool_input.get("command")
     if not isinstance(message, str) or not message.startswith(ABORT_HEADER):
         return None
     return parse_abort_command(message)
+
+
+def cleanup_stale_dispatch_state(
+    ledger_root: Path, *, keep_session_id: str, max_age_seconds: float
+) -> list[Path]:
+    """Remove bounded stale transaction files and orphan full dispatch bundles."""
+
+    keep = _session(keep_session_id)
+    if max_age_seconds < 60:
+        raise DispatchTransactionError("dispatch cleanup threshold is invalid")
+    root = _resolved_ledger_root(Path(ledger_root))
+    bundle_root = root.parent / "dispatch-bundles"
+    now = time.time()
+    removed: list[Path] = []
+    live_directories: set[Path] = set()
+    protected_sessions: set[str] = {keep}
+
+    if root.is_dir():
+        for state in sorted(root.glob(f"*{_STATE_SUFFIX}")):
+            session_id = state.name[: -len(_STATE_SUFFIX)]
+            if SESSION_ID.fullmatch(session_id) is None:
+                continue
+            if session_id == keep:
+                continue
+            lock = _lock_path(root, session_id)
+            try:
+                expired = now - state.lstat().st_mtime > max_age_seconds
+            except OSError:
+                protected_sessions.add(session_id)
+                continue
+            lock_fresh = False
+            if lock.exists() or lock.is_symlink():
+                try:
+                    lock_fresh = (
+                        now - lock.lstat().st_mtime <= _STALE_LOCK_SECONDS
+                    )
+                except OSError:
+                    lock_fresh = True
+            if lock_fresh or not expired:
+                protected_sessions.add(session_id)
+                try:
+                    document = _read_document(root, session_id)
+                except DispatchTransactionError:
+                    continue
+                for transaction_id in document["transactions"]:
+                    live_directories.add(
+                        bundle_root / f"{session_id}-{transaction_id[7:]}"
+                    )
+                continue
+            if state.is_symlink() or not state.is_file():
+                protected_sessions.add(session_id)
+                continue
+            state.unlink(missing_ok=True)
+            removed.append(state)
+
+    if _has_reparse_ancestor(bundle_root):
+        return sorted(removed, key=str)
+    if bundle_root.is_dir():
+        for directory in sorted(bundle_root.iterdir(), key=lambda path: path.name):
+            match = _BUNDLE_DIRECTORY.fullmatch(directory.name)
+            if (
+                match is None
+                or directory.is_symlink()
+                or _is_reparse(directory)
+                or not directory.is_dir()
+            ):
+                continue
+            session_id = match.group("session")
+            if session_id in protected_sessions or directory in live_directories:
+                continue
+            try:
+                expired = now - directory.lstat().st_mtime > max_age_seconds
+            except OSError:
+                continue
+            files = list(directory.iterdir())
+            if any(
+                _BUNDLE_FILE.fullmatch(candidate.name) is None
+                or candidate.is_symlink()
+                or not candidate.is_file()
+                for candidate in files
+            ):
+                continue
+            if not expired:
+                expired = bool(files) and all(
+                    now - candidate.lstat().st_mtime > max_age_seconds
+                    for candidate in files
+                )
+            if not expired:
+                continue
+            for candidate in files:
+                candidate.unlink(missing_ok=True)
+                removed.append(candidate)
+            try:
+                directory.rmdir()
+            except OSError:
+                continue
+        try:
+            bundle_root.rmdir()
+        except OSError:
+            pass
+    return sorted(removed, key=str)
 
 
 def is_native_rejection(value: Any) -> bool:

@@ -39,7 +39,9 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertEqual(manifest["version"], "1.1.2")
+        self.assertRegex(
+            manifest["version"], r"^1\.1\.3\+codex\.[a-z0-9-]+$"
+        )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -102,8 +104,11 @@ class ProjectContractTests(unittest.TestCase):
         serialized = json.dumps(hooks)
         for required in (
             "spawn_agent",
+            "collaborationspawn_agent",
             "followup_task",
+            "collaborationfollowup_task",
             "interrupt_agent",
+            "collaborationinterrupt_agent",
             "cost_orchestrator_read_leaf",
             "cost_orchestrator_write_leaf",
         ):
@@ -116,6 +121,21 @@ class ProjectContractTests(unittest.TestCase):
                     limit = 120 if event == "SubagentStop" else 5
                     self.assertLessEqual(hook["timeout"], limit)
         self.assertEqual(count, 7)
+
+    def test_directory_workspace_backend_is_bounded_and_never_initializes_git(self) -> None:
+        runtime = current_runtime_text()
+        directory = text(PLUGIN / "scripts" / "directory_state.py")
+        combined_docs = (
+            text(REPO / "README.md")
+            + text(REPO / "README.zh-CN.md")
+            + text(REPO / "docs" / "OPERATIONS.md")
+        )
+        self.assertIn("20,000", combined_docs)
+        self.assertIn("1 GiB", combined_docs)
+        self.assertIn("non-Git", combined_docs)
+        self.assertIn("DEFAULT_MAX_FILES = 20_000", directory)
+        self.assertIn("DEFAULT_MAX_BYTES = 1024 * 1024 * 1024", directory)
+        self.assertNotIn('subprocess.run(["git", "init"', runtime)
 
     def test_current_protocol_is_v7_and_runtime_route_is_static_and_network_free(self) -> None:
         packet = text(PLUGIN / "scripts" / "packet_compiler.py")

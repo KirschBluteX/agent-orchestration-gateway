@@ -24,6 +24,12 @@ requests, one whole-graph baseline, and native spawn inputs. The normal CLI comm
 plan without committing a transaction. No caller supplies a selected route pair or
 graph hash.
 
+The prepared-workspace layer has two adapters without changing the capsule: `git`
+uses Git/control-state identity; `directory` binds the exact non-Git root. Directory
+workers capture the full root, while explorers/reviewers capture declared scopes.
+Directory preparation never runs `git init` and fails before content hashing when the
+default 20,000-file / 1 GiB budget is exceeded.
+
 ## Dispatch transaction
 
 Each short reference binds one immutable full spawn input stored outside the
@@ -61,6 +67,14 @@ so current host-supported Luna/Terra/user-pinned routes use the same two profile
 The writable profile is valid only for worker;
 explorer and reviewer use the read-only profile. Reviewer requires an epoch,
 independent acceptance, and `fork_turns=none`.
+
+A reviewer normally receives the freshly captured workspace identity as `baseline`.
+For a known worker delta, Primary may supply that worker's previously verified state
+identity as node `review_baseline`. The compiler emits it as capsule `baseline` and
+automatically binds the fresh review snapshot as `current_state`. The artifact and
+ledger continue to use the fresh snapshot for pre-spawn and result-time read-only
+verification. `review_baseline` is reviewer-only and is an identity reference, not a
+stored source copy or proof supplied by an untrusted party.
 
 `CCO_NATIVE_BYPASS v1` is not a capsule. It is a user-authorized one-shot prefix for
 an unmanaged native spawn. PreToolUse removes the prefix before Codex sees the task.
@@ -116,8 +130,12 @@ reserve and settle one next cursor. Interrupt retires and fences before native
 interruption. Terminal results leave small owner tombstones so late results and raw
 follow-ups remain fenced across turns.
 
-Full transaction bundles are deleted as their candidates settle. When every owner of
-one graph is terminal, its large prepared artifact is deleted.
+Full transaction bundles are deleted as their candidates settle. An exhausted route
+chain leaves a terminal tombstone so a higher generation may restart at rank one.
+Completed sibling scopes retain their lease while any batch reference remains
+pending. A graph artifact is deleted only when its transaction has no pending,
+dispatching, or active node. Capacity pruning removes only validated terminal
+transactions whose native call tombstones have also settled.
 Small tombstones are retained across turns until the next SessionStart confirms and
 removes terminal prior-session state. Live, unknown, locked, or malformed abandoned
 state remains subject to bounded stale cleanup of up to seven days. Incomplete,

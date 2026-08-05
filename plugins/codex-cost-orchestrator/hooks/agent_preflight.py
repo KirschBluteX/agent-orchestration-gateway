@@ -21,7 +21,9 @@ from ledger_runtime import (  # noqa: E402
     reserve_spawn,
 )
 from dispatch_transaction import (  # noqa: E402
+    CONTINUATION_TOOL_NAMES,
     DispatchTransactionError,
+    SPAWN_TOOL_NAMES,
     abort_pending_transaction,
     claim_spawn_reference,
     exact_abort_for_payload,
@@ -107,7 +109,7 @@ def _pending_transaction_outcome(payload: dict[str, Any]) -> dict[str, Any]:
             PacketError("exact transaction abort fenced remaining undispatched nodes"),
             code="CCO_TRANSACTION_ABORTED",
         )
-    if payload.get("tool_name") in {"spawn_agent", "Agent"}:
+    if payload.get("tool_name") in SPAWN_TOOL_NAMES:
         return _expanded_reference_outcome(payload)
     return block_outcome(
         PacketError("only an exact pending spawn ref or exact abort command is allowed"),
@@ -170,10 +172,10 @@ def evaluate(value: object) -> dict[str, Any]:
         if pending:
             return _pending_transaction_outcome(value)
         if not isinstance(tool_input, dict):
-            if tool_name not in {"spawn_agent", "Agent", "send_message", "followup_task"}:
+            if tool_name not in SPAWN_TOOL_NAMES | CONTINUATION_TOOL_NAMES:
                 return {}
             return block_outcome(PacketError("tool input is missing"))
-        if tool_name in {"spawn_agent", "Agent"}:
+        if tool_name in SPAWN_TOOL_NAMES:
             message = tool_input.get("message")
             if isinstance(message, str) and message.startswith(BYPASS_HEADER):
                 return _bypass_outcome(tool_input)
@@ -192,7 +194,7 @@ def evaluate(value: object) -> dict[str, Any]:
             workspace = prepared_workspace_claim(value, capsule)
             reserve_spawn(value, capsule, str(tool_input["agent_type"]), workspace=workspace)
             return {}
-        if tool_name in {"send_message", "followup_task"}:
+        if tool_name in CONTINUATION_TOOL_NAMES:
             message = tool_input.get("message")
             if isinstance(message, str) and message.startswith(DISPATCH_HEADER):
                 capsule = validate_v7_continuation(tool_input)

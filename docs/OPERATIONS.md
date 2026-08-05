@@ -99,6 +99,39 @@ The state root defaults to the OS temporary directory under
 `codex-cost-orchestrator`. `CCO_LEDGER_DIR` may choose another external absolute
 location. Do not delete state belonging to an active task.
 
+## Non-Git directory workspaces
+
+CCO does not run `git init`. If the exact target root is not a Git worktree, the
+prepared-workspace adapter uses directory mode:
+
+- explorer and reviewer snapshots cover only their declared scopes and accept no
+  change;
+- worker snapshots cover the complete root, while only its declared scope may change;
+- path/type/size preflight is limited to 20,000 files and 1 GiB by default and runs
+  before any file content is read;
+- symlinks, junctions/reparse points, special files, case-insensitive aliases, root
+  replacement, and capture-time changes fail closed;
+- snapshots contain paths, types, sizes, bounded metadata, and SHA-256 values, never
+  source copies; large artifacts are deleted with the graph lifecycle.
+
+An over-budget workspace returns the prepared batch to Primary. It is never silently
+filtered, including for `node_modules` or other large dependency trees. If a ready
+batch contains any worker, the shared directory baseline covers the complete root;
+CCO does not keep read-only siblings by weakening that batch to a partial baseline.
+
+## Reviewer delta baseline
+
+A fresh reviewer normally uses the state captured at review preparation as both its
+comparison and workspace-verification baseline. To review a known worker delta,
+Primary may pass that worker's previously verified baseline as `review_baseline`.
+The compiler then places the old identity in the reviewer capsule and places the
+freshly captured review state in `current_state`; the artifact, ledger, and read-only
+workspace checks remain bound to the fresh state.
+
+`review_baseline` is a SHA-256 state identity, not an archived source snapshot.
+Primary must still provide the closed contract, anchors, and evidence needed to
+inspect the delta. It is reviewer-only and cannot weaken current-state verification.
+
 ## Failure behavior
 
 - Profile missing/shadowed/modified or hook untrusted: no delegation; run doctor.

@@ -30,7 +30,7 @@
         ]
       },
       {
-        "matcher": "interrupt_agent|interruptAgent",
+        "matcher": "^(interrupt_agent|interruptAgent|collaborationinterrupt_agent)$",
         "hooks": [
           {
             "type": "command",
@@ -45,7 +45,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Agent|spawn_agent|send_message|followup_task)$",
+        "matcher": "^(Agent|spawn_agent|collaborationspawn_agent|send_message|followup_task|collaborationsend_message|collaborationfollowup_task)$",
         "hooks": [
           {
             "type": "command",

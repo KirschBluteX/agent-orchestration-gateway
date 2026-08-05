@@ -29,7 +29,7 @@ independent review. Keep reference prose out of leaf messages.
 Assign one logical role:
 
 - `explorer`: bounded read-only inspection or probe;
-- `worker`: bounded repository mutation;
+- `worker`: bounded workspace mutation;
 - `reviewer`: fresh independent acceptance.
 
 Derive one assurance from facts, never from model reputation:
@@ -74,7 +74,7 @@ only pins leave effort adaptive; effort-only pins leave model order adaptive; a 
 pair has no fallback. A user may explicitly pin Sol or guarded Luna. An unsupported
 pin remains in Primary and is reported; it is never silently replaced.
 
-Project policy is read from `.codex/cco.toml` only when the repository root appears in
+Project policy is read from `.codex/cco.toml` only when the workspace root appears in
 `~/.codex/cco.toml` under `trusted_project_roots`. A malformed higher-priority policy
 or a route with no supported candidate returns affected nodes to Primary. Automatic
 configuration cannot contain Sol, and guarded/reviewer automatic configuration cannot
@@ -91,6 +91,8 @@ Pass the JSON object on stdin. It contains `nodes` and may contain host `native_
 `policy`. The compiler derives decisions, captures one scope-limited workspace
 baseline, maximizes useful dependency-ready non-conflicting work up to native
 capacity, and returns exact spawn inputs plus precompiled fallbacks. It never spawns.
+Git and bounded non-Git directory roots use the same entry and capsule; CCO never
+runs `git init`.
 Use the write leaf only for `worker`; explorer and reviewer share the read leaf. Use
 `fork_turns: none` when repository anchors and the capsule close context; otherwise
 use the smallest positive partial fork, never full history.
@@ -171,4 +173,6 @@ request. Ordinary Primary micro-edits do not trigger review.
 A reviewer is a fresh read leaf with `fork_turns: none`. A contract-preserving evidence
 delta may continue that reviewer. Architecture, interface, ownership, schema, safety,
 or acceptance changes require a fresh review generation. Finish only for the exact
-accepted state.
+accepted state. When reviewing a known worker delta, use `review_baseline` only for
+that worker's previously verified baseline; the compiler captures and binds the
+reviewer's current workspace state separately.

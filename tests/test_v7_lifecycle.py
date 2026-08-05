@@ -17,9 +17,10 @@ HOOKS = ROOT / "plugins" / "codex-cost-orchestrator" / "hooks"
 sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 
 import agent_preflight  # noqa: E402
+import dispatch_transaction  # noqa: E402
 import ledger_runtime  # noqa: E402
 import subagent_stop  # noqa: E402
-from graph_compiler import prepare_dispatch_graph  # noqa: E402
+from graph_compiler import compact_dispatch_batch, prepare_dispatch_graph  # noqa: E402
 from packet_compiler import (  # noqa: E402
     CapsuleError,
     capsule_sha256,
@@ -246,7 +247,101 @@ class V7LifecycleTests(unittest.TestCase):
                     ),
                     {},
                 )
-                self.assertEqual(ledger_runtime.ledger_for(first_stop).read_rows()[0]["state"], "retired")
+                self.assertEqual(
+                    ledger_runtime.ledger_for(first_stop).read_rows()[0]["state"],
+                    "retired",
+                )
+
+    def test_reviewer_can_bind_the_worker_old_baseline_while_guarding_current_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("before\n", encoding="utf-8")
+            env = {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_THREAD_ID": "v7-review-baseline",
+            }
+            with mock.patch.dict(os.environ, env):
+                implementation = prepare_dispatch_graph(
+                    [node("n01_worker", "owned.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                old_baseline = implementation["baseline"]
+                (repo / "owned.txt").write_text("after\n", encoding="utf-8")
+                review_node = node(
+                    "n02_review",
+                    "owned.txt",
+                    role="reviewer",
+                    epoch="e01",
+                )
+                review_node["review_baseline"] = old_baseline
+                review = prepare_dispatch_graph(
+                    [review_node],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                batch = dispatch_transaction.prepare_dispatch_batch(
+                    compact_dispatch_batch(review),
+                    ledger_root=root / "ledger",
+                    repo=repo,
+                    session_id="v7-review-baseline",
+                )
+                dispatch = batch["dispatches"][0]
+                owner = "/root/" + dispatch["task_name"]
+                spawn = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "v7-review-baseline",
+                    "tool_input": dispatch,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-review-baseline",
+                }
+                expanded = agent_preflight.evaluate(spawn)["hookSpecificOutput"][
+                    "updatedInput"
+                ]
+                capsule = parse_message(expanded["message"])
+                self.assertEqual(capsule["baseline"], old_baseline)
+                self.assertEqual(capsule["current_state"], review["baseline"])
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            **spawn,
+                            "hook_event_name": "PostToolUse",
+                            "tool_response": {"task_path": owner},
+                        }
+                    ),
+                    {},
+                )
+                result = compile_result(
+                    capsule,
+                    status="complete",
+                    disposition="accept",
+                    blockers=[],
+                    changed_paths=[],
+                    deviations=[],
+                    evidence={"A01": "reviewed current state against inherited baseline"},
+                    failure_signature=None,
+                    summary="accepted inherited-baseline review",
+                )
+                self.assertEqual(
+                    subagent_stop.evaluate(
+                        {
+                            "agent_id": owner,
+                            "agent_type": expanded["agent_type"],
+                            "cwd": str(repo),
+                            "hook_event_name": "SubagentStop",
+                            "last_assistant_message": result,
+                            "session_id": "v7-review-baseline",
+                            "stop_hook_active": False,
+                        }
+                    ),
+                    {},
+                )
 
     def test_still_invalid_second_subagent_stop_retires_fences_and_warns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -478,7 +573,7 @@ class V7LifecycleTests(unittest.TestCase):
                             "hook_event_name": "PreToolUse",
                             "session_id": "v7-lifecycle",
                             "tool_input": {"target": "/root/native_bypass_owner"},
-                            "tool_name": "interrupt_agent",
+                            "tool_name": "collaborationinterrupt_agent",
                         }
                     ),
                     {},
@@ -570,6 +665,77 @@ class V7LifecycleTests(unittest.TestCase):
                 )
                 self.assertEqual(raw_followup["decision"], "block")
                 self.assertIn("continuation capsule", raw_followup["reason"])
+
+    def test_direct_multi_node_graph_keeps_artifact_until_every_dispatch_has_a_terminal_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "one.txt").write_text("one\n", encoding="utf-8")
+            (repo / "two.txt").write_text("two\n", encoding="utf-8")
+            env = {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_THREAD_ID": "v7-direct-early",
+            }
+            with mock.patch.dict(os.environ, env):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_worker", "one.txt"), node("n02_worker", "two.txt")],
+                    native_capacity=2,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                artifact = Path(prepared["baseline_path"])
+                first = prepared["dispatches"][0]
+                capsule = parse_message(first["message"])
+                owner = "/root/" + first["task_name"]
+                spawn = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "v7-direct-early",
+                    "tool_input": first,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-direct-first",
+                }
+                self.assertEqual(agent_preflight.evaluate(spawn), {})
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            **spawn,
+                            "hook_event_name": "PostToolUse",
+                            "tool_response": {"task_path": owner},
+                        }
+                    ),
+                    {},
+                )
+                (repo / "one.txt").write_text("changed\n", encoding="utf-8")
+                result = compile_result(
+                    capsule,
+                    status="complete",
+                    disposition="retire",
+                    blockers=[],
+                    changed_paths=["one.txt"],
+                    deviations=[],
+                    evidence={"A01": "first direct dispatch completed"},
+                    failure_signature=None,
+                    summary="completed first direct dispatch",
+                )
+                self.assertEqual(
+                    subagent_stop.evaluate(
+                        {
+                            "agent_id": owner,
+                            "agent_type": first["agent_type"],
+                            "cwd": str(repo),
+                            "hook_event_name": "SubagentStop",
+                            "last_assistant_message": result,
+                            "session_id": "v7-direct-early",
+                            "stop_hook_active": False,
+                        }
+                    ),
+                    {},
+                )
+
+                self.assertTrue(artifact.exists())
 
     def test_session_start_injects_the_gate_once_and_cleans_bounded_stale_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -779,7 +945,33 @@ class V7LifecycleTests(unittest.TestCase):
                 ledger_runtime.evaluate(
                     {**continue_preflight, "hook_event_name": "PostToolUse", "tool_response": {"delivered": True}}
                 )
+
                 continued_capsule = parse_message(continuation["message"])
+                desktop_continuation = compile_continuation(
+                    continued_capsule,
+                    target=owner,
+                    delta={"evidence": "desktop follow-up"},
+                )
+                desktop_preflight = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "v7-review",
+                    "tool_input": desktop_continuation,
+                    "tool_name": "collaborationfollowup_task",
+                    "tool_use_id": "desktop-continue-review",
+                }
+                self.assertEqual(agent_preflight.evaluate(desktop_preflight), {})
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            **desktop_preflight,
+                            "hook_event_name": "PostToolUse",
+                            "tool_response": {"delivered": True},
+                        }
+                    ),
+                    {},
+                )
+                continued_capsule = parse_message(desktop_continuation["message"])
                 with self.assertRaisesRegex(CapsuleError, "acceptance evidence"):
                     compile_result(
                         continued_capsule,

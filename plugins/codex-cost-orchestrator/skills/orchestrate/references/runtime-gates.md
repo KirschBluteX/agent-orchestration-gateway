@@ -66,12 +66,27 @@ interrupt children. A user message or child completion wakes Primary normally.
 
 ## Workspace and lifecycle strength
 
-The prepared graph fingerprints tracked content and ignored files only inside declared
+For Git worktrees, the prepared graph fingerprints tracked content and ignored files only inside declared
 typed scopes. Git status and Git control state remain global so a newly created
 out-of-scope delta is still detectable; the standalone unscoped workspace CLI retains
 strict whole-repository content inspection. Path aliases, reparses, junctions, and
 submodules remain protected. Ignored scans fail closed above the configured file/byte
 bounds.
+
+For an exact non-Git root, CCO never initializes Git. Explorer and reviewer capture
+only declared scopes and must leave them unchanged. Worker capture covers the complete
+root so scope-external writes remain visible. A path/type/size preflight defaults to
+20,000 files and 1 GiB and happens before content hashing. Over-budget roots return to
+Primary; no directory such as `node_modules` is silently ignored. Reparse points,
+special files, path aliases, root replacement, and capture-time changes fail closed.
+If a ready batch contains a worker, its shared directory snapshot covers the full
+root; a budget failure returns that batch to Primary instead of retaining read-only
+siblings on a weaker partial baseline.
+
+A reviewer of a known worker delta may inherit the previously verified worker state
+as capsule `baseline`. The compiler separately binds the freshly captured review
+state as `current_state`, and all workspace/ledger checks use that fresh state. The
+old baseline is only a canonical identity; it does not retain source content.
 
 The task-local ledger lives outside the repository. It provides one active owner per
 node revision, cursor single-flight, generation fencing, guarded floors, and late-
@@ -86,7 +101,8 @@ repository. With no session transaction, a global hook outside Git is a no-op.
 
 Spawn/continuation hooks keep a five-second bound and SubagentStop gets 120 seconds
 for a legitimate workspace scan; there is no ten-minute reviewer hard timeout. Large
-graph artifacts are deleted as soon as all graph owners are terminal. The next
+graph artifacts are deleted only when the graph transaction has no pending,
+dispatching, or active nodes. The next
 SessionStart immediately removes validated terminal state from prior sessions. Live,
 unknown, locked, or malformed abandoned state remains subject to bounded stale
 cleanup of up to seven days. CCO does not register the optional SessionEnd event

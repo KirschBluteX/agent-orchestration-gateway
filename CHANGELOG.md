@@ -2,6 +2,26 @@
 
 The project follows semantic versioning.
 
+## 1.1.3 - 2026-08-05
+
+- Added bounded non-Git directory workspaces without automatic `git init`: workers
+  capture the full root, while explorers and reviewers capture declared scopes.
+- Added a 20,000-file / 1 GiB preflight budget that fails before file content is
+  read, plus reparse, alias, root-identity, and scope fencing.
+- Added compatibility for current desktop `collaboration*` Agent tool names and
+  exact pending-transaction aborts carried by shell or native-spawn inputs.
+- Kept completed sibling scopes leased until the batch settles and prevented early
+  prepared-artifact deletion while any transaction node remains live.
+- Distinguished an exhausted candidate chain from a fallback-pending rejection so a
+  newer generation can restart at rank one.
+- Added stale full-bundle cleanup and capacity-safe pruning of validated terminal
+  transaction records without evicting an unsettled late-PostToolUse tombstone;
+  cleanup and atomic writes never enter reparse-backed state roots.
+- Added reviewer delta binding: a reviewer may inherit a previously verified worker
+  baseline while its ledger and read-only verification remain bound to the freshly
+  captured current workspace state.
+- Corrected lifecycle and hook documentation to match the seven current definitions.
+
 ## 1.1.2 - 2026-08-05
 
 - Removed the optional SessionEnd hook because the current desktop hook browser can

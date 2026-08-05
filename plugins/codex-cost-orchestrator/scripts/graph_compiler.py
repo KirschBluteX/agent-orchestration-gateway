@@ -34,6 +34,15 @@ from prepared_graph import (
     verify_artifact_workspace,
     write_artifact,
 )
+from directory_state import (
+    DEFAULT_MAX_BYTES as DEFAULT_DIRECTORY_MAX_BYTES,
+    DEFAULT_MAX_FILES as DEFAULT_DIRECTORY_MAX_FILES,
+    DirectoryBudgetError,
+    DirectoryStateError,
+    capture_directory_state,
+    directory_root,
+    normalize_directory_scope,
+)
 from protocol_hash import ProtocolHashError, canonical_bytes, require_repository_scope
 from routing_catalog import (
     RoutingCatalogError,
@@ -77,7 +86,7 @@ NODE_FIELDS = frozenset(
     }
 )
 OPTIONAL_NODE_FIELDS = frozenset(
-    {"current_state", "epoch", "evidence", "fork_turns", "route"}
+    {"current_state", "epoch", "evidence", "fork_turns", "review_baseline", "route"}
 )
 DEFAULTABLE_NODE_FIELDS = frozenset(
     {"acceptance_facts", "closure", "fork_turns", "generation", "placement", "role", "route"}
@@ -385,6 +394,18 @@ def _normalize_node(value: object, index: int) -> dict[str, Any]:
     if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
         raise GraphCompilerError(f"graph node {index}.generation is invalid")
     route_constraints = _route_constraints(value.get("route"))
+    review_baseline = value.get("review_baseline")
+    if review_baseline is not None:
+        if decision["role"] != "reviewer":
+            raise GraphCompilerError(
+                f"graph node {index}.review_baseline is reviewer-only"
+            )
+        if not isinstance(review_baseline, str) or re.fullmatch(
+            r"sha256:[0-9a-f]{64}", review_baseline
+        ) is None:
+            raise GraphCompilerError(
+                f"graph node {index}.review_baseline is invalid"
+            )
     return {
         "acceptance_facts": {
             "acceptance_ids": list(value["acceptance_facts"]["acceptance_ids"]),
@@ -571,6 +592,8 @@ def prepare_dispatch_graph(
     workspace_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
+    directory_max_files: int = DEFAULT_DIRECTORY_MAX_FILES,
+    directory_max_bytes: int = DEFAULT_DIRECTORY_MAX_BYTES,
 ) -> dict[str, Any]:
     """Derive, route, baseline, and compile one complete graph in one call."""
 
@@ -586,27 +609,46 @@ def prepare_dispatch_graph(
         raise GraphCompilerError("graph node identities must be unique")
     completed = _completed_node_ids(completed_nodes)
     downstream = _derive_dependency_facts(normalized, completed_nodes=completed)
-    root = repository_root(Path(repo))
-    control_roots = repository_control_roots(root)
-    index_records = repository_index_records(root)
-    gitlinks = repository_gitlinks(root, index_records)
-    tracked_spellings = repository_path_spelling_map(index_records)
-    directory_spellings: dict[str, frozenset[str]] = {}
     try:
-        for item in normalized:
-            item["scopes"] = [
-                normalize_allow(
-                    root,
-                    f"{scope['kind']}:{scope['path']}",
-                    protected_roots=control_roots,
-                    gitlinks=gitlinks,
-                    tracked_spellings=tracked_spellings,
-                    directory_spellings=directory_spellings,
-                )
-                for scope in item["scopes"]
-            ]
-    except StateError as error:
-        raise GraphCompilerError(f"graph scope is unsafe: {error}") from error
+        root = repository_root(Path(repo))
+        workspace_backend = "git"
+    except (OSError, StateError):
+        try:
+            root = directory_root(Path(repo))
+        except DirectoryStateError as error:
+            raise GraphCompilerError(f"workspace root is unsafe: {error}") from error
+        workspace_backend = "directory"
+    if workspace_backend == "git":
+        control_roots = repository_control_roots(root)
+        index_records = repository_index_records(root)
+        gitlinks = repository_gitlinks(root, index_records)
+        tracked_spellings = repository_path_spelling_map(index_records)
+        directory_spellings: dict[str, frozenset[str]] = {}
+        try:
+            for item in normalized:
+                item["scopes"] = [
+                    normalize_allow(
+                        root,
+                        f"{scope['kind']}:{scope['path']}",
+                        protected_roots=control_roots,
+                        gitlinks=gitlinks,
+                        tracked_spellings=tracked_spellings,
+                        directory_spellings=directory_spellings,
+                    )
+                    for scope in item["scopes"]
+                ]
+        except StateError as error:
+            raise GraphCompilerError(f"graph scope is unsafe: {error}") from error
+    else:
+        control_roots = ()
+        index_records = {}
+        try:
+            for item in normalized:
+                item["scopes"] = [
+                    normalize_directory_scope(root, scope) for scope in item["scopes"]
+                ]
+        except DirectoryStateError as error:
+            raise GraphCompilerError(f"graph scope is unsafe: {error}") from error
     child_items, member_mapping = _dispatch_items(
         normalized,
         completed_nodes=completed,
@@ -735,15 +777,51 @@ def prepare_dispatch_graph(
             member_mapping=member_mapping,
         )
 
-    snapshot = state_payload(
-        root,
-        control_roots=control_roots,
-        index_records=index_records,
-        ignored_mode=workspace_mode,
-        ignored_max_files=ignored_max_files,
-        ignored_max_bytes=ignored_max_bytes,
-        scopes=[scope for item in normalized for scope in item["scopes"]],
-    )
+    graph_scope_values = [scope for item in normalized for scope in item["scopes"]]
+    if workspace_backend == "directory":
+        selected_set = set(selected_nodes)
+        capture_mode = (
+            "full"
+            if any(
+                item["node"] in selected_set and item["decision"]["role"] == "worker"
+                for item in physical_items
+            )
+            else "scope"
+        )
+        try:
+            snapshot = capture_directory_state(
+                root,
+                scopes=graph_scope_values,
+                capture_mode=capture_mode,
+                max_files=directory_max_files,
+                max_bytes=directory_max_bytes,
+                workspace_mode=workspace_mode,
+            )
+        except DirectoryBudgetError as error:
+            affected = {
+                item["node"]: str(error)
+                for item in normalized
+                if item["node"] not in set(completed)
+            }
+            return _no_dispatch_result(
+                normalized,
+                affected,
+                routable_items=[],
+                completed_nodes=completed,
+                member_mapping=member_mapping,
+            )
+        except DirectoryStateError as error:
+            raise GraphCompilerError(f"directory workspace capture failed: {error}") from error
+    else:
+        snapshot = state_payload(
+            root,
+            control_roots=control_roots,
+            index_records=index_records,
+            ignored_mode=workspace_mode,
+            ignored_max_files=ignored_max_files,
+            ignored_max_bytes=ignored_max_bytes,
+            scopes=graph_scope_values,
+        )
     manifest_by_node = {item["node"]: item for item in normalized}
     manifest_by_node.update(
         {
@@ -785,16 +863,24 @@ def prepare_dispatch_graph(
     by_node = {item["node"]: item for item in physical_items}
     dispatches: list[dict[str, Any]] = []
     fallback_dispatches: dict[str, list[dict[str, Any]]] = {}
+    dispatch_baselines: dict[str, str] = {}
     for node in selected_nodes:
         item = by_node[node]
         decision = item["decision"]
         route = _route_for(route_variants[node][0], node)
         optional = item["optional"]
+        capsule_baseline = optional.get("review_baseline", snapshot["state_id"])
+        if "review_baseline" in optional and optional.get(
+            "current_state", snapshot["state_id"]
+        ) != snapshot["state_id"]:
+            raise GraphCompilerError(
+                f"review node {node} current_state does not match the captured review state"
+            )
         spec: dict[str, Any] = {
             "acceptance": decision["acceptance"],
             "acceptance_ids": decision["acceptance_ids"],
             "assurance": decision["assurance"],
-            "baseline": snapshot["state_id"],
+            "baseline": capsule_baseline,
             "contract": item["contract"],
             "fork_turns": optional.get("fork_turns", "none"),
             "generation": item["generation"],
@@ -811,8 +897,11 @@ def prepare_dispatch_graph(
             },
             "scopes": item["scopes"],
         }
+        dispatch_baselines[node] = str(capsule_baseline)
+        if "review_baseline" in optional:
+            spec["current_state"] = snapshot["state_id"]
         for name in ("current_state", "epoch", "evidence"):
-            if name in optional:
+            if name in optional and name not in spec:
                 spec[name] = optional[name]
         compiled: list[dict[str, Any]] = []
         for variant in route_variants[node]:
@@ -831,7 +920,14 @@ def prepare_dispatch_graph(
                 raise GraphCompilerError(f"graph node {node} could not compile: {error}") from error
         dispatches.append(compiled[0])
         fallback_dispatches[node] = compiled[1:]
-    write_artifact(root, baseline_path, manifest=manifest, snapshot=snapshot)
+    write_artifact(
+        root,
+        baseline_path,
+        dispatch_baselines=dispatch_baselines,
+        dispatch_nodes=selected_nodes,
+        manifest=manifest,
+        snapshot=snapshot,
+    )
     partitions = _node_partitions(
         normalized,
         child_items,
@@ -984,6 +1080,8 @@ def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, A
         "defaults",
         "ignored_max_bytes",
         "ignored_max_files",
+        "directory_max_bytes",
+        "directory_max_files",
         "native_catalog",
         "policy",
     }
@@ -1019,6 +1117,8 @@ def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, A
         workspace_mode=args.workspace_mode,
         ignored_max_files=document.get("ignored_max_files", DEFAULT_IGNORED_MAX_FILES),
         ignored_max_bytes=document.get("ignored_max_bytes", DEFAULT_IGNORED_MAX_BYTES),
+        directory_max_files=document.get("directory_max_files", DEFAULT_DIRECTORY_MAX_FILES),
+        directory_max_bytes=document.get("directory_max_bytes", DEFAULT_DIRECTORY_MAX_BYTES),
     )
     if args.full:
         return prepared

@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -17,7 +18,10 @@ sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 import agent_preflight  # noqa: E402
 import dispatch_transaction  # noqa: E402
 import ledger_runtime  # noqa: E402
+import prepared_graph  # noqa: E402
+import subagent_stop  # noqa: E402
 from graph_compiler import compact_dispatch_batch, prepare_dispatch_graph  # noqa: E402
+from packet_compiler import compile_result, parse_message  # noqa: E402
 
 
 def native_catalog() -> dict[str, object]:
@@ -56,7 +60,7 @@ def no_risks() -> dict[str, str]:
     }
 
 
-def node(name: str, path: str) -> dict[str, object]:
+def node(name: str, path: str, *, generation: int = 1) -> dict[str, object]:
     return {
         "acceptance_facts": {
             "acceptance_ids": ["A01"],
@@ -74,7 +78,7 @@ def node(name: str, path: str) -> dict[str, object]:
             "ownership_closed": True,
         },
         "contract": {"contract_rev": 1, "node": name, "objective": f"handle {path}"},
-        "generation": 1,
+        "generation": generation,
         "node": name,
         "placement": {
             "benefits": [{"evidence": ["contract:A01"], "kind": "closed_chain"}],
@@ -170,6 +174,41 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertFalse(dispatch_transaction.bundle_path(root / "ledger", session_id, batch["transaction_id"], first_fallback_ref).exists())
             self.assertTrue(dispatch_transaction.bundle_path(root / "ledger", session_id, batch["transaction_id"], second_ref).exists())
 
+    def test_desktop_collaboration_spawn_name_expands_and_activates_the_same_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-desktop-spawn"
+            repo, prepared = self._prepared(root, session_id, node("n01_one", "one.txt"))
+            batch = self._transaction(root, repo, prepared, session_id)
+            ref = batch["dispatches"][0]
+            payload = {
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": ref,
+                "tool_name": "collaborationspawn_agent",
+                "tool_use_id": "desktop-spawn-one",
+            }
+
+            expanded = agent_preflight.evaluate(payload)
+
+            self.assertIn("updatedInput", expanded["hookSpecificOutput"])
+            owner = "/root/" + ref["task_name"]
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {
+                        **payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"task_path": owner},
+                    }
+                ),
+                {},
+            )
+            state = dispatch_transaction.read_transaction_state(
+                root / "ledger", session_id, batch["transaction_id"]
+            )
+            self.assertEqual(state["nodes"]["n01_one"]["state"], "active")
+
     def test_session_transaction_context_does_not_require_host_cwd_to_be_the_repo(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -233,6 +272,150 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertEqual(waiting["decision"], "block")
             self.assertIn("CCO_EVENT_FIRST_WAIT", waiting["reason"])
 
+    def test_non_git_worker_spawn_and_result_enforce_full_root_scope_fencing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "project"
+            workspace.mkdir()
+            (workspace / "owned.txt").write_text("baseline\n", encoding="utf-8")
+            (workspace / "outside.txt").write_text("outside\n", encoding="utf-8")
+            session_id = "txn-directory-worker"
+            environment = {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_THREAD_ID": session_id,
+            }
+            with mock.patch.dict(os.environ, environment):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_one", "owned.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=workspace,
+                )
+                batch = dispatch_transaction.prepare_dispatch_batch(
+                    compact_dispatch_batch(prepared),
+                    ledger_root=root / "ledger",
+                    repo=workspace,
+                    session_id=session_id,
+                )
+                ref = batch["dispatches"][0]
+                payload = {
+                    "cwd": str(workspace),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": ref,
+                    "tool_name": "collaborationspawn_agent",
+                    "tool_use_id": "directory-spawn",
+                }
+                expanded = agent_preflight.evaluate(payload)["hookSpecificOutput"][
+                    "updatedInput"
+                ]
+                owner = "/root/" + ref["task_name"]
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            **payload,
+                            "hook_event_name": "PostToolUse",
+                            "tool_response": {"task_path": owner},
+                        }
+                    ),
+                    {},
+                )
+                (workspace / "owned.txt").write_text("changed\n", encoding="utf-8")
+                capsule = parse_message(expanded["message"])
+                result = compile_result(
+                    capsule,
+                    status="complete",
+                    disposition="retire",
+                    blockers=[],
+                    changed_paths=["owned.txt"],
+                    deviations=[],
+                    evidence={"A01": "owned file changed"},
+                    failure_signature=None,
+                    summary="completed directory worker",
+                )
+                stop_payload = {
+                    "agent_id": owner,
+                    "agent_type": expanded["agent_type"],
+                    "cwd": str(workspace),
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": result,
+                    "session_id": session_id,
+                    "stop_hook_active": False,
+                }
+                self.assertEqual(subagent_stop.evaluate(stop_payload), {})
+
+            second_root = root / "second"
+            second_workspace = second_root / "project"
+            second_workspace.mkdir(parents=True)
+            (second_workspace / "owned.txt").write_text("baseline\n", encoding="utf-8")
+            (second_workspace / "outside.txt").write_text("outside\n", encoding="utf-8")
+            second_session = "txn-directory-outside"
+            second_env = {
+                "CCO_LEDGER_DIR": str(second_root / "ledger"),
+                "CODEX_THREAD_ID": second_session,
+            }
+            with mock.patch.dict(os.environ, second_env):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_one", "owned.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=second_workspace,
+                )
+                batch = dispatch_transaction.prepare_dispatch_batch(
+                    compact_dispatch_batch(prepared),
+                    ledger_root=second_root / "ledger",
+                    repo=second_workspace,
+                    session_id=second_session,
+                )
+                ref = batch["dispatches"][0]
+                payload = {
+                    "cwd": str(second_workspace),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": second_session,
+                    "tool_input": ref,
+                    "tool_name": "collaborationspawn_agent",
+                    "tool_use_id": "directory-outside-spawn",
+                }
+                expanded = agent_preflight.evaluate(payload)["hookSpecificOutput"][
+                    "updatedInput"
+                ]
+                owner = "/root/" + ref["task_name"]
+                ledger_runtime.evaluate(
+                    {
+                        **payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"task_path": owner},
+                    }
+                )
+                (second_workspace / "outside.txt").write_text(
+                    "changed outside\n", encoding="utf-8"
+                )
+                capsule = parse_message(expanded["message"])
+                result = compile_result(
+                    capsule,
+                    status="complete",
+                    disposition="retire",
+                    blockers=[],
+                    changed_paths=[],
+                    deviations=[],
+                    evidence={"A01": "claimed no owned changes"},
+                    failure_signature=None,
+                    summary="attempted outside change",
+                )
+                rejected = subagent_stop.evaluate(
+                    {
+                        "agent_id": owner,
+                        "agent_type": expanded["agent_type"],
+                        "cwd": str(second_workspace),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": result,
+                        "session_id": second_session,
+                        "stop_hook_active": False,
+                    }
+                )
+                self.assertEqual(rejected["decision"], "block")
+                self.assertIn("outside_scope:outside.txt", rejected["reason"])
+
     def test_rejection_enables_only_its_precompiled_fallback_and_keeps_active_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -273,6 +456,158 @@ class DispatchTransactionTests(unittest.TestCase):
             wrong = agent_preflight.evaluate({**first_payload, "tool_input": first, "tool_use_id": "repeat-rejected"})
             self.assertEqual(wrong["decision"], "block")
             self.assertIn("current pending candidate", wrong["reason"])
+
+    def test_completed_sibling_keeps_artifact_and_lease_for_pending_and_fallback_spawns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-completed-sibling"
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_one", "one.txt"),
+                node("n02_two", "two.txt"),
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            first, second = batch["dispatches"]
+
+            first_payload = {
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": first,
+                "tool_name": "collaborationspawn_agent",
+                "tool_use_id": "spawn-first",
+            }
+            expanded = agent_preflight.evaluate(first_payload)["hookSpecificOutput"][
+                "updatedInput"
+            ]
+            owner = "/root/" + first["task_name"]
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {
+                        **first_payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"task_path": owner},
+                    }
+                ),
+                {},
+            )
+            (repo / "one.txt").write_text("completed sibling\n", encoding="utf-8")
+            capsule = parse_message(expanded["message"])
+            result = compile_result(
+                capsule,
+                status="complete",
+                disposition="retire",
+                blockers=[],
+                changed_paths=["one.txt"],
+                deviations=[],
+                evidence={"A01": "completed and verified one.txt"},
+                failure_signature=None,
+                summary="completed first sibling",
+            )
+            self.assertEqual(
+                subagent_stop.evaluate(
+                    {
+                        "agent_id": owner,
+                        "agent_type": expanded["agent_type"],
+                        "cwd": str(repo),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": result,
+                        "session_id": session_id,
+                        "stop_hook_active": False,
+                    }
+                ),
+                {},
+            )
+            artifact = Path(str(batch["baseline_path"]))
+            self.assertTrue(artifact.exists())
+
+            second_payload = {
+                **first_payload,
+                "tool_input": second,
+                "tool_use_id": "spawn-second",
+            }
+            self.assertIn(
+                "updatedInput",
+                agent_preflight.evaluate(second_payload)["hookSpecificOutput"],
+            )
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {
+                        **second_payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"error": "unsupported before thread creation"},
+                    }
+                ),
+                {},
+            )
+            fallback = batch["fallback_dispatches"]["n02_two"][0]
+            fallback_outcome = agent_preflight.evaluate(
+                {
+                    **second_payload,
+                    "tool_input": fallback,
+                    "tool_use_id": "spawn-second-fallback",
+                }
+            )
+            self.assertIn("updatedInput", fallback_outcome["hookSpecificOutput"])
+
+    def test_exhausted_sibling_never_leases_its_scope_to_pending_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-exhausted-sibling"
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_one", "one.txt"),
+                node("n02_two", "two.txt"),
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            first = batch["dispatches"][0]
+            candidates = [first, *batch["fallback_dispatches"]["n01_one"]]
+            for index, candidate in enumerate(candidates, start=1):
+                payload = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": candidate,
+                    "tool_name": "collaborationspawn_agent",
+                    "tool_use_id": f"reject-first-{index}",
+                }
+                self.assertIn(
+                    "updatedInput",
+                    agent_preflight.evaluate(payload)["hookSpecificOutput"],
+                )
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            **payload,
+                            "hook_event_name": "PostToolUse",
+                            "tool_response": {
+                                "error": "unsupported before thread creation"
+                            },
+                        }
+                    ),
+                    {},
+                )
+
+            state = dispatch_transaction.read_transaction_state(
+                root / "ledger", session_id, batch["transaction_id"]
+            )
+            self.assertEqual(state["nodes"]["n01_one"]["state"], "exhausted")
+            (repo / "one.txt").write_text("unowned change\n", encoding="utf-8")
+            second = batch["dispatches"][1]
+            rejected = agent_preflight.evaluate(
+                {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": second,
+                    "tool_name": "collaborationspawn_agent",
+                    "tool_use_id": "spawn-second-after-exhaustion",
+                }
+            )
+            self.assertEqual(rejected["decision"], "block")
+            self.assertIn("one.txt", rejected["reason"])
 
     def test_pending_gate_stop_recovery_and_active_wait_are_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -364,7 +699,348 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertEqual(late["decision"], "block")
             self.assertIn("fenced", late["reason"])
             row = ledger_runtime.ledger_for(spawn_payload).read_rows()[0]
-            self.assertEqual(row["state"], "rejected")
+            self.assertEqual(row["state"], "exhausted")
+            settled = dispatch_transaction.read_transaction_state(
+                root / "ledger", session_id, batch["transaction_id"]
+            )
+            self.assertIsNone(settled["nodes"]["n01_one"]["call_id"])
+            self.assertIsNone(settled["nodes"]["n01_one"]["dispatch_ref"])
+
+    def test_capacity_never_prunes_a_fenced_late_postflight_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-capacity-fenced-call"
+            repo, prepared = self._prepared(
+                root, session_id, node("n01_one", "one.txt")
+            )
+            with mock.patch.object(dispatch_transaction, "_MAX_TRANSACTIONS", 1):
+                batch = self._transaction(root, repo, prepared, session_id)
+                ref = batch["dispatches"][0]
+                spawn_payload = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": ref,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-one",
+                }
+                self.assertIn(
+                    "updatedInput",
+                    agent_preflight.evaluate(spawn_payload)["hookSpecificOutput"],
+                )
+                dispatch_transaction.abort_pending_transaction(
+                    {"cwd": str(repo), "session_id": session_id},
+                    batch["transaction_id"],
+                )
+
+                prepared_next = prepare_dispatch_graph(
+                    [node("n02_two", "two.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                with self.assertRaisesRegex(
+                    dispatch_transaction.DispatchTransactionError,
+                    "capacity is exhausted",
+                ):
+                    self._transaction(root, repo, prepared_next, session_id)
+
+                late = ledger_runtime.evaluate(
+                    {
+                        **spawn_payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {
+                            "task_path": "/root/" + ref["task_name"]
+                        },
+                    }
+                )
+                self.assertEqual(late["decision"], "block")
+                prepared_after = prepare_dispatch_graph(
+                    [node("n02_two", "two.txt", generation=2)],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                replacement = self._transaction(
+                    root, repo, prepared_after, session_id
+                )
+                self.assertIsNotNone(replacement["transaction_id"])
+
+    def test_exhausted_candidate_chain_allows_a_new_generation_from_rank_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-exhausted-route"
+            repo, prepared = self._prepared(
+                root, session_id, node("n01_one", "one.txt")
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            candidates = [
+                batch["dispatches"][0],
+                *batch["fallback_dispatches"]["n01_one"],
+            ]
+            self.assertGreaterEqual(len(candidates), 2)
+            for index, candidate in enumerate(candidates, start=1):
+                payload = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": candidate,
+                    "tool_name": "collaborationspawn_agent",
+                    "tool_use_id": f"rejected-{index}",
+                }
+                self.assertIn(
+                    "updatedInput",
+                    agent_preflight.evaluate(payload)["hookSpecificOutput"],
+                )
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            **payload,
+                            "hook_event_name": "PostToolUse",
+                            "tool_response": {
+                                "error": "unsupported before thread creation"
+                            },
+                        }
+                    ),
+                    {},
+                )
+
+            ledger = ledger_runtime.ledger_for(payload)
+            self.assertEqual(ledger.read_rows()[0]["state"], "exhausted")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CCO_LEDGER_DIR": str(root / "ledger"),
+                    "CODEX_THREAD_ID": session_id,
+                },
+            ):
+                next_prepared = prepare_dispatch_graph(
+                    [node("n01_one", "one.txt", generation=2)],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+            next_batch = self._transaction(root, repo, next_prepared, session_id)
+            next_spawn = next_batch["dispatches"][0]
+            next_outcome = agent_preflight.evaluate(
+                {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": next_spawn,
+                    "tool_name": "collaborationspawn_agent",
+                    "tool_use_id": "generation-two-rank-one",
+                }
+            )
+            self.assertIn("updatedInput", next_outcome["hookSpecificOutput"])
+
+    def test_exact_abort_accepts_shell_or_full_spawn_carriers_without_executing_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index, carrier in enumerate(("shell", "spawn"), start=1):
+                session_id = f"txn-abort-carrier-{index}"
+                case_root = root / carrier
+                repo, prepared = self._prepared(
+                    case_root, session_id, node("n01_one", "one.txt")
+                )
+                batch = self._transaction(case_root, repo, prepared, session_id)
+                command = dispatch_transaction.render_abort_command(batch["transaction_id"])
+                tool_input = (
+                    {"command": command}
+                    if carrier == "shell"
+                    else {
+                        "agent_type": "cost_orchestrator_read_leaf",
+                        "fork_turns": "none",
+                        "message": command,
+                        "model": "gpt-5.6-terra",
+                        "reasoning_effort": "max",
+                        "task_name": "explorer_abort_terra_max_g01",
+                    }
+                )
+                outcome = agent_preflight.evaluate(
+                    {
+                        "cwd": str(repo),
+                        "hook_event_name": "PreToolUse",
+                        "session_id": session_id,
+                        "tool_input": tool_input,
+                        "tool_name": (
+                            "shell_command"
+                            if carrier == "shell"
+                            else "collaborationspawn_agent"
+                        ),
+                        "tool_use_id": f"abort-{carrier}",
+                    }
+                )
+                self.assertEqual(outcome["decision"], "block")
+                self.assertIn("CCO_TRANSACTION_ABORTED", outcome["reason"])
+                state = dispatch_transaction.read_transaction_state(
+                    case_root / "ledger", session_id, batch["transaction_id"]
+                )
+                self.assertEqual(state["nodes"]["n01_one"]["state"], "fenced")
+
+    def test_stale_cleanup_removes_orphan_and_expired_transaction_bundles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger_root = root / "ledger"
+            bundles = root / "dispatch-bundles"
+            suffix = "f" * 64
+            keep = bundles / f"keep-session-{suffix}"
+            stale = bundles / f"old-session-{suffix}"
+            keep.mkdir(parents=True)
+            stale.mkdir(parents=True)
+            keep_file = keep / ("a" * 64 + ".json")
+            stale_file = stale / ("b" * 64 + ".json")
+            keep_file.write_text("{}", encoding="utf-8")
+            stale_file.write_text("{}", encoding="utf-8")
+            old_time = stale_file.stat().st_mtime - (8 * 24 * 60 * 60)
+            os.utime(stale_file, (old_time, old_time))
+            os.utime(stale, (old_time, old_time))
+
+            removed = dispatch_transaction.cleanup_stale_dispatch_state(
+                ledger_root,
+                keep_session_id="keep-session",
+                max_age_seconds=7 * 24 * 60 * 60,
+            )
+
+            self.assertTrue(keep_file.exists())
+            self.assertFalse(stale.exists())
+            self.assertIn(str(stale_file.resolve()).casefold(), {str(path).casefold() for path in removed})
+
+    def test_stale_cleanup_preserves_fresh_or_locked_malformed_sessions_and_unknown_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger_root = root / "ledger"
+            ledger_root.mkdir()
+            bundles = root / "dispatch-bundles"
+            transaction_suffix = "a" * 64
+            locked = bundles / f"locked-session-{transaction_suffix}"
+            fresh = bundles / f"fresh-session-{transaction_suffix}"
+            unknown = bundles / "not-a-cco-bundle"
+            for directory in (locked, fresh, unknown):
+                directory.mkdir(parents=True)
+                candidate = directory / ("b" * 64 + ".json")
+                candidate.write_text("{}", encoding="utf-8")
+                old = candidate.stat().st_mtime - (8 * 24 * 60 * 60)
+                os.utime(candidate, (old, old))
+                os.utime(directory, (old, old))
+
+            (ledger_root / "locked-session.dispatch-transactions.json").write_text(
+                "not json", encoding="utf-8"
+            )
+            (ledger_root / ".locked-session.dispatch-transactions.lock").write_text(
+                "123\n", encoding="ascii"
+            )
+            (ledger_root / "fresh-session.dispatch-transactions.json").write_text(
+                "not json", encoding="utf-8"
+            )
+
+            dispatch_transaction.cleanup_stale_dispatch_state(
+                ledger_root,
+                keep_session_id="current-session",
+                max_age_seconds=7 * 24 * 60 * 60,
+            )
+
+            self.assertTrue(locked.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(unknown.exists())
+
+    def test_stale_cleanup_never_enters_a_reparse_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger_root = root / "ledger"
+            ledger_root.mkdir()
+            old = time.time() - (8 * 24 * 60 * 60)
+
+            bundle_root = root / "dispatch-bundles"
+            bundle = bundle_root / ("old-session-" + "a" * 64)
+            bundle.mkdir(parents=True)
+            bundle_file = bundle / ("b" * 64 + ".json")
+            bundle_file.write_text("{}", encoding="utf-8")
+            os.utime(bundle_file, (old, old))
+            os.utime(bundle, (old, old))
+
+            workspace_root = root / "workspace"
+            workspace_root.mkdir()
+            artifact = workspace_root / ("old-session-" + "c" * 64 + ".json")
+            artifact.write_text("{}", encoding="utf-8")
+            os.utime(artifact, (old, old))
+
+            def transaction_reparse(path: Path) -> bool:
+                return Path(path).name == "dispatch-bundles"
+
+            def artifact_reparse(path: Path) -> bool:
+                return Path(path).name == "workspace"
+
+            with mock.patch.object(
+                dispatch_transaction,
+                "_has_reparse_ancestor",
+                side_effect=transaction_reparse,
+            ):
+                removed_bundles = (
+                    dispatch_transaction.cleanup_stale_dispatch_state(
+                        ledger_root,
+                        keep_session_id="current-session",
+                        max_age_seconds=7 * 24 * 60 * 60,
+                    )
+                )
+            with mock.patch.object(
+                prepared_graph,
+                "_has_reparse_ancestor",
+                side_effect=artifact_reparse,
+                create=True,
+            ):
+                removed_artifacts = prepared_graph.cleanup_stale_artifacts(
+                    ledger_root,
+                    keep_session_id="current-session",
+                    max_age_seconds=7 * 24 * 60 * 60,
+                )
+
+            self.assertEqual(removed_bundles, [])
+            self.assertEqual(removed_artifacts, [])
+            self.assertTrue(bundle_file.exists())
+            self.assertTrue(artifact.exists())
+
+    def test_transaction_capacity_prunes_validated_terminal_records_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-capacity"
+            repo = root / "repo"
+            repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "one.txt").write_text("baseline\n", encoding="utf-8")
+            environment = {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_THREAD_ID": session_id,
+            }
+            with (
+                mock.patch.object(dispatch_transaction, "_MAX_TRANSACTIONS", 2),
+                mock.patch.dict(os.environ, environment),
+            ):
+                for generation in range(1, 4):
+                    prepared = prepare_dispatch_graph(
+                        [node("n01_one", "one.txt", generation=generation)],
+                        native_capacity=1,
+                        native_catalog=native_catalog(),
+                        repo=repo,
+                    )
+                    transaction = dispatch_transaction.prepare_dispatch_batch(
+                        compact_dispatch_batch(prepared),
+                        ledger_root=root / "ledger",
+                        repo=repo,
+                        session_id=session_id,
+                    )
+                    dispatch_transaction.abort_pending_transaction(
+                        {
+                            "cwd": str(repo),
+                            "session_id": session_id,
+                        },
+                        transaction["transaction_id"],
+                    )
+
+                document = dispatch_transaction._read_document(
+                    root / "ledger", session_id
+                )
+                self.assertLessEqual(len(document["transactions"]), 2)
 
 
 if __name__ == "__main__":
