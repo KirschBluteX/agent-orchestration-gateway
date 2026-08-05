@@ -965,8 +965,22 @@ def verify(
     control_roots: tuple[Path, ...] | None = None,
     index_records: dict[str, list[dict[str, str]]] | None = None,
     scope_entries: bool = False,
+    entry_scopes: list[dict[str, str]] | None = None,
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    """Verify one baseline while separating readable entries from write leases.
+
+    ``allowed`` remains the set of paths permitted to differ.  A prepared graph
+    can, however, have a wider captured scope than the leases currently active
+    at a spawn boundary.  ``entry_scopes`` preserves that capture boundary
+    without accidentally treating an unleased graph path as absent.
+    """
+
     limits = baseline["ignored_limits"]
+    captured_scopes = (
+        entry_scopes
+        if entry_scopes is not None
+        else allowed if scope_entries else None
+    )
     current = state_payload(
         root,
         control_roots=control_roots,
@@ -974,7 +988,7 @@ def verify(
         ignored_mode=baseline["ignored_mode"],
         ignored_max_files=limits["max_files"],
         ignored_max_bytes=limits["max_bytes"],
-        scopes=allowed if scope_entries else None,
+        scopes=captured_scopes,
     )
     baseline_entries = baseline["entries"]
     current_entries = current["entries"]

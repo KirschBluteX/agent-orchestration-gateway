@@ -99,12 +99,49 @@ def _physical_role(role: str) -> str:
     raise CapsuleError(f"unsupported logical role: {role}")
 
 
-def _task_name(*, role: str, node: str, generation: int, epoch: str | None) -> str:
+def _route_component(value: str) -> str:
+    tokens = [token for token in re.split(r"[^a-z0-9]+", value.casefold()) if token]
+    for family in ("luna", "terra", "sol"):
+        if family in tokens:
+            return family
+    return "_".join(tokens)
+
+
+def _bounded_name_component(value: str, *, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:6]
+    return value[: limit - 8].rstrip("_") + "_h" + digest
+
+
+def _task_name(
+    *,
+    role: str,
+    node: str,
+    generation: int,
+    epoch: str | None,
+    model: str,
+    effort: str,
+) -> str:
+    model_component = _bounded_name_component(_route_component(model), limit=18)
+    effort_component = _bounded_name_component(_route_component(effort), limit=14)
+    route = f"{model_component}_{effort_component}"
     if role == "reviewer":
         if epoch is None:
             raise CapsuleError("reviewer requires an epoch")
-        return f"review_{epoch}_{node}_g{generation:02d}"
-    return f"{role}_{node}_g{generation:02d}"
+        prefix = "review_" + _bounded_name_component(epoch, limit=14)
+    else:
+        prefix = role
+    intended = f"{prefix}_{node}_{route}_g{generation:02d}"
+    if len(intended) <= 96:
+        return intended
+    digest = hashlib.sha256(intended.encode("utf-8")).hexdigest()[:8]
+    suffix = f"_h{digest}_{route}_g{generation:02d}"
+    node_budget = 96 - len(prefix) - 1 - len(suffix)
+    if node_budget < 1:
+        raise CapsuleError("route-aware task name cannot fit the protocol limit")
+    node_prefix = node[:node_budget].rstrip("_") or node[0]
+    return f"{prefix}_{node_prefix}{suffix}"
 
 
 def _scope_list(value: object, label: str) -> list[dict[str, str]]:
@@ -211,6 +248,17 @@ def normalize_capsule(capsule: object) -> dict[str, Any]:
     task_name = execution["task_name"]
     if not isinstance(task_name, str) or TASK_NAME.fullmatch(task_name) is None:
         raise CapsuleError("execution.task_name is invalid")
+    selected = route["selected"]
+    expected_task_name = _task_name(
+        role=role,
+        node=node,
+        generation=generation,
+        epoch=value.get("epoch"),
+        model=selected["model"],
+        effort=selected["effort"],
+    )
+    if task_name != expected_task_name:
+        raise CapsuleError("execution.task_name does not match the selected route")
     if role == "reviewer" and fork_turns != "none":
         raise CapsuleError("reviewer must use fork_turns=none")
     if value.get("epoch") is not None and (not isinstance(value["epoch"], str) or EPOCH.fullmatch(value["epoch"]) is None):
@@ -320,7 +368,14 @@ def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
         "execution": {
             "cursor": 0,
             "fork_turns": spec["fork_turns"],
-            "task_name": _task_name(role=role, node=node, generation=generation, epoch=epoch),
+            "task_name": _task_name(
+                role=role,
+                node=node,
+                generation=generation,
+                epoch=epoch,
+                model=route["selected"]["model"],
+                effort=route["selected"]["effort"],
+            ),
         },
         "generation": generation,
         "graph_sha256": _sha(spec["graph_sha256"], "dispatch.graph_sha256"),

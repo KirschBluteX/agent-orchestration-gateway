@@ -136,6 +136,60 @@ class V7RoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(RoutingCatalogError, "not supported"):
             resolve_route_plan([exact_pin], catalog)
 
+    def test_model_only_user_pin_precompiles_effort_fallbacks_but_full_pin_stays_exact(self) -> None:
+        catalog = {
+            "models": [
+                {
+                    "multi_agent_version": "v2",
+                    "slug": "gpt-5.6-terra",
+                    "supported_reasoning_levels": [
+                        {"effort": "ultra"},
+                        {"effort": "high"},
+                        {"effort": "xhigh"},
+                        {"effort": "max"},
+                    ],
+                }
+            ]
+        }
+        request = {
+            "assurance": "bounded",
+            "constraints": {
+                "fixed_effort": None,
+                "fixed_model": "gpt-5.6-terra",
+                "source": "user",
+            },
+            "node": "n01_model_pin",
+            "role": "worker",
+        }
+
+        model_only = resolve_route_plan([request], catalog)["routes"][0]
+        self.assertEqual(
+            model_only["candidates"],
+            [
+                {"effort": "max", "model": "gpt-5.6-terra"},
+                {"effort": "xhigh", "model": "gpt-5.6-terra"},
+                {"effort": "high", "model": "gpt-5.6-terra"},
+            ],
+        )
+
+        full_pin = resolve_route_plan(
+            [
+                {
+                    **request,
+                    "constraints": {
+                        "fixed_effort": "xhigh",
+                        "fixed_model": "gpt-5.6-terra",
+                        "source": "user",
+                    },
+                }
+            ],
+            catalog,
+        )["routes"][0]
+        self.assertEqual(
+            full_pin["candidates"],
+            [{"effort": "xhigh", "model": "gpt-5.6-terra"}],
+        )
+
     def test_nonstandard_effort_requires_a_current_user_pin(self) -> None:
         catalog = {
             "models": [

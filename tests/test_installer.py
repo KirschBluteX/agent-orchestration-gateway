@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,13 +23,15 @@ PROFILES = {
 }
 
 
-def trusted_hook_inventory() -> dict[str, object]:
+def trusted_hook_inventory(plugin_root: Path = PLUGIN) -> dict[str, object]:
     events = (
         "sessionStart",
-        "preToolUse",
+        "sessionEnd",
         "preToolUse",
         "preToolUse",
         "postToolUse",
+        "stop",
+        "userPromptSubmit",
         "subagentStop",
     )
     return {
@@ -36,7 +40,8 @@ def trusted_hook_inventory() -> dict[str, object]:
                 "enabled": True,
                 "eventName": event,
                 "pluginId": "codex-cost-orchestrator@codex-cost-orchestrator",
-                "sourcePath": str(PLUGIN / "hooks" / "hooks.json"),
+                "source": "plugin",
+                "sourcePath": str(plugin_root / "hooks" / "hooks.json"),
                 "trustStatus": "trusted",
             }
             for event in events
@@ -331,6 +336,286 @@ class InstallerTests(unittest.TestCase):
                 )
 
             self.assertEqual(result, 0)
+
+    def test_doctor_accepts_a_byte_identical_cached_plugin_root_at_a_different_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            cached_plugin = root / "cache" / "codex-cost-orchestrator" / "1.0.0"
+            shutil.copytree(PLUGIN, cached_plugin)
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+
+            result = install_agents.doctor(
+                target,
+                workspace=root,
+                native_loader=lambda: catalog,
+                hook_loader=lambda _workspace: trusted_hook_inventory(cached_plugin),
+            )
+
+            self.assertEqual(result, 0)
+
+    def test_doctor_rejects_cached_plugin_with_a_modified_runtime_critical_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            cached_plugin = root / "cache" / "codex-cost-orchestrator" / "1.0.0"
+            shutil.copytree(PLUGIN, cached_plugin)
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+            runtime_files = [
+                *(PLUGIN / "hooks").rglob("*.py"),
+                PLUGIN / "hooks" / "hooks.json",
+                *(PLUGIN / "scripts").rglob("*.py"),
+            ]
+
+            for source in runtime_files:
+                relative_path = source.relative_to(PLUGIN)
+                cached_file = cached_plugin / relative_path
+                original = cached_file.read_bytes()
+                try:
+                    cached_file.write_bytes(original + b"\n# modified for doctor test\n")
+                    with self.subTest(path=relative_path):
+                        result = install_agents.doctor(
+                            target,
+                            workspace=root,
+                            native_loader=lambda: catalog,
+                            hook_loader=lambda _workspace: trusted_hook_inventory(cached_plugin),
+                        )
+
+                    self.assertEqual(result, 1)
+                finally:
+                    cached_file.write_bytes(original)
+
+    def test_doctor_rejects_cached_plugin_with_wrong_manifest_identity_or_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            cached_plugin = root / "cache" / "codex-cost-orchestrator" / "1.0.0"
+            shutil.copytree(PLUGIN, cached_plugin)
+            cached_manifest = cached_plugin / ".codex-plugin" / "plugin.json"
+            original = cached_manifest.read_bytes()
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+
+            for field, value in (("name", "other-plugin"), ("version", "0.0.0")):
+                manifest = json.loads(original)
+                manifest[field] = value
+                cached_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                try:
+                    with self.subTest(field=field):
+                        result = install_agents.doctor(
+                            target,
+                            workspace=root,
+                            native_loader=lambda: catalog,
+                            hook_loader=lambda _workspace: trusted_hook_inventory(cached_plugin),
+                        )
+
+                    self.assertEqual(result, 1)
+                finally:
+                    cached_manifest.write_bytes(original)
+
+    def test_doctor_accepts_cached_plugin_when_its_version_is_not_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            cached_plugin = root / "cache" / "codex-cost-orchestrator" / "local"
+            shutil.copytree(PLUGIN, cached_plugin)
+            cached_manifest = cached_plugin / ".codex-plugin" / "plugin.json"
+            manifest = json.loads(cached_manifest.read_text(encoding="utf-8"))
+            del manifest["version"]
+            cached_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+
+            result = install_agents.doctor(
+                target,
+                workspace=root,
+                native_loader=lambda: catalog,
+                hook_loader=lambda _workspace: trusted_hook_inventory(cached_plugin),
+            )
+
+            self.assertEqual(result, 0)
+
+    def test_doctor_accepts_cached_plugin_with_an_empty_unobservable_version(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            cached_plugin = root / "cache" / "codex-cost-orchestrator" / "local"
+            shutil.copytree(PLUGIN, cached_plugin)
+            cached_manifest = cached_plugin / ".codex-plugin" / "plugin.json"
+            manifest = json.loads(cached_manifest.read_text(encoding="utf-8"))
+            manifest["version"] = ""
+            cached_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+
+            result = install_agents.doctor(
+                target,
+                workspace=root,
+                native_loader=lambda: catalog,
+                hook_loader=lambda _workspace: trusted_hook_inventory(cached_plugin),
+            )
+
+            self.assertEqual(result, 0)
+
+    def test_doctor_rejects_mixed_sources_for_current_cco_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            first_cached_plugin = root / "cache-a" / "codex-cost-orchestrator" / "1.0.0"
+            second_cached_plugin = root / "cache-b" / "codex-cost-orchestrator" / "1.0.0"
+            shutil.copytree(PLUGIN, first_cached_plugin)
+            shutil.copytree(PLUGIN, second_cached_plugin)
+            inventory = trusted_hook_inventory(first_cached_plugin)
+            inventory["hooks"][-1]["sourcePath"] = str(
+                second_cached_plugin / "hooks" / "hooks.json"
+            )
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+
+            result = install_agents.doctor(
+                target,
+                workspace=root,
+                native_loader=lambda: catalog,
+                hook_loader=lambda _workspace: inventory,
+            )
+
+            self.assertEqual(result, 1)
+
+    def test_doctor_rejects_hooks_not_reported_as_plugin_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            cached_plugin = root / "cache" / "codex-cost-orchestrator" / "1.0.0"
+            shutil.copytree(PLUGIN, cached_plugin)
+            inventory = trusted_hook_inventory(cached_plugin)
+            inventory["hooks"][0]["source"] = "project"
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+
+            result = install_agents.doctor(
+                target,
+                workspace=root,
+                native_loader=lambda: catalog,
+                hook_loader=lambda _workspace: inventory,
+            )
+
+            self.assertEqual(result, 1)
+
+    def test_doctor_retains_hook_readiness_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "agents"
+            self.assertEqual(
+                install_agents.install(target, check_only=False, workspace=root),
+                0,
+            )
+            catalog = {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    }
+                ]
+            }
+            mutations = {
+                "missing": lambda inventory: inventory["hooks"].pop(),
+                "disabled": lambda inventory: inventory["hooks"][0].update(enabled=False),
+                "modified": lambda inventory: inventory["hooks"][0].update(trustStatus="modified"),
+                "wrong-plugin": lambda inventory: inventory["hooks"][0].update(pluginId="other@plugin"),
+            }
+
+            for name, mutate in mutations.items():
+                inventory = trusted_hook_inventory()
+                mutate(inventory)
+                with self.subTest(case=name):
+                    result = install_agents.doctor(
+                        target,
+                        workspace=root,
+                        native_loader=lambda: catalog,
+                        hook_loader=lambda _workspace: inventory,
+                    )
+
+                self.assertEqual(result, 1)
 
     def test_doctor_reports_not_ready_until_every_plugin_hook_is_trusted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

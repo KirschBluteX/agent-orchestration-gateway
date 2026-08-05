@@ -11,7 +11,12 @@ import re
 import time
 from typing import Any, Mapping
 
-from protocol_hash import ProtocolHashError, canonical_bytes, require_repository_scope
+from protocol_hash import (
+    ProtocolHashError,
+    canonical_bytes,
+    repository_scopes_overlap,
+    require_repository_scope,
+)
 from routing_catalog import RoutingCatalogError, validate_route_constraints, validate_route_pair
 from workspace_state import (
     StateError,
@@ -28,13 +33,18 @@ from workspace_state import (
 
 
 ARTIFACT_PROTOCOL = "cco.prepared-workspace.v2"
-GRAPH_PROTOCOL = "cco.graph.v3"
-GRAPH_DOMAIN = b"cco.graph.v3\0"
+GRAPH_PROTOCOL = "cco.graph.v4"
+LEGACY_GRAPH_PROTOCOL = "cco.graph.v3"
+GRAPH_DOMAINS = {
+    GRAPH_PROTOCOL: b"cco.graph.v4\0",
+    LEGACY_GRAPH_PROTOCOL: b"cco.graph.v3\0",
+}
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_ROUTE_BINDINGS = 4
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 ARTIFACT_FILENAME = re.compile(r"^.+-[0-9a-f]{64}\.json$")
+NODE_ID = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 
 
 class PreparedGraphError(ValueError):
@@ -42,7 +52,11 @@ class PreparedGraphError(ValueError):
 
 
 def graph_sha256(manifest: Mapping[str, Any]) -> str:
-    return "sha256:" + hashlib.sha256(GRAPH_DOMAIN + canonical_bytes(dict(manifest))).hexdigest()
+    protocol = manifest.get("protocol") if isinstance(manifest, Mapping) else None
+    domain = GRAPH_DOMAINS.get(protocol)
+    if domain is None:
+        raise PreparedGraphError("prepared graph protocol is unsupported")
+    return "sha256:" + hashlib.sha256(domain + canonical_bytes(dict(manifest))).hexdigest()
 
 
 def artifact_path(ledger_root: Path, session_id: str, identity: str) -> Path:
@@ -163,53 +177,207 @@ def _route_bindings(value: object, label: str) -> list[dict[str, Any]]:
     return normalized
 
 
-def _manifest(value: object) -> dict[str, Any]:
-    fields = {"baseline", "nodes", "protocol", "route_plan_sha256", "workspace_mode"}
-    if not isinstance(value, Mapping) or set(value) != fields or value["protocol"] != GRAPH_PROTOCOL:
-        raise PreparedGraphError("prepared graph manifest is malformed")
-    if SHA256.fullmatch(str(value["baseline"])) is None:
+def _node_id(value: object, label: str) -> str:
+    if not isinstance(value, str) or NODE_ID.fullmatch(value) is None:
+        raise PreparedGraphError(f"{label} is invalid")
+    return value
+
+
+def _manifest_header(value: Mapping[str, Any]) -> tuple[str, str | None]:
+    baseline = value.get("baseline")
+    if SHA256.fullmatch(str(baseline)) is None:
         raise PreparedGraphError("prepared graph baseline identity is invalid")
-    route_plan_sha256 = value["route_plan_sha256"]
+    route_plan_sha256 = value.get("route_plan_sha256")
     if route_plan_sha256 is not None and SHA256.fullmatch(str(route_plan_sha256)) is None:
         raise PreparedGraphError("prepared graph route plan identity is invalid")
-    if value["workspace_mode"] not in {"light", "strict"}:
+    if value.get("workspace_mode") not in {"light", "strict"}:
         raise PreparedGraphError("prepared graph workspace mode is invalid")
+    return str(baseline), route_plan_sha256
+
+
+def _manifest_node(
+    value: object,
+    *,
+    index: int,
+    route_plan_sha256: str | None,
+    selection: bool,
+    require_child_route: bool,
+) -> dict[str, Any]:
+    required = {"contract", "decision", "node", "route_bindings", "scopes"}
+    optional = {"member_nodes"} if selection else set()
+    if selection:
+        required.add("selection")
+    if not isinstance(value, Mapping) or set(value) - optional != required:
+        raise PreparedGraphError(f"prepared graph node {index} is malformed")
+    name = _node_id(value["node"], f"prepared graph node {index}.node")
+    contract = value["contract"]
+    decision = value["decision"]
+    if (
+        not isinstance(contract, Mapping)
+        or contract.get("node") != name
+        or not isinstance(decision, Mapping)
+    ):
+        raise PreparedGraphError(f"prepared graph node {index} is inconsistent")
+    bindings = _route_bindings(
+        value["route_bindings"], f"prepared graph node {index}.route_bindings"
+    )
+    placement = decision.get("placement")
+    if (
+        require_child_route
+        and isinstance(placement, Mapping)
+        and placement.get("target") == "child"
+        and not bindings
+    ):
+        raise PreparedGraphError(f"prepared graph child node {index} lacks a route")
+    if bindings and bindings[0]["plan_sha256"] != route_plan_sha256:
+        raise PreparedGraphError("prepared graph route base identity is inconsistent")
+    normalized = {
+        "contract": dict(contract),
+        "decision": dict(decision),
+        "node": name,
+        "route_bindings": bindings,
+        "scopes": _scopes(value["scopes"], f"prepared graph node {index}.scopes"),
+    }
+    if not selection:
+        return normalized
+
+    selection_value = value["selection"]
+    selection_fields = {
+        "depends_on",
+        "dependencies_ready",
+        "downstream_count",
+        "responsibility",
+    }
+    if (
+        not isinstance(selection_value, Mapping)
+        or set(selection_value) != selection_fields
+        or not isinstance(selection_value["responsibility"], str)
+        or not selection_value["responsibility"]
+        or type(selection_value["dependencies_ready"]) is not bool
+        or type(selection_value["downstream_count"]) is not int
+        or selection_value["downstream_count"] < 0
+        or not isinstance(selection_value["depends_on"], list)
+    ):
+        raise PreparedGraphError(f"prepared graph node {index}.selection is malformed")
+    dependencies = [
+        _node_id(item, f"prepared graph node {index}.selection.depends_on")
+        for item in selection_value["depends_on"]
+    ]
+    if dependencies != sorted(dependencies) or len(dependencies) != len(set(dependencies)):
+        raise PreparedGraphError(
+            f"prepared graph node {index}.selection.depends_on is not canonical"
+        )
+    normalized["selection"] = {
+        "depends_on": dependencies,
+        "dependencies_ready": selection_value["dependencies_ready"],
+        "downstream_count": selection_value["downstream_count"],
+        "responsibility": selection_value["responsibility"],
+    }
+    if "member_nodes" in value:
+        members = [
+            _node_id(item, f"prepared graph node {index}.member_nodes")
+            for item in value["member_nodes"]
+        ] if isinstance(value["member_nodes"], list) else None
+        if (
+            members is None
+            or len(members) < 2
+            or members != sorted(members)
+            or len(members) != len(set(members))
+            or name in members
+        ):
+            raise PreparedGraphError(f"prepared graph node {index}.member_nodes is malformed")
+        normalized["member_nodes"] = members
+    return normalized
+
+
+def _manifest(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise PreparedGraphError("prepared graph manifest is malformed")
+    protocol = value.get("protocol")
+    legacy_fields = {
+        "baseline",
+        "nodes",
+        "protocol",
+        "route_plan_sha256",
+        "workspace_mode",
+    }
+    v4_fields = legacy_fields | {"completed_nodes", "member_mapping"}
+    if protocol == LEGACY_GRAPH_PROTOCOL and set(value) == legacy_fields:
+        baseline, route_plan_sha256 = _manifest_header(value)
+        selection = False
+        require_child_route = True
+    elif protocol == GRAPH_PROTOCOL and set(value) == v4_fields:
+        baseline, route_plan_sha256 = _manifest_header(value)
+        selection = True
+        require_child_route = False
+    else:
+        raise PreparedGraphError("prepared graph manifest is malformed")
+
     nodes = value["nodes"]
     if not isinstance(nodes, list) or not nodes:
         raise PreparedGraphError("prepared graph nodes are invalid")
-    normalized_nodes: list[dict[str, Any]] = []
-    for index, node in enumerate(nodes):
-        required = {"contract", "decision", "node", "route_bindings", "scopes"}
-        if not isinstance(node, Mapping) or set(node) != required:
-            raise PreparedGraphError(f"prepared graph node {index} is malformed")
-        name = node["node"]
-        contract = node["contract"]
-        decision = node["decision"]
-        if not isinstance(name, str) or not isinstance(contract, Mapping) or contract.get("node") != name or not isinstance(decision, Mapping):
-            raise PreparedGraphError(f"prepared graph node {index} is inconsistent")
-        bindings = _route_bindings(node["route_bindings"], f"prepared graph node {index}.route_bindings")
-        if decision.get("placement", {}).get("target") == "child" and not bindings:
-            raise PreparedGraphError(f"prepared graph child node {index} lacks a route")
-        if bindings and bindings[0]["plan_sha256"] != route_plan_sha256:
-            raise PreparedGraphError("prepared graph route base identity is inconsistent")
-        normalized_nodes.append(
-            {
-                "contract": dict(contract),
-                "decision": dict(decision),
-                "node": name,
-                "route_bindings": bindings,
-                "scopes": _scopes(node["scopes"], f"prepared graph node {index}.scopes"),
-            }
+    normalized_nodes = [
+        _manifest_node(
+            node,
+            index=index,
+            route_plan_sha256=route_plan_sha256,
+            selection=selection,
+            require_child_route=require_child_route,
         )
-    if [item["node"] for item in normalized_nodes] != sorted(item["node"] for item in normalized_nodes) or len({item["node"] for item in normalized_nodes}) != len(normalized_nodes):
+        for index, node in enumerate(nodes)
+    ]
+    names = [item["node"] for item in normalized_nodes]
+    if names != sorted(names) or len(names) != len(set(names)):
         raise PreparedGraphError("prepared graph nodes must be sorted and unique")
-    return {
-        "baseline": value["baseline"],
+
+    manifest: dict[str, Any] = {
+        "baseline": baseline,
         "nodes": normalized_nodes,
-        "protocol": GRAPH_PROTOCOL,
+        "protocol": protocol,
         "route_plan_sha256": route_plan_sha256,
         "workspace_mode": value["workspace_mode"],
     }
+    if not selection:
+        return manifest
+
+    completed = value["completed_nodes"]
+    if (
+        not isinstance(completed, list)
+        or any(NODE_ID.fullmatch(item) is None for item in completed if isinstance(item, str))
+        or any(not isinstance(item, str) for item in completed)
+        or completed != sorted(completed)
+        or len(completed) != len(set(completed))
+    ):
+        raise PreparedGraphError("prepared graph completed nodes are malformed")
+    member_mapping_value = value["member_mapping"]
+    if (
+        not isinstance(member_mapping_value, Mapping)
+        or any(
+            NODE_ID.fullmatch(member) is None
+            or not isinstance(aggregate, str)
+            or NODE_ID.fullmatch(aggregate) is None
+            for member, aggregate in member_mapping_value.items()
+            if isinstance(member, str)
+        )
+        or any(not isinstance(member, str) for member in member_mapping_value)
+        or list(member_mapping_value) != sorted(member_mapping_value)
+    ):
+        raise PreparedGraphError("prepared graph member mapping is malformed")
+    member_mapping = dict(member_mapping_value)
+    known_names = set(names)
+    expected_mapping: dict[str, str] = {}
+    for node in normalized_nodes:
+        if "member_nodes" not in node:
+            continue
+        for member in node["member_nodes"]:
+            if member not in known_names or member in expected_mapping:
+                raise PreparedGraphError("prepared graph aggregate members are inconsistent")
+            expected_mapping[member] = node["node"]
+    if member_mapping != expected_mapping:
+        raise PreparedGraphError("prepared graph member mapping is inconsistent")
+    manifest["completed_nodes"] = list(completed)
+    manifest["member_mapping"] = member_mapping
+    return manifest
 
 
 def normalize_artifact(value: object) -> dict[str, Any]:
@@ -337,3 +505,95 @@ def verify_artifact_workspace(path: Path, *, repo: Path, baseline: str, graph_sh
         scope_entries=True,
     )
     return result
+
+
+def verify_pre_spawn_workspace(
+    artifact: Path,
+    *,
+    repo: Path,
+    baseline: str,
+    graph_sha256_value: str,
+    graph_scopes_value: object,
+    workspace_mode: str,
+    active_sibling_scopes: object,
+    pending_candidate_scopes: object,
+) -> dict[str, Any]:
+    """Check that a queued spawn can safely inherit a prepared workspace.
+
+    The prepared graph remains the read boundary, while only scopes leased to
+    active siblings may carry a baseline-relative delta.  The candidate's
+    pending scopes consequently remain fail-closed until its spawn is active.
+    """
+
+    prepared = load_artifact(artifact)
+    manifest = prepared["manifest"]
+    snapshot = prepared["snapshot"]
+    scopes = graph_scopes(manifest)
+    if (
+        prepared["graph_sha256"] != graph_sha256_value
+        or snapshot["state_id"] != baseline
+        or snapshot["ignored_mode"] != workspace_mode
+        or scopes != graph_scopes_value
+    ):
+        raise PreparedGraphError("ledger workspace identity does not match artifact")
+
+    active = _scopes(active_sibling_scopes, "active sibling scopes")
+    pending = _scopes(pending_candidate_scopes, "pending candidate scopes")
+    graph_keys = {(scope["kind"], scope["path"]) for scope in scopes}
+    if any((scope["kind"], scope["path"]) not in graph_keys for scope in active):
+        raise PreparedGraphError("active sibling scopes are outside the prepared graph")
+    if any((scope["kind"], scope["path"]) not in graph_keys for scope in pending):
+        raise PreparedGraphError("pending candidate scopes are outside the prepared graph")
+    for active_scope in active:
+        for pending_scope in pending:
+            if repository_scopes_overlap(active_scope, pending_scope):
+                raise PreparedGraphError(
+                    "active sibling scopes overlap pending candidate scopes"
+                )
+
+    try:
+        root = repository_root(Path(repo))
+        control_roots = repository_control_roots(root)
+        index_records = repository_index_records(root)
+        gitlinks = repository_gitlinks(root, index_records)
+        spellings = repository_path_spelling_map(index_records)
+        directory_spellings: dict[str, frozenset[str]] = {}
+
+        def normalize(scopes_to_normalize: list[dict[str, str]]) -> list[dict[str, str]]:
+            return [
+                normalize_allow(
+                    root,
+                    f"{scope['kind']}:{scope['path']}",
+                    protected_roots=control_roots,
+                    gitlinks=gitlinks,
+                    tracked_spellings=spellings,
+                    directory_spellings=directory_spellings,
+                )
+                for scope in scopes_to_normalize
+            ]
+
+        graph_allowed = normalize(scopes)
+        allowed_active = normalize(active)
+        pending_scopes = normalize(pending)
+        _code, result, _current = verify(
+            root,
+            snapshot,
+            allowed_active,
+            control_roots=control_roots,
+            index_records=index_records,
+            scope_entries=True,
+            entry_scopes=graph_allowed,
+        )
+    except StateError as error:
+        raise PreparedGraphError(f"pre-spawn workspace verification is invalid: {error}") from error
+
+    return {
+        "schema": "cco.pre-spawn-workspace-verification.v1",
+        "baseline_state": result["baseline_state"],
+        "current_state": result["current_state"],
+        "allowed_active_scopes": allowed_active,
+        "pending_scopes": pending_scopes,
+        "changed_paths": result["changed_paths"],
+        "violations": result["violations"],
+        "verdict": result["verdict"],
+    }

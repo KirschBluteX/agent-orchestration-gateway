@@ -1,6 +1,6 @@
 # Roadmap
 
-## 1.0 adoption
+## 1.1 adoption
 
 - Validate clean install, update, trust, first dispatch, and uninstall with Windows and
   Linux users.
@@ -8,6 +8,8 @@
   green on the exact release commit.
 - Collect voluntary issue reports for false blocks, native route rejection, model
   capability differences, and scope attribution; add no plugin telemetry.
+- Measure user-visible prepare-to-spawn latency and transaction recovery behavior with
+  reproducible local traces before adding another orchestration layer.
 - Publish workload-matched benchmark inputs and raw observations before making any
   cost or quality claim.
 

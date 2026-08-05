@@ -5,7 +5,7 @@
 | Dimension | Current support |
 | --- | --- |
 | Host | Codex CLI/Desktop with plugins, hooks, and native Agents |
-| Tested Codex contract | 0.144.6 |
+| Tested Codex contract | CLI 0.146.0; Desktop build 26.730.8199.0 |
 | Operating system | Windows and Linux |
 | macOS | Not currently tested or claimed |
 | Python | 3.11+; CI exercises 3.11 and 3.14 |
@@ -19,7 +19,7 @@
 python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
 ```
 
-Open `/hooks`, inspect all six current CCO hooks, and trust their hashes. Then run:
+Open `/hooks`, inspect all seven current CCO hooks, and trust their hashes. Then run:
 
 ```text
 python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
@@ -54,23 +54,44 @@ Effort adapts through `max`, `xhigh`, `high`. Sol and `ultra` are never automati
 Current user pins override project/global policy. Unsupported exact pins and invalid
 higher-priority policy remain in Primary without substitution.
 
-The graph compiler accepts host capability metadata to avoid a CLI round trip. If it
+Both CCO leaf profiles are model-neutral. The compiler sends the selected model and
+effort explicitly on native spawn, so Luna does not require a dedicated profile. The
+graph compiler accepts host capability metadata to avoid a CLI round trip. If it
 is absent, CCO reads the PATH Codex bundled catalogue once for that preparation. It
-does not contact a model or network service.
+does not contact a model or network service. The actual native spawn response remains
+the final capability evidence.
+
+## Fast dispatch sequence
+
+1. Close the complete graph from facts already present in the user request and known
+   repository policy. If one material fact is missing, use one narrow explorer.
+2. Put shared facts in graph `defaults` and invoke `graph_compiler.py` once.
+3. Issue every ready short spawn reference in the same Primary model turn. No other
+   tool is allowed while the transaction still has pending references.
+4. Enter one long event wait. Do not poll or send progress-only requests. Child
+   completion, blocking input, or a user message wakes Primary.
+
+A confirmed pre-thread rejection advances only that node to its precompiled fallback.
+Active siblings continue. Graph identity, workspace, or transaction corruption is a
+graph-level failure and fences the undispatched remainder.
 
 ## Hooks and local state
 
 | Event | Purpose |
 | --- | --- |
 | SessionStart | Inject one compact mandatory CCO reminder; prune stale sessions |
-| PreToolUse spawn | Validate cco.v7 request, prepared artifact, route, and reserve owner |
+| SessionEnd | Remove task artifacts immediately only when its ledger is terminal |
+| PreToolUse all tools | Gate a pending transaction; expand one exact short spawn reference |
 | PreToolUse continuation | Require exact next cursor for managed owners |
 | PreToolUse interrupt | Retire/fence before native interruption |
 | PostToolUse | Activate one owner, settle continuation, or release rejected spawn |
+| Stop | Request a 30-minute event wait or perform one bounded pending-batch recovery |
+| UserPromptSubmit | Restore compact active/pending transaction context after user input |
 | SubagentStop | Validate result, acceptance evidence, role, scope, and exact delta |
 
-There is deliberately no Stop hook or unsupported SessionEnd entry. Large terminal
-artifacts delete immediately. A later SessionStart removes terminal ledgers after 24
+Large terminal artifacts and settled dispatch bundles delete immediately. SessionEnd
+removes the remaining task residue only after terminality; a later SessionStart is the
+fallback and removes terminal ledgers after 24
 hours and live/unknown abandoned artifacts and ledgers after seven days. This keeps
 fencing across multiple turns without adding per-turn hook latency.
 
@@ -83,6 +104,8 @@ location. Do not delete state belonging to an active task.
 - Profile missing/shadowed/modified or hook untrusted: no delegation; run doctor.
 - Node route unavailable: only that node returns to Primary.
 - Confirmed pre-thread rejection: use the next precompiled fallback only.
+- Interrupted pending dispatch: one exact recovery; a second abandonment fences only
+  nodes that never became active.
 - Managed malformed capsule, wrong owner/cursor, stale result, or raw follow-up: block.
 - Result path/evidence/workspace mismatch: keep owner fenced and return exact error.
 - Incomplete, blocked, or deviation: record one failure signature and force a guarded

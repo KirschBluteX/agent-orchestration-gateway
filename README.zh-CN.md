@@ -9,7 +9,7 @@ Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的隐式控制层。它�
 CCO 不创建第二套 Agent runtime。spawn、follow-up、interrupt、sandbox 和实际执行仍由
 Codex 负责；CCO 只编译并守卫这些原生调用。
 
-## 1.0 提供什么
+## 1.1 提供什么
 
 - 逻辑角色为 `explorer`、`worker`、`reviewer`，物理上只使用模型中立的只读/可写
   两个 profile。
@@ -21,6 +21,11 @@ Codex 负责；CCO 只编译并守卫这些原生调用。
 - 默认严格接管普通原生 Agent spawn；只有用户明确授权时才能恢复原生继承。
 - `cco.v7` 胶囊、scope 限定 baseline、owner/cursor fencing、guarded generation、
   failure signature 与迟到结果 tombstone。
+- 一次 fail-closed 派遣事务：完整胶囊保存在 Primary 上下文之外，Primary 只接收短的
+  原生 spawn 引用。
+- 显式 DAG 依赖、已完成节点输入、下游优先调度，以及对兼容微任务的全图安全聚合。
+- 每次 spawn 前的 workspace lease：只允许 active sibling 在其不冲突 scope 内产生
+  变化；pending scope 或图外变化一律 fail-closed。
 - 将 acceptance ID、结构化证据和真实 workspace delta 连接为一条验收链。
 - Primary 派遣后事件驱动等待；CCO 不再额外压低 Codex 原生并发容量。
 - 不依赖 Radar，不创建运行时路由缓存，也不记录 token、账单或成本统计。
@@ -34,7 +39,8 @@ flowchart LR
     D -->|"未闭合 / 无 child 收益"| P
     D --> R["静态本地路由"]
     R --> G["Prepared cco.v7 graph"]
-    G --> H["PreToolUse + ledger"]
+    G --> T["短引用派遣事务"]
+    T --> H["PreToolUse + ledger"]
     H --> A["Codex 原生 Agent"]
     A --> E["结果 + 精确状态证据"]
     E --> V["Primary 验收或风险触发 reviewer"]
@@ -42,6 +48,26 @@ flowchart LR
 
 派遣后，Primary 只可继续已证明不会重叠、冲突或依赖 leaf 的工作；其余情况直接等待
 原生事件，不轮询，也不发起只用于“查看进度”的模型请求。
+
+## 快速派遣
+
+正常路径固定为：
+
+```text
+一次闭合完整工作图 → 一次编译 → 同一模型轮次派遣全部 ready 节点
+→ 一次长事件等待
+```
+
+共享事实只通过 graph `defaults` 提供一次。编译器会先聚合兼容的 Primary 微任务，推导
+DAG ready frontier，捕获一份 baseline，在本地完成全部节点路由，提交一次事务，并仅
+返回精确的短 spawn 引用。仍有引用待派遣时，hook 不允许插入文件读取、修改、测试、
+路由解释或状态查询。若某节点在线程创建前被拒绝，只有该节点进入已经预编译的后备，
+已经运行的 sibling 不受影响。
+
+如果用户请求与仓库策略已经足以闭合工作图，Primary 在编译前不得再次展开仓库探索。
+若只缺一个关键事实，应立即交给窄范围 explorer，而不是让 Primary 长时间自行探索。
+派遣完成后，Primary 仅在 child 完成、需要阻塞输入、收到用户消息或 30 分钟原生保护
+超时时被唤醒；保护超时不会终止 child。
 
 ## 默认路由
 
@@ -62,8 +88,8 @@ generation 使用 guarded。
 
 ## 环境要求
 
-- 支持插件 hooks 和原生 Agent 的 Codex CLI / Codex 桌面端；本版本按 `0.144.6`
-  契约验证。
+- 支持插件 hooks 和原生 Agent 的 Codex CLI / Codex 桌面端；本版本按 CLI `0.146.0`
+  与桌面构建 `26.730.8199.0` 契约验证。
 - Python 3.11 或更高版本。
 - Git。
 - Windows 或 Linux；当前不测试 macOS。
@@ -92,6 +118,10 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . -
 
 doctor 必须同时显示 `HOOKS READY` 和 `STATIC ROUTE READY`。安装或更新后新建一个
 Codex 任务，使新的 skill、profile 与 hook 生效。
+
+两个 leaf profile 特意保持模型中立。当前 Codex 宿主允许在原生 spawn 中显式传入所选
+Luna/Terra 模型与思考强度，因此 CCO 不安装重复的模型专用 profile。
+`STATIC ROUTE READY` 只验证本地能力目录；实际 spawn 响应仍是最终能力证据。
 
 之后 CCO 会默认隐式运行。例如直接提出：
 
@@ -177,8 +207,8 @@ CCO 生命周期和证据保证。
   light 模式，也会保留全仓库 Git status 与 Git control state，以发现新产生的 scope 外变更。
 - worker 声明的 changed paths 必须与该节点 scope 内的真实 delta 完全一致。
 - 大型终态 graph artifact 会立即删除。用于迟到结果 fencing 的小型 tombstone 存放在
-  仓库外；后续 SessionStart 会清理超过 24 小时的终态残留，并将仍像 live/unknown 的
-  遗留状态保守保留最多 7 天，因为当前 Codex 没有 SessionEnd hook。
+  仓库外；SessionEnd 会立即清理已经终态的任务残留。后续 SessionStart 仍作为兜底：
+  超过 24 小时的终态残留会被清理，live/unknown 遗留状态最多保守保留 7 天。
 - CCO 不发送自身遥测，也不保存 token 数、账单、Radar 数据或长期路由历史。临时
   prepared artifact 必然包含闭合合同、scope、route binding 与 workspace 指纹，但
   不复制仓库文件正文或完整对话。
@@ -203,8 +233,8 @@ CI 覆盖 Windows/Python 3.14 与 Linux/Python 3.11。基准方法见
 
 ## 项目状态
 
-1.0.0 是第一版稳定协议，目标是生产导向的流程护栏；它不是硬安全边界，也不能替代
-Primary 的最终验收。欢迎提交 issue 与 PR，参见 [CONTRIBUTING.md](CONTRIBUTING.md)、
+1.1.0 保持稳定的 `cco.v7` wire protocol，同时加强派遣事务、workspace lease、DAG
+调度和 Primary 静默等待。它不是硬安全边界，也不能替代 Primary 的最终验收。欢迎提交 issue 与 PR，参见 [CONTRIBUTING.md](CONTRIBUTING.md)、
 [ROADMAP.md](ROADMAP.md) 与 [CHANGELOG.md](CHANGELOG.md)。
 
 MIT License。Copyright (c) 2026 KirschQAQ。

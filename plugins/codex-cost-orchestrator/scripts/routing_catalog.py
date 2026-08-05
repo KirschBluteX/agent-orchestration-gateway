@@ -329,8 +329,9 @@ def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, 
             pair = {"effort": effort, "model": model}
             if pair not in candidates:
                 candidates.append(pair)
-            if fixed_model is not None or constraints["source"] == "automatic":
-                # Automatic policy and model-only pins choose one effort per model.
+            if constraints["source"] == "automatic":
+                # Automatic routes choose one effort per model.  A model-only user
+                # pin keeps the model fixed while precompiling its effort fallback.
                 break
         if len(candidates) >= MAX_FALLBACK_CANDIDATES:
             break

@@ -15,22 +15,23 @@
         ]
       }
     ],
-    "PreToolUse": [
+    "SessionEnd": [
       {
-        "matcher": "^(Agent|spawn_agent)$",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
             "timeout": 5,
             "async": false,
-            "statusMessage": "Checking CCO spawn packet"
+            "statusMessage": "Cleaning terminal CCO task state"
           }
         ]
-      },
+      }
+    ],
+    "PreToolUse": [
       {
-        "matcher": "send_message|followup_task",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
@@ -38,7 +39,7 @@
             "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
             "timeout": 5,
             "async": false,
-            "statusMessage": "Checking CCO continuation packet"
+            "statusMessage": "Checking CCO transaction gate"
           }
         ]
       },
@@ -67,6 +68,34 @@
             "timeout": 5,
             "async": false,
             "statusMessage": "Recording CCO native owner"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "timeout": 5,
+            "async": false,
+            "statusMessage": "Protecting CCO native wait"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "timeout": 5,
+            "async": false,
+            "statusMessage": "Loading CCO dispatch context"
           }
         ]
       }

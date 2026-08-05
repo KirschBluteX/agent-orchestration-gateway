@@ -2,6 +2,28 @@
 
 The project follows semantic versioning.
 
+## 1.1.0 - 2026-08-05
+
+- Added a fail-closed graph dispatch transaction: the normal compiler path persists
+  full capsules outside model context and returns only short native spawn references.
+- Added exact per-node pre-thread rejection recovery, so one unsupported candidate can
+  advance to its precompiled fallback without cancelling successful siblings.
+- Added explicit DAG dependencies, completed-node input, downstream-aware selection,
+  and safe whole-graph aggregation of compatible Primary microtasks.
+- Added pre-spawn workspace leases: the first child requires the exact prepared state;
+  later children permit only changes owned by active non-conflicting siblings.
+- Added route-aware task names that expose logical role, node, model, effort, and
+  generation without sacrificing deterministic length bounds.
+- Added a 30-minute event-first Primary wait guard, one bounded pending-dispatch
+  recovery, and fail-closed fencing instead of short status polling.
+- Added terminal-only SessionEnd cleanup, with the existing bounded SessionStart
+  cleanup retained as a fallback for abandoned or older-host sessions.
+- Documented and enforced the fast path: close once, compile once, dispatch the ready
+  batch in one model turn, then enter one long event wait.
+- Validated the model-neutral profile design against Codex CLI 0.146.0: current host
+  support permits explicit Luna/Terra model and effort overrides without dedicated
+  model-pinned profiles.
+
 ## 1.0.0 - 2026-08-04
 
 - Published the clean-break `cco.v7` protocol with explorer/worker/reviewer logical

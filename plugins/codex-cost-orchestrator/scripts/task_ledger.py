@@ -249,7 +249,6 @@ class TaskLedger:
                     "generation",
                     "node",
                     "role",
-                    "run",
                     *_WORKSPACE_FIELDS,
                 )
                 previous_route = existing["route"]
@@ -369,6 +368,23 @@ class TaskLedger:
             self._set_guarded_floor(document, row)
             self._write(document)
             return True
+
+    def retire_after_invalid_stop(self, owner: str) -> dict[str, Any]:
+        """Atomically fence a final invalid SubagentStop and require guarded retry."""
+
+        if _TASK_PATH.fullmatch(owner) is None:
+            raise ValueError("owner is not canonical")
+        with self._lock():
+            document = self._read()
+            row = self._find_by_owner(document, owner)
+            if row.get("state") not in {"owned", "continuable", "retired"}:
+                raise LedgerConflict("owner cannot be retired")
+            row["state"] = "retired"
+            row.pop("_pending", None)
+            self._fence_owner(document, owner)
+            self._set_guarded_floor(document, row, force=True)
+            self._write(document)
+            return self._public(row)
 
     def record_result(self, *, node: str, contract_rev: int, run: str, generation: int, input_sha256: str, owner: str, disposition: str, cursor: int | None = None, require_guarded: bool = False) -> dict[str, Any]:
         if disposition not in {"continuable", "retired"} or _TASK_PATH.fullmatch(owner) is None:

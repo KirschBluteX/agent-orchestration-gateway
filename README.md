@@ -10,7 +10,7 @@ child task.
 CCO does not create another Agent runtime. Codex still owns spawn, follow-up,
 interrupt, sandboxing, and execution. CCO compiles and guards those native calls.
 
-## What 1.0 provides
+## What 1.1 provides
 
 - Logical `explorer`, `worker`, and `reviewer` roles over two model-neutral physical
   profiles: read-only and writable.
@@ -23,6 +23,12 @@ interrupt, sandboxing, and execution. CCO compiles and guards those native calls
   explicit user-authorized bypass.
 - `cco.v7` capsules, prepared scope-limited baselines, owner/cursor fencing, guarded
   generations, failure signatures, and late-result tombstones.
+- One fail-closed dispatch transaction that keeps full capsules outside Primary
+  context and exposes only short native spawn references.
+- Explicit DAG dependencies, completed-node input, downstream-aware scheduling, and
+  safe whole-graph aggregation of compatible microtasks.
+- Per-spawn workspace leases: active sibling changes are allowed only inside their
+  non-conflicting scopes; pending or out-of-graph changes fail closed.
 - Acceptance IDs connected to structured evidence and the exact workspace delta.
 - Event-driven Primary waiting and no CCO concurrency ceiling below native capacity.
 - No Radar dependency, runtime route cache, token/billing history, or cost telemetry.
@@ -36,7 +42,8 @@ flowchart LR
     D -->|"not closed / no child benefit"| P
     D --> R["Static local route"]
     R --> G["Prepared cco.v7 graph"]
-    G --> H["PreToolUse + ledger"]
+    G --> T["Short-ref dispatch transaction"]
+    T --> H["PreToolUse + ledger"]
     H --> A["Codex native Agent"]
     A --> E["Result + exact-state evidence"]
     E --> V["Primary acceptance or risk-triggered reviewer"]
@@ -44,6 +51,28 @@ flowchart LR
 
 CCO also keeps the Primary quiet after dispatch: it may continue only proven
 non-overlapping, dependency-independent work; otherwise it waits for native events.
+
+## Fast dispatch
+
+The normal path is deliberately short:
+
+```text
+close the whole graph once → compile once → spawn the ready batch in one model turn
+→ enter one long event wait
+```
+
+Shared facts are supplied once through graph `defaults`. The compiler aggregates
+compatible Primary microtasks, derives the ready DAG frontier, captures one baseline,
+routes every node locally, commits one transaction, and returns only exact short
+spawn references. While references remain pending, the hook permits no intervening
+file reads, edits, tests, route explanations, or status checks. A pre-thread rejection
+advances only that node to its already-prepared fallback; active siblings continue.
+
+If the user request and repository policy already close the graph, Primary should not
+inspect the repository again before compiling it. One missing material fact goes to a
+narrow explorer rather than an open-ended Primary investigation. After spawn, Primary
+wakes only for child completion, blocking input, a user message, or the 30-minute
+native protection timeout; the timeout does not terminate children.
 
 ## Default routes
 
@@ -64,8 +93,8 @@ Any incomplete, blocked, or deviating result forces a guarded next generation.
 
 ## Requirements
 
-- Codex CLI or Codex desktop with plugin hooks and native Agents. Version `0.144.6`
-  is the release-tested contract.
+- Codex CLI or Codex desktop with plugin hooks and native Agents. CLI `0.146.0` and
+  Desktop build `26.730.8199.0` are the release-tested contracts.
 - Python 3.11 or newer.
 - Git.
 - Windows or Linux. macOS is not currently tested.
@@ -94,6 +123,11 @@ python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . -
 
 Doctor must report both `HOOKS READY` and `STATIC ROUTE READY`. Start a new Codex task
 after installation or update so the new skill, profiles, and hooks are loaded.
+
+The two installed leaf profiles are intentionally model-neutral. Current Codex hosts
+accept the selected Luna/Terra model and effort as explicit native spawn values, so
+CCO does not install duplicate model-specific profiles. `STATIC ROUTE READY` validates
+the local capability catalogue; the real spawn response remains final evidence.
 
 CCO is implicit after that. For example, ask Codex normally:
 
@@ -184,8 +218,9 @@ bypassed owner is outside CCO lifecycle and evidence guarantees.
 - Worker result paths must exactly equal the real delta inside that node's scopes.
 - Large terminal graph artifacts are removed immediately. Small task tombstones stay
   outside the repository for late-result fencing. A later SessionStart removes
-  terminal residue after 24 hours and conservatively retains live/unknown abandoned
-  state for up to seven days because current Codex has no SessionEnd hook.
+  SessionEnd removes terminal task residue immediately. A later SessionStart remains
+  the fallback: terminal residue expires after 24 hours and live/unknown abandoned
+  state after up to seven days.
 - CCO sends no CCO telemetry and stores no token counts, billing records, Radar data,
   or long-term route history. A temporary prepared artifact necessarily contains the
   closed node contracts, scopes, route bindings, and workspace fingerprints; it does
@@ -211,7 +246,8 @@ bill-savings percentage without workload-matched measurements.
 
 ## Project status
 
-Version 1.0.0 is a production-oriented first stable protocol, not a hard security
+Version 1.1.0 keeps the stable `cco.v7` wire protocol while tightening dispatch,
+workspace leases, DAG scheduling, and Primary quiescence. It is not a hard security
 boundary or a replacement for Primary review. Issues and pull requests are welcome;
 see [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and
 [CHANGELOG.md](CHANGELOG.md).

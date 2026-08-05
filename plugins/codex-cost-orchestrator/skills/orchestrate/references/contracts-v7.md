@@ -13,13 +13,26 @@ new task and prepare a new graph; v6 and v7 owners never share a ledger.
   and all risk answers;
 - evidenced placement benefits and direct action/check counts;
 - contract, generation, typed repository scopes, dependency readiness,
-  responsibility, and optional downstream count;
+  responsibility, explicit dependencies, and completed graph nodes;
 - optional current user model/effort constraints.
 
-It derives assurance, acceptance mode, placement, static routes, fallback requests,
-one whole-graph baseline, and native spawn inputs. The normal CLI returns
-`cco.dispatch-batch.v1`; `--full` additionally exposes the diagnostic manifest and
-route plan. No caller supplies a selected route pair or graph hash.
+It derives assurance, acceptance mode, placement, the dependency-ready frontier,
+downstream priority, safe compatible microtask aggregation, static routes, fallback
+requests, one whole-graph baseline, and native spawn inputs. The normal CLI commits a
+`cco.dispatch-batch.v2` transaction and returns only short spawn references;
+`--full` exposes the diagnostic `cco.graph.v4` manifest, full capsules, and route
+plan without committing a transaction. No caller supplies a selected route pair or
+graph hash.
+
+## Dispatch transaction
+
+Each short reference binds one immutable full spawn input stored outside the
+repository. While a transaction has undispatched work, PreToolUse permits only its
+current exact references or one exact abort command. The hook expands a reference,
+verifies the prepared workspace and sibling leases, reserves the owner, and then lets
+Codex perform the native spawn. A successful sibling remains active if another node
+gets a confirmed pre-thread rejection; only that node may use its next precompiled
+fallback. Graph-level identity or workspace failure fences the remaining batch.
 
 ## Dispatch envelope
 
@@ -43,7 +56,9 @@ The capsule binds:
 - optional evidence/current state; continuation delta and previous capsule identity.
 
 The native spawn arguments must exactly match capsule task name, physical read/write
-profile, fork, model, and effort. The writable profile is valid only for worker;
+profile, fork, explicit model, and effort. Both physical profiles are model-neutral,
+so current host-supported Luna/Terra/user-pinned routes use the same two profiles.
+The writable profile is valid only for worker;
 explorer and reviewer use the read-only profile. Reviewer requires an epoch,
 independent acceptance, and `fork_turns=none`.
 
@@ -94,14 +109,16 @@ review claim until Primary confirms the exact state.
 
 ## Ledger and cleanup
 
-PreToolUse reserves one `node@contract_rev`; PostToolUse activates exactly one
-canonical native owner or releases a confirmed pre-thread rejection. Continuations
+PreToolUse claims one exact transaction reference and reserves one
+`node@contract_rev`; PostToolUse activates exactly one canonical native owner or
+releases a confirmed pre-thread rejection. Continuations
 reserve and settle one next cursor. Interrupt retires and fences before native
 interruption. Terminal results leave small owner tombstones so late results and raw
 follow-ups remain fenced across turns.
 
-When every owner of one graph is terminal, its large prepared artifact is deleted.
-Current Codex has no SessionEnd hook, so small tombstones are retained across turns.
-A later SessionStart removes terminal residue after 24 hours and live/unknown
-abandoned state after seven days. Incomplete, blocked, deviating, or retired Luna
+Full transaction bundles are deleted as their candidates settle. When every owner of
+one graph is terminal, its large prepared artifact is deleted.
+Small tombstones are retained across turns until SessionEnd observes a terminal
+ledger. A later SessionStart removes missed terminal residue after 24 hours and
+live/unknown abandoned state after seven days. Incomplete, blocked, deviating, or retired Luna
 results set the `node + role` guarded floor for a newer generation.

@@ -39,7 +39,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(manifest["version"], "1.1.0")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -86,11 +86,19 @@ class ProjectContractTests(unittest.TestCase):
             "read-only",
         )
 
-    def test_hooks_use_only_supported_v7_lifecycle_events(self) -> None:
+    def test_hooks_use_supported_v7_transaction_and_wait_events(self) -> None:
         hooks = json.loads(text(HOOKS))["hooks"]
         self.assertEqual(
             set(hooks),
-            {"SessionStart", "PreToolUse", "PostToolUse", "SubagentStop"},
+            {
+                "SessionStart",
+                "SessionEnd",
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+                "UserPromptSubmit",
+                "SubagentStop",
+            },
         )
         serialized = json.dumps(hooks)
         for required in (
@@ -101,15 +109,13 @@ class ProjectContractTests(unittest.TestCase):
             "cost_orchestrator_write_leaf",
         ):
             self.assertIn(required, serialized)
-        self.assertNotIn("SessionEnd", serialized)
-        self.assertNotIn('"Stop"', serialized)
         count = 0
         for event, groups in hooks.items():
             for group in groups:
                 for hook in group["hooks"]:
                     count += 1
                     self.assertLessEqual(hook["timeout"], 120 if event == "SubagentStop" else 5)
-        self.assertEqual(count, 6)
+        self.assertEqual(count, 8)
 
     def test_current_protocol_is_v7_and_runtime_route_is_static_and_network_free(self) -> None:
         packet = text(PLUGIN / "scripts" / "packet_compiler.py")
@@ -117,8 +123,8 @@ class ProjectContractTests(unittest.TestCase):
         graph = text(PLUGIN / "scripts" / "graph_compiler.py")
         self.assertIn('PROTOCOL = "cco.v7"', packet)
         self.assertIn('ROUTE_PLAN_PROTOCOL = "cco.route-plan.v5"', routing)
-        self.assertIn('GRAPH_PROTOCOL = "cco.graph.v3"', graph)
-        self.assertIn('DISPATCH_BATCH_PROTOCOL = "cco.dispatch-batch.v1"', graph)
+        self.assertIn('GRAPH_PROTOCOL = "cco.graph.v4"', graph)
+        self.assertIn('DISPATCH_BATCH_PROTOCOL = "cco.dispatch-batch.v2"', graph)
         for forbidden in (
             "urllib.request",
             "needs_refresh",
@@ -128,6 +134,17 @@ class ProjectContractTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, routing.casefold())
         self.assertIn("network-free", routing.casefold())
+
+    def test_fast_dispatch_is_one_transaction_and_one_quiescent_wait(self) -> None:
+        compiler = text(PLUGIN / "scripts" / "graph_compiler.py")
+        transaction = text(PLUGIN / "scripts" / "dispatch_transaction.py")
+        skill = text(SKILL)
+
+        self.assertIn("prepare_transaction_batch", compiler)
+        self.assertIn("CCO_DISPATCH_REF cco.dispatch-batch.v2", transaction)
+        self.assertIn("same model turn", skill)
+        self.assertIn("one long event wait", skill)
+        self.assertIn("do not read the repository again", skill.casefold())
 
     def test_no_accounting_encryption_or_second_runtime_is_shipped(self) -> None:
         lowered = current_runtime_text().casefold()

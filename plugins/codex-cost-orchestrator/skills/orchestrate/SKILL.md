@@ -98,6 +98,26 @@ use the smallest positive partial fork, never full history.
 After a confirmed pre-thread native rejection, use only the next returned fallback.
 Do not rescore, recapture the baseline, rebuild the contract, or contact a service.
 
+## Fast dispatch path
+
+Use already-available user, repository-policy, and task facts before acquiring more
+context. If they close the graph, do not read the repository again before preparing
+it. If one material fact is missing, dispatch one narrow explorer for that fact; do
+not make Primary perform an open-ended inspection first.
+
+For one ready graph, close once, compile once, dispatch every returned ready reference
+in the same model turn, then enter one long event wait. Do not insert route
+explanations, status checks, file reads, tests, edits, or baseline recaptures between
+the compiler result and those spawn calls. The transaction gate makes this sequence
+fail closed. A confirmed pre-thread rejection may consume only its already-prepared
+fallback in that same dispatch turn.
+
+Use graph-level `defaults` for facts shared by nodes. Describe each node only by its
+contract, typed scopes, responsibility, dependencies, and genuine differences. Do
+not construct separate graphs merely to use different models; routing is a compiler
+output. Do not repeat capability lookup, closure derivation, or route selection per
+node.
+
 ## Dispatch and wait
 
 CCO adds no concurrency ceiling. Fill observed native capacity only with nodes whose
@@ -106,9 +126,9 @@ splits. A CCO leaf never delegates; Primary owns the complete graph.
 
 After dispatch, Primary may continue only a node already proven unsuitable for a
 child when it cannot overlap, conflict with, or depend on active leaf work. Otherwise
-wait event-first. Do not poll status, emit progress-only model turns, or duplicate a
-leaf. Wake for completion, blocking input, user input, or a long native protection
-timeout.
+enter one long event wait. Do not poll status, emit progress-only model turns, or
+duplicate a leaf. Wake only for completion, blocking input, user input, or the long
+native protection timeout.
 
 ## Lifecycle and recovery
 
@@ -123,9 +143,9 @@ Treat every result as a claim. `CCO_RESULT cco.v7` must cover acceptance IDs, de
 exact changed paths, and match the current workspace delta inside that node's scopes.
 Only a complete reviewer may return `accept`; explorer and worker never claim Primary
 acceptance. Large terminal graph artifacts are deleted immediately. Small owner
-tombstones remain across turns for fencing. A later SessionStart removes terminal
-residue after 24 hours and live/unknown abandoned state after seven days because
-current Codex has no SessionEnd hook.
+tombstones remain across turns for fencing. SessionEnd removes terminal task residue;
+a later SessionStart removes missed terminal residue after 24 hours and live/unknown
+abandoned state after seven days.
 
 Normalize each failure into one stable failure signature. Retry only when new evidence
 changes the intervention. A confirmed pre-thread rejection uses a precompiled route

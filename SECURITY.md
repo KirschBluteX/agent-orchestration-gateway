@@ -41,8 +41,9 @@ reparse-ancestor paths are rejected.
 
 Large graph artifacts are deleted once all of that graph's owners are terminal. Small
 owner tombstones remain across turns to fence late results and raw continuations.
-Because current Codex has no SessionEnd hook, a later SessionStart removes terminal
-residue after 24 hours and live/unknown abandoned state only after seven days.
+SessionEnd removes residue only when the session ledger is already terminal. A later
+SessionStart remains the fallback: it removes terminal residue after 24 hours and
+live/unknown abandoned state only after seven days.
 
 ## Hook behavior
 

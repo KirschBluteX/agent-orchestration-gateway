@@ -33,6 +33,16 @@ from prepared_graph import (  # noqa: E402
     dispatch_workspace_claim,
     verify_artifact_workspace,
 )
+from dispatch_transaction import (  # noqa: E402
+    DispatchTransactionError,
+    fence_spawn_call,
+    retire_owner as retire_transaction_owner,
+    settle_spawn_rejection,
+    settle_spawn_success,
+    spawn_claim_for_call,
+    stop_outcome as transaction_stop_outcome,
+    user_prompt_context as transaction_user_prompt_context,
+)
 from protocol_hash import canonical_bytes, repository_scopes_overlap  # noqa: E402
 from task_ledger import LedgerConflict, TaskLedger  # noqa: E402
 from workspace_state import StateError, repository_root  # noqa: E402
@@ -191,6 +201,59 @@ def _native_rejection(value: Any) -> bool:
 
 
 def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
+    # A v2 reference was expanded during PreToolUse.  PostToolUse may expose the
+    # original ref or the updated v7 input, so the exact call id is authoritative.
+    transaction_claim = None
+    if isinstance(payload.get("session_id"), str):
+        try:
+            transaction_claim = spawn_claim_for_call(payload)
+        except DispatchTransactionError as error:
+            return {"decision": "block", "reason": f"CCO transaction state is invalid: {error}"}
+    if transaction_claim is not None:
+        ledger = ledger_for(payload)
+        call_id = payload.get("tool_use_id")
+        if ledger is None or not ledger.path.exists() or not isinstance(call_id, str):
+            try:
+                fence_spawn_call(payload)
+            except DispatchTransactionError:
+                pass
+            return {"decision": "block", "reason": "CCO transaction spawn lost its reservation"}
+        if transaction_claim["state"] != "dispatching":
+            try:
+                ledger.release(call_id)
+            except LedgerConflict:
+                pass
+            return {"decision": "block", "reason": "CCO transaction spawn was fenced before native activation"}
+        paths = _task_paths(payload.get("tool_response"))
+        expected_owner = transaction_claim["owner"]
+        if len(paths) == 1 and next(iter(paths)) == expected_owner:
+            try:
+                ledger.activate(call_id, expected_owner)
+                settle_spawn_success(payload, expected_owner)
+                return {}
+            except (LedgerConflict, DispatchTransactionError) as error:
+                try:
+                    fence_spawn_call(payload)
+                except DispatchTransactionError:
+                    pass
+                return {"decision": "block", "reason": f"CCO transaction activation failed: {error}"}
+        if not paths and _native_rejection(payload.get("tool_response")):
+            try:
+                ledger.release(call_id)
+                settle_spawn_rejection(payload)
+                return {}
+            except (LedgerConflict, DispatchTransactionError) as error:
+                try:
+                    fence_spawn_call(payload)
+                except DispatchTransactionError:
+                    pass
+                return {"decision": "block", "reason": f"CCO transaction rejection could not settle: {error}"}
+        try:
+            ledger.release(call_id)
+            fence_spawn_call(payload)
+        except (LedgerConflict, DispatchTransactionError):
+            pass
+        return {"decision": "block", "reason": "CCO transaction spawn did not expose its exact native owner"}
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, Mapping) or not isinstance(tool_input.get("message"), str) or not tool_input["message"].startswith(V7_HEADER):
         return {}
@@ -278,7 +341,44 @@ def preflight_interrupt(payload: Mapping[str, Any]) -> None:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, Mapping) or not isinstance(tool_input.get("target"), str) or TASK_PATH.fullmatch(tool_input["target"]) is None:
         raise LedgerConflict("interrupt target is not canonical")
-    ledger.retire_if_present(tool_input["target"])
+    retired = ledger.retire_if_present(tool_input["target"])
+    if retired:
+        retire_transaction_owner(payload, tool_input["target"], fenced=True)
+
+
+def _cleanup_terminal_graph_artifact(
+    ledger: TaskLedger,
+    payload: Mapping[str, Any],
+    row: Mapping[str, Any],
+) -> None:
+    if not row.get("baseline_path"):
+        return
+    graph_identity = str(row["graph_sha256"])
+    graph_rows = [
+        candidate
+        for candidate in ledger.read_rows()
+        if candidate.get("graph_sha256") == graph_identity
+    ]
+    if graph_rows and all(candidate.get("state") == "retired" for candidate in graph_rows):
+        cleanup_graph_artifact(
+            ledger.root,
+            str(payload["session_id"]),
+            graph_identity,
+        )
+
+
+def retire_invalid_subagent_stop(payload: Mapping[str, Any]) -> None:
+    """Fence a final invalid result without issuing another stop block."""
+
+    ledger = ledger_for(payload)
+    if ledger is None or not ledger.path.exists():
+        raise LedgerConflict("v7 result has no live dispatch ledger")
+    owner = payload.get("agent_id")
+    if not isinstance(owner, str) or TASK_PATH.fullmatch(owner) is None:
+        raise LedgerConflict("result has no canonical owner")
+    row = ledger.retire_after_invalid_stop(owner)
+    retire_transaction_owner(payload, owner, fenced=True)
+    _cleanup_terminal_graph_artifact(ledger, payload, row)
 
 
 def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any] | None = None) -> None:
@@ -352,19 +452,10 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
         cursor=int(row["cursor"]),
         require_guarded=require_guarded,
     )
-    if disposition == "retired" and row.get("baseline_path"):
-        graph_identity = str(row["graph_sha256"])
-        graph_rows = [
-            candidate
-            for candidate in ledger.read_rows()
-            if candidate.get("graph_sha256") == graph_identity
-        ]
-        if graph_rows and all(candidate.get("state") == "retired" for candidate in graph_rows):
-            cleanup_graph_artifact(
-                ledger.root,
-                str(payload["session_id"]),
-                graph_identity,
-            )
+    if disposition == "retired":
+        retire_transaction_owner(payload, owner)
+    if disposition == "retired":
+        _cleanup_terminal_graph_artifact(ledger, payload, row)
 
 
 def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -411,13 +502,20 @@ def cleanup_task(payload: Mapping[str, Any]) -> None:
     )
 
 
-def evaluate(payload: object) -> dict[str, str]:
+def evaluate(payload: object) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         return {}
     event = payload.get("hook_event_name")
     tool_name = payload.get("tool_name")
     if event == "SessionStart":
         return start_task(payload)
+    if event == "SessionEnd":
+        cleanup_task(payload)
+        return {}
+    if event == "Stop":
+        return transaction_stop_outcome(payload)
+    if event == "UserPromptSubmit":
+        return transaction_user_prompt_context(payload)
     if event == "PostToolUse":
         if tool_name in {"spawn_agent", "Agent"}:
             return postflight_spawn(payload)

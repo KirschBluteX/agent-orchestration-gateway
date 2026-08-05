@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -112,8 +113,7 @@ def node(
         "role": role,
         "scopes": [{"kind": "exact", "path": path}],
         "selection": {
-            "dependencies_ready": True,
-            "downstream_count": 1,
+            "depends_on": [],
             "responsibility": name,
         },
     }
@@ -123,6 +123,161 @@ def node(
 
 
 class V7LifecycleTests(unittest.TestCase):
+    def test_session_end_removes_terminal_session_artifacts_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            ledger_root = root / "ledger"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            artifact = workspace / ("ended-task-" + "a" * 64 + ".json")
+            artifact.write_text("{}", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CCO_LEDGER_DIR": str(ledger_root)}):
+                self.assertEqual(
+                    ledger_runtime.evaluate(
+                        {
+                            "cwd": str(repo),
+                            "hook_event_name": "SessionEnd",
+                            "session_id": "ended-task",
+                        }
+                    ),
+                    {},
+                )
+
+            self.assertFalse(artifact.exists())
+
+    def test_corrected_second_subagent_stop_is_validated_and_retires_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("ready\n", encoding="utf-8")
+            env = {"CCO_LEDGER_DIR": str(root / "ledger"), "CODEX_THREAD_ID": "v7-stop-corrected"}
+            with mock.patch.dict(os.environ, env):
+                dispatch = prepare_dispatch_graph(
+                    [node("n01_worker", "owned.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )["dispatches"][0]
+                capsule = parse_message(dispatch["message"])
+                owner = "/root/" + dispatch["task_name"]
+                preflight = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "v7-stop-corrected",
+                    "tool_input": dispatch,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-stop-corrected",
+                }
+                self.assertEqual(agent_preflight.evaluate(preflight), {})
+                ledger_runtime.evaluate(
+                    {**preflight, "hook_event_name": "PostToolUse", "tool_response": {"task_path": owner}}
+                )
+
+                first_stop = {
+                    "agent_id": owner,
+                    "agent_type": dispatch["agent_type"],
+                    "cwd": str(repo),
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "not a CCO result",
+                    "session_id": "v7-stop-corrected",
+                    "stop_hook_active": False,
+                }
+                first_outcome = subagent_stop.evaluate(first_stop)
+                self.assertEqual(first_outcome["decision"], "block")
+                self.assertEqual(ledger_runtime.ledger_for(first_stop).read_rows()[0]["state"], "owned")
+
+                (repo / "owned.txt").write_text("corrected\n", encoding="utf-8")
+                corrected = compile_result(
+                    capsule,
+                    status="complete",
+                    disposition="retire",
+                    blockers=[],
+                    changed_paths=["owned.txt"],
+                    deviations=[],
+                    evidence={"A01": "corrected second stop has the exact owned-file delta"},
+                    failure_signature=None,
+                    summary="corrected result",
+                )
+                self.assertEqual(
+                    subagent_stop.evaluate(
+                        {**first_stop, "last_assistant_message": corrected, "stop_hook_active": True}
+                    ),
+                    {},
+                )
+                self.assertEqual(ledger_runtime.ledger_for(first_stop).read_rows()[0]["state"], "retired")
+
+    def test_still_invalid_second_subagent_stop_retires_fences_and_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("ready\n", encoding="utf-8")
+            env = {"CCO_LEDGER_DIR": str(root / "ledger"), "CODEX_THREAD_ID": "v7-stop-invalid"}
+            with mock.patch.dict(os.environ, env):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_worker", "owned.txt", decision_space="bounded_effect")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                dispatch = prepared["dispatches"][0]
+                artifact = Path(prepared["baseline_path"])
+                owner = "/root/" + dispatch["task_name"]
+                preflight = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "v7-stop-invalid",
+                    "tool_input": dispatch,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-stop-invalid",
+                }
+                self.assertEqual(agent_preflight.evaluate(preflight), {})
+                ledger_runtime.evaluate(
+                    {**preflight, "hook_event_name": "PostToolUse", "tool_response": {"task_path": owner}}
+                )
+
+                invalid_stop = {
+                    "agent_id": owner,
+                    "agent_type": dispatch["agent_type"],
+                    "cwd": str(repo),
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "still not a CCO result",
+                    "session_id": "v7-stop-invalid",
+                    "stop_hook_active": False,
+                }
+                self.assertEqual(subagent_stop.evaluate(invalid_stop)["decision"], "block")
+                self.assertTrue(artifact.exists())
+
+                warning = subagent_stop.evaluate({**invalid_stop, "stop_hook_active": True})
+                self.assertNotIn("decision", warning)
+                self.assertIn("WARNING", warning["systemMessage"])
+                self.assertFalse(artifact.exists())
+
+                ledger = ledger_runtime.ledger_for(invalid_stop)
+                self.assertEqual(ledger.read_rows()[0]["state"], "retired")
+                document = json.loads(ledger.path.read_text(encoding="utf-8"))
+                self.assertIn(owner, document["fenced_owners"])
+                self.assertIn({"node": "n01_worker", "role": "worker"}, document["guarded_floors"])
+
+                unguarded = prepare_dispatch_graph(
+                    [node("n01_worker", "owned.txt", decision_space="bounded_effect", generation=2)],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )["dispatches"][0]
+                blocked = agent_preflight.evaluate(
+                    {**preflight, "tool_input": unguarded, "tool_use_id": "spawn-stop-invalid-retry"}
+                )
+                self.assertEqual(blocked["decision"], "block")
+                self.assertIn("guarded assurance", blocked["reason"])
+
     def test_light_graph_tracks_ignored_files_inside_typed_scopes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -564,7 +719,7 @@ class V7LifecycleTests(unittest.TestCase):
                 }
                 forged_outcome = agent_preflight.evaluate(forged_preflight)
                 self.assertEqual(forged_outcome["decision"], "block")
-                self.assertIn("immutable", forged_outcome["reason"])
+                self.assertIn("task_name does not match", forged_outcome["reason"])
                 forged_epoch = parse_message(continuation["message"])
                 forged_epoch["epoch"] = "e02"
                 forged_epoch_outcome = agent_preflight.evaluate(
@@ -575,7 +730,7 @@ class V7LifecycleTests(unittest.TestCase):
                     }
                 )
                 self.assertEqual(forged_epoch_outcome["decision"], "block")
-                self.assertIn("immutable", forged_epoch_outcome["reason"])
+                self.assertIn("task_name does not match", forged_epoch_outcome["reason"])
                 continue_preflight = {
                     "cwd": str(repo),
                     "hook_event_name": "PreToolUse",

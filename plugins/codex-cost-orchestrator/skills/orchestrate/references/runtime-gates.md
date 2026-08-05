@@ -22,6 +22,8 @@ never writes trust state and never uses `--dangerously-bypass-hook-trust`.
 
 Start a new Codex task after plugin/profile changes. SessionStart injects one compact
 mandatory-dispatch reminder. PreToolUse remains the mechanical enforcement point.
+The 1.1 release contract was exercised with Codex CLI 0.146.0; an updated desktop or
+CLI host is required when an older host rejects a model that its catalogue lists.
 
 ## Native capability and route health
 
@@ -29,6 +31,11 @@ Use capability metadata exposed by the active host when available. The PATH Code
 bundled catalogue is only a fallback. An entry is eligible only when it explicitly
 advertises native multi-Agent v1 or v2 plus the selected reasoning effort. The actual
 spawn response remains final evidence.
+
+The two physical leaf profiles intentionally do not pin a model or effort. CCO passes
+the selected model and effort explicitly on each native spawn, which preserves user
+pins and lets one read/write profile pair serve Luna, Terra, and supported explicit
+models. Do not add model-specific profile copies merely to route Luna.
 
 Routing is static and local. There is no Radar request, network dependency, route TTL,
 cache, pricing table, token meter, or billing history. A full current-user pin has one
@@ -46,9 +53,16 @@ dependency-ready nodes with distinct responsibilities and non-conflicting typed
 scopes. The deterministic selector prioritizes downstream graph progress, then uses
 available capacity and stable node ordering.
 
+Prepare the graph once. The normal compiler call commits one transaction and returns
+short spawn references. Issue all ready references in the same model turn without
+intervening tools, route prose, status checks, or baseline recapture. Shared node
+facts belong in graph `defaults`, and compatible Primary microtasks are aggregated
+before routing.
+
 After spawn, Primary performs only proven non-overlapping, dependency-independent
-work. Otherwise it waits for native events rather than polling or issuing progress-
-only model requests.
+work. Otherwise it enters one long native event wait rather than polling or issuing
+progress-only model requests. The protection timeout is 30 minutes and does not
+interrupt children. A user message or child completion wakes Primary normally.
 
 ## Workspace and lifecycle strength
 
@@ -67,9 +81,9 @@ against a late filesystem write. Primary still inspects actual state.
 
 Spawn/continuation hooks keep a five-second bound. SubagentStop gets 120 seconds for a
 legitimate workspace scan; there is no ten-minute reviewer hard timeout. Large graph
-artifacts are deleted as soon as all graph owners are terminal. Current Codex does not
-expose SessionEnd, so tiny tombstones remain across turns. A later SessionStart
-removes terminal residue after 24 hours and live/unknown abandoned state after seven
+artifacts are deleted as soon as all graph owners are terminal. SessionEnd removes
+remaining task residue only when its ledger is terminal. A later SessionStart removes
+missed terminal residue after 24 hours and live/unknown abandoned state after seven
 days.
 
 The read profile requests OS read-only, but describe it as isolated only when observed
@@ -79,6 +93,8 @@ cannot be proven, stop rather than relying only on before/after comparison.
 ## Recovery table
 
 - Missing/mismatched profile or untrusted hook: stop delegation and run doctor.
+- Pending batch after an interrupted dispatch turn: use its exact references once;
+  a second abandoned recovery fences only the remaining undispatched nodes.
 - Confirmed pre-thread native rejection: take the next precompiled fallback.
 - Same owner, same contract, new evidence: one cursor continuation.
 - Completed, fenced, materially changed, or cold work: newer full generation.

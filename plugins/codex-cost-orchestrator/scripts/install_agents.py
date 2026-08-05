@@ -38,12 +38,15 @@ PROFILE_AGENT_NAMES = {
     "write": "cost_orchestrator_write_leaf",
 }
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 REQUIRED_HOOK_EVENTS = Counter(
     {
         "sessionStart": 1,
-        "preToolUse": 3,
+        "sessionEnd": 1,
+        "preToolUse": 2,
         "postToolUse": 1,
+        "stop": 1,
+        "userPromptSubmit": 1,
         "subagentStop": 1,
     }
 )
@@ -173,6 +176,52 @@ def fail(message: str) -> None:
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def runtime_critical_plugin_paths(plugin_root: Path) -> tuple[Path, ...]:
+    paths = {Path("hooks") / "hooks.json"}
+    for directory in ("hooks", "scripts"):
+        root = plugin_root / directory
+        if root.is_dir():
+            paths.update(path.relative_to(plugin_root) for path in root.rglob("*.py"))
+    return tuple(sorted(paths, key=lambda path: path.as_posix()))
+
+
+def runtime_files_match(plugin_root: Path, discovered_root: Path) -> bool:
+    for relative_path in runtime_critical_plugin_paths(plugin_root):
+        expected = plugin_root / relative_path
+        discovered = discovered_root / relative_path
+        if not is_real_file(expected) or not is_real_file(discovered):
+            return False
+        if file_sha256(expected) != file_sha256(discovered):
+            return False
+    return True
+
+
+def plugin_identity_matches(plugin_root: Path, discovered_root: Path) -> bool:
+    manifest_relative_path = Path(".codex-plugin") / "plugin.json"
+    expected_manifest_path = plugin_root / manifest_relative_path
+    discovered_manifest_path = discovered_root / manifest_relative_path
+    if not is_real_file(expected_manifest_path) or not is_real_file(discovered_manifest_path):
+        return False
+    expected_manifest = json.loads(expected_manifest_path.read_text(encoding="utf-8"))
+    discovered_manifest = json.loads(discovered_manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(expected_manifest, dict) or not isinstance(discovered_manifest, dict):
+        return False
+    expected_name = PLUGIN_ID.partition("@")[0]
+    if expected_manifest.get("name") != expected_name:
+        return False
+    if discovered_manifest.get("name") != expected_name:
+        return False
+    if "version" not in discovered_manifest:
+        return True
+    discovered_version = discovered_manifest["version"]
+    if not isinstance(discovered_version, str):
+        return False
+    if not discovered_version.strip():
+        return True
+    expected_version = expected_manifest.get("version", PLUGIN_VERSION)
+    return isinstance(expected_version, str) and discovered_version == expected_version
 
 
 def stage_bytes(target: Path, contents: bytes, prefix: str) -> Path:
@@ -766,7 +815,15 @@ def doctor(
         try:
             hook_document = json.loads(hooks_path.read_text(encoding="utf-8"))
             events = set(hook_document.get("hooks", {}))
-            required_events = {"SessionStart", "PreToolUse", "PostToolUse", "SubagentStop"}
+            required_events = {
+                "SessionStart",
+                "SessionEnd",
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+                "UserPromptSubmit",
+                "SubagentStop",
+            }
             if not required_events <= events:
                 errors.append("hook lifecycle configuration is incomplete")
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -798,14 +855,34 @@ def doctor(
         )
         if any(counts[event] < count for event, count in REQUIRED_HOOK_EVENTS.items()):
             errors.append("CCO hooks are not fully discovered by this Codex installation")
-        plugin_root = Path(__file__).resolve().parent.parent
+        if any(hook.get("source") != "plugin" for hook in plugin_hooks):
+            errors.append("Codex discovered CCO hooks from a non-plugin source")
+        discovered_sources: set[str] = set()
+        for hook in plugin_hooks:
+            source_path = hook.get("sourcePath")
+            if not isinstance(source_path, str):
+                continue
+            try:
+                discovered_sources.add(os.path.normcase(str(Path(source_path).resolve())))
+            except (OSError, RuntimeError):
+                continue
+        if len(discovered_sources) > 1:
+            errors.append("Codex discovered CCO hooks from inconsistent plugin sources")
         for hook in plugin_hooks:
             source_path = hook.get("sourcePath")
             source_matches = False
             if isinstance(source_path, str):
                 try:
-                    source_matches = Path(source_path).resolve() == (plugin_root / "hooks" / "hooks.json").resolve()
-                except OSError:
+                    source = Path(source_path)
+                    source_matches = (
+                        source.is_absolute()
+                        and source.name == "hooks.json"
+                        and source.parent.name == "hooks"
+                        and is_real_file(source)
+                        and plugin_identity_matches(plugin_root, source.parent.parent)
+                        and runtime_files_match(plugin_root, source.parent.parent)
+                    )
+                except (OSError, RuntimeError, UnicodeError, json.JSONDecodeError):
                     source_matches = False
             if not source_matches:
                 errors.append("Codex discovered CCO hooks from a different plugin version")
@@ -822,7 +899,7 @@ def doctor(
             )
         if discovery_errors:
             errors.append("Codex reported hook discovery errors")
-        if not unready and plugin_hooks and not discovery_errors:
+        if not errors and not unready and plugin_hooks and not discovery_errors:
             print(f"HOOKS READY: {len(plugin_hooks)} current CCO hooks are enabled and trusted.")
     except (OSError, ValueError) as error:
         errors.append(f"CCO hook trust could not be verified: {error}")
