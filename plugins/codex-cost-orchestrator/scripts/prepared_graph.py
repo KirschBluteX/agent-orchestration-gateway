@@ -616,6 +616,7 @@ def dispatch_workspace_claim(*, ledger_root: Path, session_id: str, capsule: Map
         "baseline_path": str(path),
         "graph_scopes": graph_scopes(manifest),
         "graph_sha256": identity,
+        "repo": str(root),
         "route_constraints": dict(route_match[0]["constraints"]),
         "scopes": [dict(scope) for scope in node["scopes"]],
         "workspace_backend": workspace_backend,

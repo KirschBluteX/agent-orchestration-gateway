@@ -23,7 +23,7 @@
             "type": "command",
             "command": "python3 -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
             "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
-            "timeout": 5,
+            "timeout": 30,
             "async": false,
             "statusMessage": "Checking CCO transaction gate"
           }

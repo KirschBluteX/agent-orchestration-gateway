@@ -186,6 +186,47 @@ class V7LifecycleTests(unittest.TestCase):
             self.assertTrue(live_ledger.exists())
             self.assertTrue(live_artifact.exists())
 
+    def test_prior_terminal_ledger_keeps_graph_artifact_while_a_sibling_is_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "pending.txt").write_text("baseline\n", encoding="utf-8")
+            session_id = "prior-session"
+            ledger_root = root / "ledger"
+            with mock.patch.dict(
+                os.environ,
+                {"CCO_LEDGER_DIR": str(ledger_root), "CODEX_THREAD_ID": session_id},
+            ):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_pending", "pending.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                batch = dispatch_transaction.prepare_dispatch_batch(
+                    compact_dispatch_batch(prepared),
+                    ledger_root=ledger_root,
+                    repo=repo,
+                    session_id=session_id,
+                )
+            terminal_ledger = ledger_root / f"{session_id}.json"
+            terminal_ledger.write_text(
+                '{"fenced_owners":[],"guarded_floors":[],"rows":{}}',
+                encoding="utf-8",
+            )
+            artifact = Path(str(batch["baseline_path"]))
+
+            removed = ledger_runtime.cleanup_terminal_prior_sessions(
+                ledger_root,
+                keep_session_id="new-session",
+            )
+
+            self.assertEqual(removed, [])
+            self.assertTrue(terminal_ledger.exists())
+            self.assertTrue(artifact.exists())
+
     def test_invalid_subagent_stop_retires_once_without_a_second_model_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

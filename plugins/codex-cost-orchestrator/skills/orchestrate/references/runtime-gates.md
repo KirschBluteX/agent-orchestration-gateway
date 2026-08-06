@@ -80,11 +80,14 @@ An ordinary tool in a task with no marker exits before importing the ledger, wor
 packet, or transaction runtimes. Managed spawn/continuation tools and tasks with a
 state marker still take the complete fail-closed path.
 
-The native event stream owns completion state. Protected or unreadable collaboration
-content is progress, not a failure and not a continuation contract. Keep its owner
-active, never paste the opaque value into a message tool, and wait for an authoritative
-terminal, blocking-input, user, or protection-timeout event. A timeout alone does not
-retire or fence the owner.
+The native event stream owns normal completion state. Protected or unreadable
+collaboration content is progress, not a failure and not a continuation contract.
+This includes current `reasoning` objects carrying `encrypted_content`. Keep its owner
+active, never paste the opaque value into a message tool, and wait for
+an authoritative terminal, blocking-input, user, or protection-timeout event. A
+timeout alone does not retire or fence the owner. A Codex Desktop restart is the
+explicit host interruption boundary; its next `SessionStart` retires and fences
+active or dispatching children as `host_restart`.
 
 ## Workspace and lifecycle strength
 
@@ -98,7 +101,9 @@ bounds.
 For an exact non-Git root, CCO never initializes Git. Explorer and reviewer capture
 only declared scopes and must leave them unchanged. Worker capture covers the complete
 root so scope-external writes remain visible. A path/type/size preflight defaults to
-20,000 files and 1 GiB and happens before content hashing. Over-budget roots return to
+20,000 files and 1 GiB and happens before content hashing. The workspace-scanning
+PreToolUse hook has a 30-second bound; its ordinary no-transaction path still exits
+before loading the workspace runtime. Over-budget roots return to
 Primary; no directory such as `node_modules` is silently ignored. Reparse points,
 special files, path aliases, root replacement, and capture-time changes fail closed.
 If a ready batch contains a worker, its shared directory snapshot covers the full
@@ -124,15 +129,19 @@ against a late filesystem write. Primary still inspects actual state.
 Transactions retain the canonical repository captured at prepare time. Lifecycle
 discovery, exact spawn-reference expansion, and Stop protection use that identity;
 they do not assume the desktop task's host working directory is itself a Git
-repository. With no session transaction, a global hook outside Git is a no-op.
+repository. SubagentStop workspace verification uses the same bound repository rather
+than the event `cwd`. With no session transaction, a global hook outside Git is a no-op.
 
-Spawn/continuation hooks keep a five-second bound and SubagentStop gets 120 seconds
-for a legitimate workspace scan; there is no ten-minute reviewer hard timeout. Large
-graph artifacts are deleted only when the graph transaction has no pending,
-dispatching, or active nodes. The next
-SessionStart immediately removes validated terminal state from prior sessions. Live,
-unknown, locked, or malformed abandoned state remains subject to bounded stale
-cleanup of up to seven days. CCO does not register the optional SessionEnd event
+The workspace-scanning PreToolUse hook has a 30-second bound; other lightweight
+lifecycle hooks keep five seconds, and SubagentStop gets 120 seconds for legitimate
+result-time verification. There is no ten-minute reviewer hard timeout. Large graph
+artifacts are deleted only when the graph transaction has no pending, dispatching, or
+active nodes. Cross-session cleanup checks that transaction before removing a terminal
+TaskLedger, and capacity pruning never removes a fenced transaction with an active
+sibling. The next SessionStart retires and fences active or
+dispatching children from a restarted Desktop session as `host_restart`, then
+removes validated terminal state from prior sessions. Unknown, locked, or malformed
+abandoned state remains subject to bounded stale cleanup of up to seven days. CCO does not register the optional SessionEnd event
 because the current desktop hook browser cannot render its untrusted definition for
 review.
 
@@ -151,6 +160,8 @@ cannot be proven, stop rather than relying only on before/after comparison.
 ## Recovery table
 
 - Missing/mismatched profile or untrusted hook: stop delegation and run doctor.
+- Codex Desktop restart: retire/fence active or dispatching children as
+  `host_restart`, retain tombstones, and inspect the workspace before a newer generation.
 - Pending batch after an interrupted dispatch turn: use its exact references once;
   a second abandoned recovery fences only the remaining undispatched nodes.
 - Confirmed pre-thread native rejection: take the next precompiled fallback.

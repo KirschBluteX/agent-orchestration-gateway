@@ -1,6 +1,6 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "1.2.0+codex.20260805154513",
+  "version": "1.2.1+codex.20260806005437",
   "description": "Implicit role-aware Codex orchestration with network-free static routing, native Agent enforcement, compact cco.v7 lifecycle, and exact-state acceptance evidence.",
   "author": {
     "name": "KirschQAQ",

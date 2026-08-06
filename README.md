@@ -29,6 +29,8 @@ helps with larger tasks that have independent pieces.
   is routed locally, without a separate model request for every child.
 - **Quiet execution.** After dispatch, the Primary waits for a meaningful event instead
   of repeatedly asking for progress. Only native terminal events establish completion.
+- **Restart-safe recovery.** A Codex Desktop restart treats active children as
+  interrupted, fences late results, and prevents stale work from blocking the next task.
 - **Local by default.** Routing uses a static local policy. CCO does not require an
   online routing service or collect billing and telemetry history.
 
@@ -159,6 +161,9 @@ A trusted project may add `.codex/cco.toml` with the same route tables. See
   replacement fail closed.
 - Temporary state contains contracts, routes, metadata, and hashes—not source copies,
   full conversations, credentials, billing history, or telemetry.
+- When Codex Desktop restarts, active or dispatching children are retired as
+  `host_restart` interruptions rather than reported as successful completions; their
+  tombstones remain to reject late results.
 - CCO is a workflow guard, not an operating-system sandbox or a defense against a
   malicious local process. See [Security](SECURITY.md) for the trust model.
 

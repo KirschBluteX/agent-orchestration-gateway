@@ -73,11 +73,15 @@ the final capability evidence.
 4. Call `wait_agent` once and enter one long event wait. Do not poll or send progress-only requests. Child
    completion, blocking input, or a user message wakes Primary.
 
-Only a native terminal event proves completion, failure, or interruption. An opaque
-or unreadable progress payload and an unchanged workspace prove nothing about Agent
-state. Do not copy protected payloads into `send_message` or `followup_task`; keep the
-owner active and wait. The 30-minute protection timeout is a recovery wakeup, not a
-forced Agent interruption or implicit completion.
+Only a native terminal event proves normal completion, failure, or interruption. A
+Codex Desktop restart is the explicit host interruption boundary: the next
+`SessionStart` retires and fences the previous session's active or dispatching
+children with `host_restart`. An opaque or unreadable progress payload and an
+unchanged workspace prove nothing about Agent state. Do not copy protected payloads
+including `reasoning` objects with `encrypted_content` into `send_message` or
+`followup_task`; keep the owner active and wait. The 30-minute
+protection timeout is a recovery wakeup, not a forced Agent interruption or implicit
+completion.
 
 A confirmed pre-thread rejection advances only that node to its precompiled fallback.
 Active siblings continue. Graph identity, workspace, or transaction corruption is a
@@ -87,8 +91,8 @@ graph-level failure and fences the undispatched remainder.
 
 | Event | Purpose |
 | --- | --- |
-| SessionStart | Inject one compact mandatory CCO reminder; remove terminal prior sessions and prune stale state |
-| PreToolUse all tools | Exit cheaply when no transaction marker exists; otherwise gate pending work and expand one exact short spawn reference |
+| SessionStart | Treat Desktop restart as `host_restart` interruption for active/dispatching children; inject the reminder, remove terminal prior sessions, and prune stale state |
+| PreToolUse all tools | Exit cheaply when no transaction marker exists; otherwise use a 30-second bound to gate pending work, verify a bounded workspace, and expand one exact short spawn reference |
 | PreToolUse continuation | Require exact next cursor and reject opaque protected payload forwarding |
 | PreToolUse interrupt | Retire/fence before native interruption |
 | PostToolUse | Activate one owner, settle continuation, or release rejected spawn |
@@ -96,16 +100,24 @@ graph-level failure and fences the undispatched remainder.
 | UserPromptSubmit | Restore compact active/pending transaction context after user input |
 | SubagentStop | Map native UUID to owner; validate result, evidence, role, scope, and exact delta; retire once without a formatting-only second response |
 
-Large terminal artifacts and settled dispatch bundles delete immediately. The next
-SessionStart removes validated terminal ledgers and their workspace artifacts from
-prior sessions. Live, unknown, locked, or malformed abandoned artifacts and ledgers
-remain subject to bounded stale cleanup of up to seven days. This keeps fencing across
-multiple turns without adding an optional SessionEnd hook that the current desktop
-browser cannot expose for trust review.
+Large terminal artifacts and settled dispatch bundles delete immediately. On a Codex
+Desktop restart, `SessionStart` retires active/dispatching children as
+`host_restart`, records a guarded floor, and keeps owner tombstones so late results
+remain fenced. It then removes validated terminal ledgers and their workspace
+artifacts from prior sessions. Unknown, locked, or malformed state remains subject
+to bounded stale cleanup of up to seven days. This keeps fencing across multiple
+turns without adding an optional SessionEnd hook that the current desktop browser
+cannot expose for trust review.
+
+Cross-session cleanup checks the matching dispatch-transaction file before deleting
+a terminal TaskLedger or its graph artifact. A pending, dispatching, or active sibling
+keeps that artifact available. Capacity pruning likewise excludes any fenced
+transaction that still contains an active node.
 
 The state root defaults to the OS temporary directory under
 `codex-cost-orchestrator`. `CCO_LEDGER_DIR` may choose another external absolute
-location. Do not delete state belonging to an active task.
+location. Do not manually delete state belonging to an active task; a Desktop
+restart performs the safe `host_restart` retirement at `SessionStart`.
 
 ## Non-Git directory workspaces
 
@@ -116,7 +128,8 @@ prepared-workspace adapter uses directory mode:
   change;
 - worker snapshots cover the complete root, while only its declared scope may change;
 - path/type/size preflight is limited to 20,000 files and 1 GiB by default and runs
-  before any file content is read;
+  before any file content is read; the workspace-scanning PreToolUse hook allows 30
+  seconds while its ordinary no-transaction path remains a lightweight fast exit;
 - symlinks, junctions/reparse points, special files, case-insensitive aliases, root
   replacement, and capture-time changes fail closed;
 - snapshots contain paths, types, sizes, bounded metadata, and SHA-256 values, never
@@ -150,6 +163,8 @@ derived fields must match the ledger or preparation fails closed.
 ## Failure behavior
 
 - Profile missing/shadowed/modified or hook untrusted: no delegation; run doctor.
+- Codex Desktop restart: retire and fence active/dispatching children as
+  `host_restart`; inspect the actual workspace before starting a newer generation.
 - Node route unavailable: only that node returns to Primary.
 - Confirmed pre-thread rejection: use the next precompiled fallback only.
 - Interrupted pending dispatch: one exact recovery; a second abandonment fences only
@@ -157,6 +172,8 @@ derived fields must match the ledger or preparation fails closed.
 - Managed malformed capsule, wrong owner/cursor, or raw follow-up: block before delivery.
 - Invalid or stale SubagentStop result: retire and fence once, show Primary a concise
   status, and do not trigger another child response merely to repair formatting.
+- SubagentStop workspace verification uses the prepare-time repository bound in the
+  task claim; the event's `cwd` may be a repository parent and is not authoritative.
 - Result path/evidence/workspace mismatch: retire and fence; Primary inspects the
   actual state before replanning.
 - Incomplete, blocked, or deviation: record one failure signature and force a guarded

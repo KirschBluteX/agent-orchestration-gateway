@@ -184,9 +184,11 @@ Treat every result as a claim. `CCO_RESULT cco.v7` must cover acceptance IDs, de
 exact changed paths, and match the current workspace delta inside that node's scopes.
 Only a complete reviewer may return `accept`; explorer and worker never claim Primary
 acceptance. Large terminal graph artifacts are deleted immediately. Small owner
-tombstones remain across turns for fencing. The next SessionStart immediately removes
-validated terminal state from prior sessions; live, unknown, locked, or malformed
-abandoned state remains subject to bounded stale cleanup of up to seven days.
+tombstones remain across turns for fencing. The next SessionStart treats a Codex
+Desktop restart as a `host_restart` interruption: active or dispatching children are
+retired and fenced, their owner tombstones remain, and no stale wait is emitted. It
+then removes validated terminal state from prior sessions; unknown, locked, or
+malformed abandoned state remains subject to bounded stale cleanup of up to seven days.
 
 Leaf profiles receive the exact three-line result shape before execution. If a result
 still fails structural, identity, evidence, scope, or workspace validation, the hook

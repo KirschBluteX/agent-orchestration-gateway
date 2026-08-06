@@ -2,6 +2,27 @@
 
 The project follows semantic versioning.
 
+## 1.2.1 - 2026-08-06
+
+- Treat a Codex Desktop restart as an interruption boundary: active and
+  dispatching children are retired and fenced at the next `SessionStart` instead
+  of remaining in a stale wait state.
+- Record `host_restart` on interrupted TaskLedger rows, force a guarded floor for
+  the next generation, and keep late-result tombstones intact.
+- Add regression coverage for same-session restart recovery and update the
+  lifecycle and recovery documentation.
+- Reject current Codex `reasoning` payloads that carry top-level
+  `encrypted_content` before they can be copied into plain collaboration messages.
+- Preserve fenced transactions that still own an active sibling during capacity
+  pruning, so Stop protection and late-result fencing cannot disappear early.
+- Bind SubagentStop workspace verification to the prepare-time repository stored in
+  the workspace claim instead of the event's potentially parent-directory `cwd`.
+- Keep prior-session graph artifacts while any dispatch sibling remains pending,
+  dispatching, or active.
+- Raise the workspace-scanning PreToolUse hook bound from 5 to 30 seconds so the
+  documented 20,000-file non-Git budget is usable on supported Windows systems;
+  ordinary no-transaction tools still take the lightweight fast exit.
+
 ## 1.2.0 - 2026-08-05
 
 - Added a graph-level decision fast path: shared facts are closed once, self-contained

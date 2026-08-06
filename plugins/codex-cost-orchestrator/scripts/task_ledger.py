@@ -34,8 +34,9 @@ _NODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 _MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _EFFORT = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 _EPOCH = re.compile(r"^e[0-9]{2,}$")
+_RETIRE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
-_WORKSPACE_FIELDS = frozenset({"baseline", "baseline_path", "graph_scopes", "graph_sha256", "scopes", "workspace_backend", "workspace_mode"})
+_WORKSPACE_FIELDS = frozenset({"baseline", "baseline_path", "graph_scopes", "graph_sha256", "repo", "scopes", "workspace_backend", "workspace_mode"})
 _LOCK_WAIT_SECONDS = 0.25
 _STALE_LOCK_SECONDS = 60.0
 _MAX_REVIEW_SEED_BYTES = 64 * 1024
@@ -88,6 +89,11 @@ class TaskLedger:
         for row in document["rows"].values():
             if not isinstance(row, dict) or row.get("state") not in _STATES:
                 raise LedgerConflict("ledger row is malformed")
+            reason = row.get("retire_reason")
+            if reason is not None and (
+                not isinstance(reason, str) or _RETIRE_REASON.fullmatch(reason) is None
+            ):
+                raise LedgerConflict("ledger retirement reason is malformed")
         fenced = document.get("fenced_owners", [])
         if not isinstance(fenced, list) or any(not isinstance(owner, str) or _TASK_PATH.fullmatch(owner) is None for owner in fenced) or len(set(fenced)) != len(fenced):
             raise LedgerConflict("ledger owner fences are malformed")
@@ -206,7 +212,7 @@ class TaskLedger:
         if present:
             if present != _WORKSPACE_FIELDS:
                 raise ValueError("claim workspace identity is incomplete")
-            if not isinstance(identity["baseline"], str) or _SHA256.fullmatch(identity["baseline"]) is None or not isinstance(identity["graph_sha256"], str) or _SHA256.fullmatch(identity["graph_sha256"]) is None or not isinstance(identity["baseline_path"], str) or not Path(identity["baseline_path"]).is_absolute() or identity["workspace_backend"] not in {"git", "directory"} or identity["workspace_mode"] not in {"light", "strict"} or not isinstance(identity["scopes"], list) or not isinstance(identity["graph_scopes"], list):
+            if not isinstance(identity["baseline"], str) or _SHA256.fullmatch(identity["baseline"]) is None or not isinstance(identity["graph_sha256"], str) or _SHA256.fullmatch(identity["graph_sha256"]) is None or not isinstance(identity["baseline_path"], str) or not Path(identity["baseline_path"]).is_absolute() or not isinstance(identity["repo"], str) or not Path(identity["repo"]).is_absolute() or identity["workspace_backend"] not in {"git", "directory"} or identity["workspace_mode"] not in {"light", "strict"} or not isinstance(identity["scopes"], list) or not isinstance(identity["graph_scopes"], list):
                 raise ValueError("claim workspace identity is invalid")
             for scope_set in (identity["scopes"], identity["graph_scopes"]):
                 if scope_set != sorted(scope_set, key=lambda item: (item.get("kind", ""), item.get("path", ""))):
@@ -395,6 +401,41 @@ class TaskLedger:
             self._set_guarded_floor(document, row)
             self._write(document)
             return True
+
+    def retire_for_host_restart(self) -> list[str]:
+        """Retire reservations and native owners invalidated by a host restart."""
+
+        with self._lock():
+            document = self._read()
+            owners: list[str] = []
+            changed = False
+            for row in document["rows"].values():
+                if row.get("state") not in {"reserved", "owned"}:
+                    continue
+                if (
+                    not isinstance(row.get("node"), str)
+                    or _NODE.fullmatch(row["node"]) is None
+                    or row.get("role") not in _ROLES
+                    or not isinstance(row.get("route"), Mapping)
+                ):
+                    continue
+                owner = row.get("owner")
+                if owner is not None and (
+                    not isinstance(owner, str) or _TASK_PATH.fullmatch(owner) is None
+                ):
+                    raise LedgerConflict("host-restart owner is malformed")
+                row["state"] = "retired"
+                row["retire_reason"] = "host_restart"
+                row.pop("_pending", None)
+                row.pop("review_seed", None)
+                if owner is not None:
+                    self._fence_owner(document, owner)
+                    owners.append(owner)
+                self._set_guarded_floor(document, row, force=True)
+                changed = True
+            if changed:
+                self._write(document)
+            return sorted(owners)
 
     def retire_after_invalid_stop(self, owner: str) -> dict[str, Any]:
         """Atomically fence a final invalid SubagentStop and require guarded retry."""

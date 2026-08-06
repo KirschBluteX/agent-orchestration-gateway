@@ -42,7 +42,10 @@ from dispatch_transaction import (  # noqa: E402
     SPAWN_TOOL_NAMES,
     fence_spawn_call,
     graph_has_live_transaction,
+    repository_for_owner,
+    retire_active_for_host_restart,
     retire_owner as retire_transaction_owner,
+    session_has_live_transaction,
     settle_spawn_rejection,
     settle_spawn_success,
     spawn_claim_for_call,
@@ -70,7 +73,9 @@ SESSION_CONTEXT = (
     "CCO is mandatory for every native Agent spawn. Prepare one closed cco.v7 "
     "graph before dispatch. Only an explicit user-authorized CCO_NATIVE_BYPASS v1 "
     "may use native inheritance. CCO leaves never delegate. After dispatch, wait for "
-    "a native terminal, blocking-input, or user event; never forward opaque progress."
+    "a native terminal, blocking-input, or user event; never forward opaque progress. "
+    "A Codex Desktop restart retires and fences active or dispatching children as "
+    "host_restart before the next task continues."
 )
 
 
@@ -243,6 +248,7 @@ def claim_from_fields(fields: Mapping[str, Any], *, role: str | None = None, wor
             "baseline_path": workspace.get("baseline_path"),
             "graph_scopes": workspace.get("graph_scopes"),
             "graph_sha256": workspace.get("graph_sha256"),
+            "repo": workspace.get("repo"),
             "scopes": workspace.get("scopes"),
             "workspace_mode": workspace.get("workspace_mode"),
             "workspace_backend": workspace.get("workspace_backend"),
@@ -420,6 +426,7 @@ def preflight_continuation(payload: Mapping[str, Any], fields: Mapping[str, Any]
         "graph_sha256",
         "node",
         "role",
+        "repo",
         "route",
         "run",
         "scopes",
@@ -533,15 +540,20 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
         raise LedgerConflict(str(error)) from error
     if "baseline_path" in row:
         try:
+            repo = (
+                Path(str(row["repo"]))
+                if isinstance(row.get("repo"), str)
+                else repository_for_owner(payload, owner)
+            )
             verification = verify_artifact_workspace(
                 Path(str(row["baseline_path"])),
-                repo=Path(payload["cwd"]) if isinstance(payload.get("cwd"), str) else Path.cwd(),
+                repo=repo,
                 baseline=str(row["baseline"]),
                 graph_sha256_value=str(row["graph_sha256"]),
                 graph_scopes_value=row["graph_scopes"],
                 workspace_mode=str(row["workspace_mode"]),
             )
-        except PreparedGraphError as error:
+        except (DispatchTransactionError, PreparedGraphError) as error:
             raise LedgerConflict("result workspace artifact is invalid") from error
         if verification["verdict"] != "pass":
             raise LedgerConflict("result workspace verification failed: " + ",".join(verification["violations"]))
@@ -607,9 +619,17 @@ def cleanup_terminal_prior_sessions(
         ):
             continue
         try:
+            if session_has_live_transaction(directory, candidate.stem):
+                continue
             ledger = TaskLedger(directory, candidate.stem)
             terminal = ledger.cleanup_if_terminal()
-        except (LedgerBusy, LedgerConflict, OSError, ValueError):
+        except (
+            DispatchTransactionError,
+            LedgerBusy,
+            LedgerConflict,
+            OSError,
+            ValueError,
+        ):
             continue
         if terminal and not candidate.exists():
             cleanup_session_artifacts(directory, candidate.stem)
@@ -621,6 +641,12 @@ def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
     ledger = ledger_for(payload)
     if ledger is not None:
         session_id = str(payload.get("session_id"))
+        retired_owners = set(ledger.retire_for_host_restart())
+        retired_owners.update(retire_active_for_host_restart(payload))
+        if retired_owners:
+            for row in ledger.read_rows():
+                if row.get("owner") in retired_owners and row.get("state") == "retired":
+                    _cleanup_terminal_graph_artifact(ledger, payload, row)
         cleanup_terminal_prior_sessions(
             ledger.root,
             keep_session_id=session_id,

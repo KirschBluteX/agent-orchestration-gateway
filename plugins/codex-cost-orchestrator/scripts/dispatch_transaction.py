@@ -334,6 +334,9 @@ def _prune_terminal_transactions(
             record["state"] in {"fenced", "terminal"}
             and not _transaction_pending(record)
             and not has_unsettled_native_call
+            and not any(
+                node["state"] == "active" for node in record["nodes"].values()
+            )
         ):
             terminal.append((float(record["created_at"]), transaction_id, record))
     terminal.sort(key=lambda item: (item[0], item[1]))
@@ -789,6 +792,29 @@ def graph_has_live_transaction(
     )
 
 
+def session_has_live_transaction(ledger_root: Path, session_id: str) -> bool:
+    """Return whether a session still owns pending, dispatching, or active work."""
+
+    session = _session(session_id)
+    root = _resolved_ledger_root(Path(ledger_root))
+    if not _state_path(root, session).exists():
+        return False
+    with _lock(root, session):
+        document = _read_document(root, session)
+        records = [
+            _validate_transaction(transaction_id, value)
+            for transaction_id, value in document["transactions"].items()
+        ]
+    return any(
+        _transaction_pending(record)
+        or any(
+            node["state"] in {"dispatching", "active"}
+            for node in record["nodes"].values()
+        )
+        for record in records
+    )
+
+
 def _refresh_transaction_state(transaction: dict[str, Any]) -> None:
     nodes = list(transaction["nodes"].values())
     if any(node["state"] == "active" for node in nodes):
@@ -1109,6 +1135,28 @@ def pending_transactions(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [record for record in records if _transaction_pending(record)]
 
 
+def repository_for_owner(payload: Mapping[str, Any], owner: str) -> Path:
+    """Return the prepare-time repository bound to one active native owner."""
+
+    if TASK_PATH.fullmatch(owner) is None:
+        raise DispatchTransactionError("transaction owner is not canonical")
+    _root, _session_id, _repo, records = _records_for_payload(payload)
+    matches = [
+        record
+        for record in records
+        if any(node.get("owner") == owner for node in record["nodes"].values())
+    ]
+    if len(matches) != 1:
+        raise DispatchTransactionError("transaction owner repository is absent or ambiguous")
+    try:
+        repo = workspace_root(Path(str(matches[0]["repo"])))
+    except (DirectoryStateError, OSError, StateError) as error:
+        raise DispatchTransactionError("transaction owner repository is unavailable") from error
+    if str(repo) != matches[0]["repo"]:
+        raise DispatchTransactionError("transaction owner repository identity changed")
+    return repo
+
+
 def has_pending_transaction(payload: Mapping[str, Any]) -> bool:
     return bool(pending_transactions(payload))
 
@@ -1119,14 +1167,20 @@ def _fence_transaction(
     transaction: dict[str, Any],
     *,
     graph_fatal: bool = False,
+    include_active: bool = False,
 ) -> None:
     for node in transaction["nodes"].values():
-        if node["state"] in {"prepared", "dispatching", "rejected"}:
+        if node["state"] in {"prepared", "dispatching", "rejected"} or (
+            include_active and node["state"] == "active"
+        ):
             was_dispatching = node["state"] == "dispatching"
+            was_active = node["state"] == "active"
             node["state"] = "fenced"
             node["eligible_ref"] = None
             for candidate in node["candidates"]:
-                if candidate["state"] in {"prepared", "dispatching"}:
+                if candidate["state"] in {"prepared", "dispatching"} or (
+                    include_active and candidate["state"] == "active"
+                ):
                     candidate["state"] = "fenced"
             # Retain one tiny call/ref tombstone for a late PostToolUse.  Clearing
             # it would let the host's updated full v7 input fall through to the
@@ -1134,6 +1188,8 @@ def _fence_transaction(
             if not was_dispatching:
                 node["call_id"] = None
                 node["dispatch_ref"] = None
+            if was_active:
+                node["owner"] = None
     _refresh_transaction_state(transaction)
     if graph_fatal:
         transaction["state"] = "fenced"
@@ -1158,6 +1214,39 @@ def abort_pending_transaction(payload: Mapping[str, Any], transaction_id: str) -
         document["transactions"][requested] = transaction
         _write_document(root, session, document)
         _cleanup_settled_bundles(root, session, transaction)
+
+
+def retire_active_for_host_restart(payload: Mapping[str, Any]) -> list[str]:
+    """Fence active native owners when the Desktop host restarts."""
+
+    session = _session(payload.get("session_id"))
+    root = ledger_root_for_payload(payload)
+    retired: set[str] = set()
+    settled: list[dict[str, Any]] = []
+    with _lock(root, session):
+        document = _read_document(root, session)
+        changed = False
+        for transaction_id, raw in document["transactions"].items():
+            transaction = _validate_transaction(transaction_id, raw)
+            if not any(
+                node["state"] in {"active", "dispatching"}
+                for node in transaction["nodes"].values()
+            ):
+                continue
+            retired.update(
+                node["owner"]
+                for node in transaction["nodes"].values()
+                if isinstance(node.get("owner"), str)
+            )
+            _fence_transaction(root, session, transaction, include_active=True)
+            document["transactions"][transaction_id] = transaction
+            settled.append(transaction)
+            changed = True
+        if changed:
+            _write_document(root, session, document)
+            for transaction in settled:
+                _cleanup_settled_bundles(root, session, transaction)
+    return sorted(retired)
 
 
 def _fail_graph(root: Path, session_id: str, document: dict[str, Any], transaction: dict[str, Any]) -> None:

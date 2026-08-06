@@ -124,15 +124,13 @@ def _is_protected_payload_text(message: object) -> bool:
         return False
 
     def protected(item: object) -> bool:
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "encrypted_content"
-            and isinstance(item.get("encrypted_content"), str)
-            and bool(item["encrypted_content"])
-            and set(item) == {"type", "encrypted_content"}
-        ):
-            return True
         if isinstance(item, dict):
+            encrypted = item.get("encrypted_content")
+            if isinstance(encrypted, str) and encrypted and (
+                item.get("type") in {"encrypted_content", "reasoning"}
+                or PROTECTED_TOKEN.fullmatch(encrypted.strip()) is not None
+            ):
+                return True
             return any(protected(child) for child in item.values())
         if isinstance(item, list):
             return any(protected(child) for child in item)

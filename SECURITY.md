@@ -45,9 +45,11 @@ dispatch-bundle state roots.
 Large graph artifacts are deleted once the graph transaction has no pending,
 dispatching, or active nodes. Settled full dispatch bundles delete immediately;
 abandoned bundles share the seven-day stale bound. Small owner tombstones remain
-across turns to fence late results and raw continuations. SessionStart immediately
-removes validated terminal residue from prior sessions and retains live, unknown,
-locked, or malformed abandoned state only for bounded recovery of up to seven days.
+across turns to fence late results and raw continuations. On a Codex Desktop
+restart, the next SessionStart retires and fences active or dispatching children as
+`host_restart` interruptions before removing validated terminal residue. Unknown,
+locked, or malformed abandoned state remains only for bounded recovery of up to
+seven days.
 
 ## Hook behavior
 
@@ -55,6 +57,10 @@ The plugin uses SessionStart, PreToolUse, PostToolUse, Stop, UserPromptSubmit, a
 SubagentStop. Ordinary raw spawn and managed raw continuation fail closed. The only
 unmanaged path is the exact `CCO_NATIVE_BYPASS v1` marker after current user
 authorization.
+
+Protected collaboration values remain typed host data. PreToolUse rejects attempts
+to copy opaque values—including current `reasoning` objects carrying
+`encrypted_content`—into plain `send_message` or `followup_task` text.
 
 Hooks run only when Codex reports their current hashes as enabled and trusted. Review
 them through `/hooks`. Bootstrap and doctor do not grant trust; doctor only reads the
@@ -67,6 +73,12 @@ Non-Git workers capture the complete root with a default 20,000-file / 1 GiB
 preflight; read-only roles capture declared scopes and must finish unchanged. These
 checks reduce accidental scope drift; they cannot prevent a process from writing after
 the check completes.
+
+Result-time workspace verification uses the canonical repository captured during
+graph preparation. A SubagentStop event's `cwd` is not authoritative because Codex
+may start the parent task above the repository. Cross-session cleanup preserves graph
+artifacts while a sibling remains pending, dispatching, or active, and capacity
+pruning never evicts a fenced transaction that still contains an active owner.
 
 For a reviewer of a known worker delta, the capsule may retain the worker's old
 baseline identity while `current_state`, the prepared artifact, and the ledger bind

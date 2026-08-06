@@ -207,6 +207,27 @@ class TaskLedgerTests(unittest.TestCase):
                     disposition="retired",
                 )
 
+    def test_host_restart_retires_owned_rows_and_records_a_guarded_fence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = TaskLedger(Path(directory), "session-a")
+            owner = "/root/worker_n01_worker_g01"
+            ledger.reserve("spawn", identity())
+            ledger.activate("spawn", owner)
+
+            self.assertEqual(ledger.retire_for_host_restart(), [owner])
+            row = ledger.read_rows()[0]
+            self.assertEqual(row["state"], "retired")
+            self.assertEqual(row["retire_reason"], "host_restart")
+            self.assertTrue(ledger.is_managed_owner(owner))
+            self.assertEqual(ledger.read_rows()[0]["state"], "retired")
+            self.assertEqual(ledger.retire_for_host_restart(), [])
+
+            pending = TaskLedger(Path(directory), "session-b")
+            pending.reserve("pending", identity())
+            self.assertEqual(pending.retire_for_host_restart(), [])
+            self.assertEqual(pending.read_rows()[0]["state"], "retired")
+            self.assertEqual(pending.read_rows()[0]["retire_reason"], "host_restart")
+
     def test_cleanup_removes_only_terminal_or_expired_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

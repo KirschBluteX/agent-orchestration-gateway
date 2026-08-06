@@ -41,7 +41,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertRegex(
-            manifest["version"], r"^1\.2\.0\+codex\.[a-z0-9-]+$"
+            manifest["version"], r"^1\.2\.1\+codex\.[a-z0-9-]+$"
         )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
@@ -146,7 +146,13 @@ class ProjectContractTests(unittest.TestCase):
             for group in groups:
                 for hook in group["hooks"]:
                     count += 1
-                    limit = 120 if event == "SubagentStop" else 5
+                    if event == "SubagentStop":
+                        limit = 120
+                    elif event == "PreToolUse" and group.get("matcher") == ".*":
+                        limit = 30
+                        self.assertGreaterEqual(hook["timeout"], 30)
+                    else:
+                        limit = 5
                     self.assertLessEqual(hook["timeout"], limit)
         self.assertEqual(count, 7)
 

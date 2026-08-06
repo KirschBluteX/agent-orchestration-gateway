@@ -129,9 +129,16 @@ class DispatchTransactionTests(unittest.TestCase):
                 )
 
     def test_protected_collaboration_payload_is_never_forwarded_as_plain_text(self) -> None:
+        reasoning_payload = json.dumps(
+            {
+                "type": "reasoning",
+                "encrypted_content": "gAAAAAB-opaque-reasoning-payload-" + ("x" * 96),
+            }
+        )
         payloads = (
             "gAAAAAB-protected-agent-payload-" + ("x" * 96),
             '{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}',
+            reasoning_payload,
             '[{"type":"input_text","text":"Payload:"},{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}]',
             '{"type":"agent_message","content":[{"type":"input_text","text":"Payload:"},{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}]}',
         )
@@ -374,6 +381,76 @@ class DispatchTransactionTests(unittest.TestCase):
                 graph_compiler._review_source_row(
                     {"contract_rev": 1, "node": "n01_worker"}
                 )
+
+    def test_subagent_stop_uses_the_prepared_repo_when_event_cwd_is_its_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-parent-cwd-result"
+            host_root = root / "host"
+            repo = host_root / "repo"
+            repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("baseline\n", encoding="utf-8")
+            ledger_root = root / "state" / "ledger"
+            environment = {
+                "CCO_LEDGER_DIR": str(ledger_root),
+                "CODEX_THREAD_ID": session_id,
+            }
+            with mock.patch.dict(os.environ, environment):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_worker", "owned.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                batch = dispatch_transaction.prepare_dispatch_batch(
+                    compact_dispatch_batch(prepared),
+                    ledger_root=ledger_root,
+                    repo=repo,
+                    session_id=session_id,
+                )
+                dispatch = batch["dispatches"][0]
+                preflight = {
+                    "cwd": str(host_root),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": dispatch,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-parent-cwd-result",
+                }
+                expanded = agent_preflight.evaluate(preflight)["hookSpecificOutput"]["updatedInput"]
+                owner = "/root/" + expanded["task_name"]
+                ledger_runtime.evaluate(
+                    {**preflight, "hook_event_name": "PostToolUse", "tool_response": {"task_path": owner}}
+                )
+                (repo / "owned.txt").write_text("changed\n", encoding="utf-8")
+                result = compile_result(
+                    parse_message(expanded["message"]),
+                    status="complete",
+                    disposition="retire",
+                    blockers=[],
+                    changed_paths=["owned.txt"],
+                    deviations=[],
+                    evidence={"A01": "worker changed the declared file"},
+                    failure_signature=None,
+                    summary="worker completed inside the prepared repository",
+                )
+
+                self.assertEqual(
+                    subagent_stop.evaluate(
+                        {
+                            "agent_id": owner,
+                            "agent_type": expanded["agent_type"],
+                            "cwd": str(host_root),
+                            "hook_event_name": "SubagentStop",
+                            "last_assistant_message": result,
+                            "session_id": session_id,
+                            "stop_hook_active": False,
+                        }
+                    ),
+                    {},
+                )
+                self.assertEqual(ledger_runtime.ledger_for(preflight).read_rows()[0]["state"], "retired")
 
     def test_ref_expands_before_reservation_and_activation_discards_only_its_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -925,6 +1002,57 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertIn("additionalContext", prompt["hookSpecificOutput"])
             self.assertIn("active", prompt["hookSpecificOutput"]["additionalContext"])
 
+    def test_session_start_retires_active_children_after_host_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-host-restart"
+            repo, prepared = self._prepared(
+                root, session_id, node("n01_active", "active.txt")
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            ref = batch["dispatches"][0]
+            payload = {
+                "cwd": str(repo), "hook_event_name": "PreToolUse", "session_id": session_id,
+                "tool_input": ref, "tool_name": "spawn_agent", "tool_use_id": "spawn-host-restart",
+            }
+            agent_preflight.evaluate(payload)
+            owner = "/root/" + ref["task_name"]
+            ledger_runtime.evaluate(
+                {**payload, "hook_event_name": "PostToolUse", "tool_response": {"task_path": owner}}
+            )
+
+            restarted = ledger_runtime.evaluate(
+                {"cwd": str(repo), "hook_event_name": "SessionStart", "session_id": session_id}
+            )
+            self.assertEqual(restarted["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            row = ledger_runtime.ledger_for(payload).read_rows()[0]
+            self.assertEqual(row["state"], "retired")
+            self.assertEqual(row["retire_reason"], "host_restart")
+            transaction = dispatch_transaction.read_transaction_state(
+                root / "ledger", session_id, batch["transaction_id"]
+            )
+            self.assertEqual(transaction["state"], "terminal")
+            self.assertEqual(transaction["nodes"]["n01_active"]["state"], "fenced")
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {"cwd": str(repo), "hook_event_name": "Stop", "session_id": session_id}
+                ),
+                {},
+            )
+            late = subagent_stop.evaluate(
+                {
+                    "agent_id": owner,
+                    "agent_type": "cost_orchestrator_write_leaf",
+                    "cwd": str(repo),
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "late host-restart result",
+                    "session_id": session_id,
+                    "stop_hook_active": False,
+                }
+            )
+            self.assertIn("rejected", late["systemMessage"])
+            self.assertEqual(ledger_runtime.ledger_for(payload).read_rows()[0]["state"], "retired")
+
     def test_exact_abort_keeps_a_late_postflight_from_activating_a_fenced_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1025,6 +1153,46 @@ class DispatchTransactionTests(unittest.TestCase):
                     root, repo, prepared_after, session_id
                 )
                 self.assertIsNotNone(replacement["transaction_id"])
+
+    def test_capacity_never_prunes_a_fenced_transaction_with_an_active_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-capacity-active-sibling"
+            with mock.patch.object(dispatch_transaction, "_MAX_TRANSACTIONS", 1):
+                repo, prepared = self._prepared(
+                    root, session_id, node("n01_active", "active.txt")
+                )
+                batch = self._transaction(root, repo, prepared, session_id)
+                ref = batch["dispatches"][0]
+                spawn_payload = {
+                    "cwd": str(repo), "hook_event_name": "PreToolUse", "session_id": session_id,
+                    "tool_input": ref, "tool_name": "spawn_agent", "tool_use_id": "spawn-active-sibling",
+                }
+                agent_preflight.evaluate(spawn_payload)
+                owner = "/root/" + ref["task_name"]
+                ledger_runtime.evaluate(
+                    {**spawn_payload, "hook_event_name": "PostToolUse", "tool_response": {"task_path": owner}}
+                )
+
+                document = dispatch_transaction._read_document(root / "ledger", session_id)
+                transaction = document["transactions"][batch["transaction_id"]]
+                dispatch_transaction._fence_transaction(
+                    root / "ledger", session_id, transaction, graph_fatal=True
+                )
+                document["transactions"][batch["transaction_id"]] = transaction
+                dispatch_transaction._write_document(root / "ledger", session_id, document)
+
+                prepared_next = prepare_dispatch_graph(
+                    [node("n02_next", "next.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                with self.assertRaisesRegex(
+                    dispatch_transaction.DispatchTransactionError,
+                    "capacity is exhausted",
+                ):
+                    self._transaction(root, repo, prepared_next, session_id)
 
     def test_exhausted_candidate_chain_allows_a_new_generation_from_rank_one(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

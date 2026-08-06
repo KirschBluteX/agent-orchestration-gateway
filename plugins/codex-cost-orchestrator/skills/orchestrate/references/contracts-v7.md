@@ -53,12 +53,15 @@ The dispatch fast path is one compiler call followed by all ready native spawns 
 same model turn. Primary then waits for a completion, user message, blocking input, or
 the protection timeout; progress-only turns are not part of the protocol.
 
-Completion, failure, and interruption are established only by authoritative native
-terminal events. Protected or unreadable progress content, no workspace delta, no
-commentary, and elapsed time do not settle a node. A protection timeout wakes Primary
-for recovery but preserves the owner unless the host also reports a terminal state.
-Opaque protected content remains in the host's typed field and must never be copied
-into a plain `send_message` or `followup_task` string.
+Normal completion, failure, and interruption are established only by authoritative
+native terminal events. A Codex Desktop restart is the explicit host interruption
+boundary handled by `SessionStart`, which retires and fences active or dispatching
+children as `host_restart`. Protected or unreadable progress content, no workspace
+delta, no commentary, and elapsed time do not settle a node. A protection timeout
+wakes Primary for recovery but preserves the owner unless the host also reports a
+terminal state. Opaque protected content, including `reasoning` objects carrying
+`encrypted_content`, remains in the host's typed field and must never be copied into
+a plain `send_message` or `followup_task` string.
 
 ## Dispatch envelope
 
@@ -140,7 +143,8 @@ SubagentStop maps a current native thread UUID to the canonical owner using the
 bounded first `session_meta` record from `agent_transcript_path`; older hosts that
 send the canonical owner directly remain compatible. It then matches the result to
 the current owner, capsule, role, cursor, graph, workspace, and node scopes. Declared worker paths must equal the real delta inside
-that node's scopes. Only a complete reviewer may return `accept`; that is still a
+that node's scopes. Workspace verification uses the prepare-time repository bound in
+the task claim, not the event's potentially parent-directory `cwd`. Only a complete reviewer may return `accept`; that is still a
 review claim until Primary confirms the exact state.
 
 SubagentStop is authoritative native terminality. Every valid result retires the
@@ -165,9 +169,13 @@ chain leaves a terminal tombstone so a higher generation may restart at rank one
 Completed sibling scopes retain their lease while any batch reference remains
 pending. A graph artifact is deleted only when its transaction has no pending,
 dispatching, or active node. Capacity pruning removes only validated terminal
-transactions whose native call tombstones have also settled.
-Small tombstones are retained across turns until the next SessionStart confirms and
-removes terminal prior-session state. Live, unknown, locked, or malformed abandoned
-state remains subject to bounded stale cleanup of up to seven days. Incomplete,
+transactions whose native call tombstones have also settled and never prunes a
+fenced transaction that still contains an active sibling. Cross-session cleanup
+checks the corresponding transaction before removing a terminal TaskLedger or graph
+artifact.
+Small tombstones are retained across turns. On a Codex Desktop restart, the next
+SessionStart retires and fences active or dispatching children as `host_restart`
+interruptions before removing terminal prior-session state. Unknown, locked, or
+malformed abandoned state remains subject to bounded stale cleanup of up to seven days. Incomplete,
 blocked, deviating, or retired Luna results set the `node + role` guarded floor for a
 newer generation.
