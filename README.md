@@ -164,6 +164,9 @@ A trusted project may add `.codex/cco.toml` with the same route tables. See
 - When Codex Desktop restarts, active or dispatching children are retired as
   `host_restart` interruptions rather than reported as successful completions; their
   tombstones remain to reject late results.
+- Codex Desktop owns its native V2 task cards separately. If a proof-backed completed
+  child is still displayed as processing after restart, use the explicit maintenance
+  procedure in [Operations](docs/OPERATIONS.md); CCO never performs that repair from a Hook.
 - CCO is a workflow guard, not an operating-system sandbox or a defense against a
   malicious local process. See [Security](SECURITY.md) for the trust model.
 

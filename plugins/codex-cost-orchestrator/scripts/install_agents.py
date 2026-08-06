@@ -38,7 +38,7 @@ PROFILE_AGENT_NAMES = {
     "write": "cost_orchestrator_write_leaf",
 }
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 REQUIRED_HOOK_EVENTS = Counter(
     {
         "sessionStart": 1,

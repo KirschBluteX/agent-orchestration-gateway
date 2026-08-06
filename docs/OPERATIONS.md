@@ -188,3 +188,34 @@ trust-bypass flag for normal operation. For a shadow, inspect `.codex/agents` an
 `config.toml` declarations in the current repository and configured Codex home. For a
 modified profile, compare and decide manually. For route failure, inspect the native
 catalogue or supply a supported current-user pin.
+
+### Completed V2 children still show as processing
+
+Codex Desktop persists native V2 spawn edges separately from CCO's ledger. A rollout
+can end with `event_msg/task_complete` while its host edge remains `open`; after a
+restart, the Agent is not running, but the task card may still say processing. CCO's
+SessionStart retirement prevents stale waiting and late-result acceptance, but the
+Hook API cannot relabel that host-owned card.
+
+The optional maintenance CLI is outside every Hook and is read-only by default. First
+close active child work, then inspect proof-backed stale CCO edges:
+
+```text
+python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --check
+```
+
+Repair only the exact parent and children you reviewed. Repeat `--child-thread-id`
+for each selected child:
+
+```text
+python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID> --repair
+```
+
+Repair is allowed only when the host row, CCO role, canonical Agent path, first
+`session_meta`, parent/child identities, and final `task_complete` event all agree.
+Before writing, the tool creates a consistent backup below
+`~/.codex/backups/cco-host-edge-repair/`, acquires a database write transaction, and
+revalidates every requested child. Any missing, changed, duplicated, non-CCO, or
+unproven child fails the entire command. Restart Codex Desktop afterward so its task
+list reloads the corrected edge state. Do not use this command for a genuinely active
+Agent or as an automatic SessionStart action.

@@ -36,6 +36,13 @@ non-Git directory, hashes are captured only after a path/type/size budget prefli
 source contents are never retained. It does not copy workspace file contents or the
 full conversation.
 
+The optional `maintenance/repair_host_edges.py` command is not part of routing or any
+Hook. Its default mode reads only native thread metadata and bounded rollout evidence.
+An explicit `--repair` additionally requires exact parent/child IDs, creates a
+consistent backup, revalidates every requested completed CCO edge under a write
+transaction, and changes only matching `open` edges to `closed`. CCO never performs
+this host-state repair automatically.
+
 The default ledger is below the operating-system temporary directory at
 `codex-cost-orchestrator/ledger`; prepared artifacts and dispatch bundles use sibling
 directories. `CCO_LEDGER_DIR` may select another external location. Workspace paths

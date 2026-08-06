@@ -145,6 +145,11 @@ abandoned state remains subject to bounded stale cleanup of up to seven days. CC
 because the current desktop hook browser cannot render its untrusted definition for
 review.
 
+Codex Desktop owns its native V2 task-card state separately. SessionStart retirement
+cannot relabel those host-owned cards. If a proof-backed completed child remains shown
+as processing, use the explicit procedure in `docs/OPERATIONS.md`; never add host-card
+mutation to a Hook.
+
 Current Desktop SubagentStop events carry a native thread UUID rather than the
 canonical `/root/...` path. CCO reads only the bounded first session-metadata record
 under the configured Codex sessions root, verifies child UUID, parent task, and

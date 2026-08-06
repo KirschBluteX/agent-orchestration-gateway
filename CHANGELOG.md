@@ -2,6 +2,21 @@
 
 The project follows semantic versioning.
 
+## 1.2.2 - 2026-08-06
+
+- Distinguish CCO lifecycle recovery from Codex Desktop's persisted V2 task-card
+  state. A completed native rollout can still retain an `open` host spawn edge and
+  appear as processing even though no Agent is running.
+- Add an opt-in host-edge maintenance CLI outside the Hook/runtime path. Its default
+  mode is read-only; repair requires one exact parent and explicit child IDs.
+- Require matching CCO role/path metadata and an authoritative final
+  `event_msg/task_complete` record before an edge is eligible for repair.
+- Create a consistent pre-write state backup, revalidate under an immediate
+  transaction, and fail the whole repair when any requested child is absent,
+  changed, or unproven.
+- Document that host task-card repair is never automatic and may require a Desktop
+  restart before the corrected state is visible.
+
 ## 1.2.1 - 2026-08-06
 
 - Treat a Codex Desktop restart as an interruption boundary: active and

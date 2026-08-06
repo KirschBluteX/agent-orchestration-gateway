@@ -41,7 +41,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertRegex(
-            manifest["version"], r"^1\.2\.1\+codex\.[a-z0-9-]+$"
+            manifest["version"], r"^1\.2\.2\+codex\.[a-z0-9-]+$"
         )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
@@ -221,6 +221,20 @@ class ProjectContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, lowered)
         self.assertIn("second agent runtime", lowered)
         self.assertIn("not encryption", lowered)
+
+    def test_host_edge_repair_is_explicit_and_outside_hooks(self) -> None:
+        maintenance = PLUGIN / "maintenance" / "repair_host_edges.py"
+        operations = text(REPO / "docs" / "OPERATIONS.md")
+        hooks = text(HOOKS)
+
+        self.assertTrue(maintenance.is_file())
+        self.assertIn("--repair", operations)
+        self.assertIn("--parent-thread-id", operations)
+        self.assertIn("--child-thread-id", operations)
+        self.assertIn("task_complete", operations)
+        self.assertIn("cco-host-edge-repair", operations)
+        self.assertNotIn("repair_host_edges", hooks)
+        self.assertNotIn("state_5.sqlite", hooks)
 
     def test_marketplace_and_release_materials_are_complete(self) -> None:
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
