@@ -129,10 +129,12 @@ and validated result evidence. Primary supplies only the new reviewer node, epoc
 and closed review contract. This is still the same graph compiler and native runtime.
 
 The task-local ledger lives outside the repository. It provides one active owner per
-node revision, cursor single-flight, generation fencing, guarded floors, and late-
-result tombstones. It is not encryption or authentication against a malicious
-Primary. It is also not a second Agent runtime, durable scheduler, or protection
-against a late filesystem write. Primary still inspects actual state.
+node revision, one workspace write lease across reserved, owned, and continuable
+workers, cursor single-flight, generation fencing, guarded floors, and late-result
+tombstones. A worker result is rejected when the graph delta contains any path
+outside that worker's exact node scopes. It is not encryption or authentication
+against a malicious Primary. It is also not a second Agent runtime, durable scheduler,
+or protection against a late filesystem write. Primary still inspects actual state.
 
 Transactions retain the canonical repository captured at prepare time. Lifecycle
 discovery, exact spawn-reference expansion, and Stop protection use that identity;
@@ -148,10 +150,12 @@ active nodes. Cross-session cleanup checks that transaction before removing a te
 TaskLedger, and capacity pruning never removes a fenced transaction with an active
 sibling. The next SessionStart retires and fences active or
 dispatching children from a restarted Desktop session as `host_restart`, then
-removes validated terminal state from prior sessions. Unknown, locked, or malformed
-abandoned state remains subject to bounded stale cleanup of up to seven days. CCO does not register the optional SessionEnd event
-because the current desktop hook browser cannot render its untrusted definition for
-review.
+removes validated terminal state from prior sessions. Valid orphan artifacts,
+transaction bundles, and terminal state use bounded stale cleanup. Locked state is
+retried later; malformed state stays fail-closed for explicit recovery and is never
+deleted merely because it contains a terminal-looking label. CCO does not register
+the optional SessionEnd event because the current desktop hook browser cannot render
+its untrusted definition for review.
 
 Codex Desktop owns its native V2 task-card state separately. SessionStart retirement
 cannot relabel those host-owned cards. If a proof-backed completed child remains shown
@@ -165,6 +169,12 @@ canonical Agent path, then matches the exact dispatch identity. A valid `continu
 result ends the native dispatch transaction while keeping the TaskLedger owner
 continuable. An invalid result is retired and fenced in that same callback; the hook
 does not trigger a second child model response for formatting repair.
+
+Rollout inspection reads binary records with a 4 MiB per-record limit and 256 MiB
+total decompression limit. Host-edge maintenance additionally limits session metadata
+to 64 KiB and terminal evidence to a 1 MiB tail; plain JSONL tails are read from the
+end without scanning the full history. Expired atomic-write residue is reclaimable,
+while fresh or lifecycle-reachable transaction files remain protected.
 
 The read profile requests OS read-only, but describe it as isolated only when observed
 runtime metadata confirms the effective sandbox. If hard isolation is required and

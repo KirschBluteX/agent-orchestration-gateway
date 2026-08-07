@@ -498,6 +498,98 @@ class DispatchTransactionTests(unittest.TestCase):
                 )
                 self.assertEqual(ledger_runtime.ledger_for(preflight).read_rows()[0]["state"], "retired")
 
+    def test_continuation_uses_the_owner_workspace_instead_of_event_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-parent-cwd-continuation"
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_worker", "owned.txt"),
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            dispatch = batch["dispatches"][0]
+            spawn_payload = {
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": dispatch,
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-before-parent-cwd-continuation",
+            }
+            expanded = agent_preflight.evaluate(spawn_payload)["hookSpecificOutput"][
+                "updatedInput"
+            ]
+            owner = "/root/" + expanded["task_name"]
+            ledger_runtime.evaluate(
+                {
+                    **spawn_payload,
+                    "hook_event_name": "PostToolUse",
+                    "tool_response": {"task_path": owner},
+                }
+            )
+            capsule = parse_message(expanded["message"])
+            result = compile_result(
+                capsule,
+                status="complete",
+                disposition="continue",
+                blockers=[],
+                changed_paths=[],
+                deviations=[],
+                evidence={"A01": "worker requested one bounded follow-up"},
+                failure_signature=None,
+                summary="worker remained continuable",
+            )
+            self.assertEqual(
+                subagent_stop.evaluate(
+                    {
+                        "agent_id": owner,
+                        "agent_type": expanded["agent_type"],
+                        "cwd": str(repo),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": result,
+                        "session_id": session_id,
+                        "stop_hook_active": False,
+                    }
+                ),
+                {},
+            )
+
+            continuation = compile_continuation(
+                capsule,
+                target=owner,
+                delta={"evidence": "collect the remaining fact"},
+            )
+            continuation_payload = {
+                "cwd": str(root),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": continuation,
+                "tool_name": "followup_task",
+                "tool_use_id": "continue-from-parent-cwd",
+            }
+            outcome = agent_preflight.evaluate(continuation_payload)
+            self.assertEqual(outcome, {})
+            self.assertEqual(
+                ledger_runtime.evaluate(
+                    {
+                        **continuation_payload,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"status": "accepted"},
+                    }
+                ),
+                {},
+            )
+            row = ledger_runtime.ledger_for(
+                spawn_payload,
+                workspace_root=repo,
+            ).read_rows()[0]
+            self.assertEqual(row["cursor"], 1)
+            self.assertEqual(
+                row["input_sha256"],
+                parse_message(continuation["message"])["capsule_sha256"],
+            )
+
     def test_ref_expands_before_reservation_and_activation_discards_only_its_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1457,8 +1549,11 @@ class DispatchTransactionTests(unittest.TestCase):
             stale_file = stale / ("b" * 64 + ".json")
             keep_file.write_text("{}", encoding="utf-8")
             stale_file.write_text("{}", encoding="utf-8")
+            stale_temp = stale / ".cco-transaction-orphan"
+            stale_temp.write_text("partial", encoding="utf-8")
             old_time = stale_file.stat().st_mtime - (8 * 24 * 60 * 60)
             os.utime(stale_file, (old_time, old_time))
+            os.utime(stale_temp, (old_time, old_time))
             os.utime(stale, (old_time, old_time))
 
             removed = dispatch_transaction.cleanup_stale_dispatch_state(
@@ -1470,6 +1565,27 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertTrue(keep_file.exists())
             self.assertFalse(stale.exists())
             self.assertIn(str(stale_file.resolve()).casefold(), {str(path).casefold() for path in removed})
+            self.assertIn(str(stale_temp.resolve()).casefold(), {str(path).casefold() for path in removed})
+
+    def test_stale_cleanup_preserves_a_fresh_transaction_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger_root = root / "ledger"
+            bundle = root / "dispatch-bundles" / ("orphan-session-" + "a" * 64)
+            bundle.mkdir(parents=True)
+            temporary = bundle / ".cco-transaction-in-flight"
+            temporary.write_text("partial", encoding="utf-8")
+            old = time.time() - (8 * 24 * 60 * 60)
+            os.utime(bundle, (old, old))
+
+            dispatch_transaction.cleanup_stale_dispatch_state(
+                ledger_root,
+                keep_session_id="current-session",
+                max_age_seconds=7 * 24 * 60 * 60,
+            )
+
+            self.assertTrue(temporary.exists())
+            self.assertTrue(bundle.exists())
 
     def test_stale_cleanup_preserves_fresh_or_locked_malformed_sessions_and_unknown_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1563,6 +1679,32 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertEqual(removed_bundles, [])
             self.assertEqual(removed_artifacts, [])
             self.assertTrue(bundle_file.exists())
+            self.assertTrue(artifact.exists())
+
+    def test_artifact_cleanup_rechecks_session_state_under_the_shared_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ledger_root = root / "ledger"
+            ledger_root.mkdir()
+            session_id = "live-after-scan"
+            (ledger_root / f"{session_id}.json").write_text(
+                '{"fenced_owners":[],"guarded_floors":[],"rows":{}}',
+                encoding="utf-8",
+            )
+            workspace = root / "workspace"
+            workspace.mkdir()
+            artifact = workspace / f"{session_id}-{'a' * 64}.json"
+            artifact.write_text("{}", encoding="utf-8")
+            old = time.time() - (8 * 24 * 60 * 60)
+            os.utime(artifact, (old, old))
+
+            removed = prepared_graph.cleanup_stale_artifacts(
+                ledger_root,
+                keep_session_id="current-session",
+                max_age_seconds=7 * 24 * 60 * 60,
+            )
+
+            self.assertEqual(removed, [])
             self.assertTrue(artifact.exists())
 
     def test_transaction_capacity_prunes_validated_terminal_records_before_commit(self) -> None:

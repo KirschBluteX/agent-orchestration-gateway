@@ -16,7 +16,6 @@ from typing import Any, Iterator, Mapping
 from state_lock import (
     StateLockBusy,
     acquire as acquire_state_lock,
-    is_locked as state_lock_is_held,
     lock_path as state_lock_path,
 )
 
@@ -73,16 +72,14 @@ class TaskLedger:
             document = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise LedgerConflict("ledger document is unreadable") from error
-        if not isinstance(document, dict) or not isinstance(document.get("rows"), dict):
+        if (
+            not isinstance(document, dict)
+            or set(document) != {"fenced_owners", "guarded_floors", "rows"}
+            or not isinstance(document.get("rows"), dict)
+        ):
             raise LedgerConflict("ledger document is malformed")
-        for row in document["rows"].values():
-            if not isinstance(row, dict) or row.get("state") not in _STATES:
-                raise LedgerConflict("ledger row is malformed")
-            reason = row.get("retire_reason")
-            if reason is not None and (
-                not isinstance(reason, str) or _RETIRE_REASON.fullmatch(reason) is None
-            ):
-                raise LedgerConflict("ledger retirement reason is malformed")
+        for key, row in document["rows"].items():
+            self._validate_stored_row(key, row)
         fenced = document.get("fenced_owners", [])
         if not isinstance(fenced, list) or any(not isinstance(owner, str) or _TASK_PATH.fullmatch(owner) is None for owner in fenced) or len(set(fenced)) != len(fenced):
             raise LedgerConflict("ledger owner fences are malformed")
@@ -94,6 +91,104 @@ class TaskLedger:
         document["fenced_owners"] = fenced
         document["guarded_floors"] = floors
         return document
+
+    @classmethod
+    def _validate_stored_row(cls, key: object, row: object) -> None:
+        """Validate one complete persisted lifecycle row, not only its state label."""
+
+        if not isinstance(key, str) or not isinstance(row, dict) or row.get("state") not in _STATES:
+            raise LedgerConflict("ledger row is malformed")
+        try:
+            claim = cls._claim(row)
+            if cls._key(claim) != key:
+                raise ValueError("claim key mismatch")
+        except (TypeError, ValueError) as error:
+            raise LedgerConflict("ledger row is malformed") from error
+        allowed = {
+            *claim,
+            "_pending",
+            "call_id",
+            "owner",
+            "retire_reason",
+            "review_seed",
+            "state",
+        }
+        if not set(claim) <= set(row) or not set(row) <= allowed:
+            raise LedgerConflict("ledger row is malformed")
+        call_id = row.get("call_id")
+        owner = row.get("owner")
+        state = row["state"]
+        if not isinstance(call_id, str) or not call_id:
+            raise LedgerConflict("ledger row is malformed")
+        if owner is not None and (
+            not isinstance(owner, str) or _TASK_PATH.fullmatch(owner) is None
+        ):
+            raise LedgerConflict("ledger row is malformed")
+        if state in {"reserved", "rejected", "exhausted"} and owner is not None:
+            raise LedgerConflict("ledger row is malformed")
+        if state in {"owned", "continuable"} and owner is None:
+            raise LedgerConflict("ledger row is malformed")
+        reason = row.get("retire_reason")
+        if reason is not None and (
+            state != "retired"
+            or not isinstance(reason, str)
+            or _RETIRE_REASON.fullmatch(reason) is None
+        ):
+            raise LedgerConflict("ledger retirement reason is malformed")
+        pending = row.get("_pending")
+        if pending is not None:
+            required = {
+                "call_id",
+                "cursor",
+                "from_state",
+                "next_input_sha256",
+                "previous_input_sha256",
+            }
+            if (
+                state not in {"owned", "continuable"}
+                or not isinstance(pending, Mapping)
+                or set(pending) != required
+                or not isinstance(pending.get("call_id"), str)
+                or not pending["call_id"]
+                or pending.get("from_state") not in {"owned", "continuable"}
+                or isinstance(pending.get("cursor"), bool)
+                or not isinstance(pending.get("cursor"), int)
+                or pending["cursor"] < 1
+                or any(
+                    not isinstance(pending.get(name), str)
+                    or _SHA256.fullmatch(pending[name]) is None
+                    for name in ("next_input_sha256", "previous_input_sha256")
+                )
+                or pending["from_state"] != state
+                or pending["previous_input_sha256"] != row["input_sha256"]
+                or pending["next_input_sha256"] == row["input_sha256"]
+                or pending["cursor"] != row["cursor"] + 1
+            ):
+                raise LedgerConflict("ledger pending continuation is malformed")
+        review_seed = row.get("review_seed")
+        if review_seed is not None:
+            if (
+                state not in {"continuable", "retired"}
+                or not isinstance(review_seed, Mapping)
+                or set(review_seed) != {"disposition", "payload", "status"}
+                or review_seed.get("disposition")
+                not in {"accept", "continue", "retire"}
+                or review_seed.get("status")
+                not in {"blocked", "complete", "partial"}
+                or not isinstance(review_seed.get("payload"), Mapping)
+            ):
+                raise LedgerConflict("ledger review seed is malformed")
+            try:
+                encoded = json.dumps(
+                    review_seed,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise LedgerConflict("ledger review seed is malformed") from error
+            if len(encoded) > _MAX_REVIEW_SEED_BYTES:
+                raise LedgerConflict("ledger review seed exceeds the size limit")
 
     def _write(self, document: Mapping[str, Any]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -114,6 +209,39 @@ class TaskLedger:
         if not isinstance(node, str) or _NODE.fullmatch(node) is None or isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
             raise ValueError("claim identity is invalid")
         return f"{node}@{revision}"
+
+    @staticmethod
+    def _same_workspace(left: Mapping[str, object], right: Mapping[str, object]) -> bool:
+        """Compare exact workspace leases, conservatively handling legacy rows."""
+
+        left_repo = left.get("repo")
+        right_repo = right.get("repo")
+        if not isinstance(left_repo, str) or not isinstance(right_repo, str):
+            return True
+        return os.path.normcase(os.path.normpath(left_repo)) == os.path.normcase(
+            os.path.normpath(right_repo)
+        )
+
+    @classmethod
+    def _assert_write_lease_available(
+        cls,
+        document: Mapping[str, Any],
+        requested: Mapping[str, object],
+        *,
+        exclude_owner: str | None = None,
+    ) -> None:
+        if requested.get("role") != "worker":
+            return
+        for existing in document["rows"].values():
+            if (
+                existing.get("role") == "worker"
+                and existing.get("state") in {"reserved", "owned", "continuable"}
+                and (exclude_owner is None or existing.get("owner") != exclude_owner)
+                and cls._same_workspace(existing, requested)
+            ):
+                raise LedgerConflict(
+                    "workspace write lease already belongs to another worker"
+                )
 
     @staticmethod
     def _integer(value: object, label: str, minimum: int) -> int:
@@ -226,6 +354,7 @@ class TaskLedger:
         key = self._key(row)
         with self._lock():
             document = self._read()
+            self._assert_write_lease_available(document, row)
             floor = {"node": row["node"], "role": row["role"]}
             if floor in document["guarded_floors"] and row["assurance"] != "guarded":
                 raise LedgerConflict(f"{row['node']} requires guarded assurance after a Luna generation")
@@ -328,6 +457,11 @@ class TaskLedger:
             row = self._find_by_owner(document, owner)
             if row.get("state") not in {"owned", "continuable"}:
                 raise LedgerConflict("owner is not continuable")
+            self._assert_write_lease_available(
+                document,
+                row,
+                exclude_owner=owner,
+            )
             requested = {"call_id": call_id, "from_state": row["state"], "previous_input_sha256": previous_input_sha256, "next_input_sha256": next_input_sha256, "cursor": cursor}
             pending = row.get("_pending")
             if isinstance(pending, Mapping):
@@ -582,21 +716,26 @@ class TaskLedger:
             if candidate.stem == keep_session_id or candidate.stem.startswith("."):
                 continue
             try:
-                age = now - candidate.stat().st_mtime
-            except FileNotFoundError:
+                with acquire_state_lock(directory, candidate.stem, timeout=0):
+                    if candidate.is_symlink() or not candidate.is_file():
+                        continue
+                    age = now - candidate.stat().st_mtime
+                    try:
+                        document = cls(directory, candidate.stem)._read()
+                    except (LedgerConflict, OSError, ValueError):
+                        continue
+                    rows = document["rows"]
+                    live = any(
+                        row["state"]
+                        in {"reserved", "rejected", "owned", "continuable"}
+                        for row in rows.values()
+                    )
+                    expired = age > (
+                        live_threshold if live else max_age_seconds
+                    )
+                    if expired:
+                        candidate.unlink(missing_ok=True)
+                        removed.append(candidate)
+            except (FileNotFoundError, StateLockBusy):
                 continue
-            try:
-                document = json.loads(candidate.read_text(encoding="utf-8"))
-                rows = document.get("rows") if isinstance(document, Mapping) else None
-                live = not isinstance(rows, Mapping) or any(
-                    not isinstance(row, Mapping)
-                    or row.get("state") in {"reserved", "rejected", "owned", "continuable"}
-                    for row in rows.values()
-                )
-            except (OSError, ValueError):
-                live = True
-            expired = age > (live_threshold if live else max_age_seconds)
-            if expired and not state_lock_is_held(directory, candidate.stem):
-                candidate.unlink(missing_ok=True)
-                removed.append(candidate)
         return sorted(removed, key=lambda path: path.name)

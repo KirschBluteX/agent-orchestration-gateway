@@ -29,7 +29,6 @@ from directory_state import DirectoryStateError, directory_root
 from state_lock import (
     StateLockBusy,
     acquire as acquire_state_lock,
-    is_locked as state_lock_is_held,
     lock_path as state_lock_path,
 )
 
@@ -77,6 +76,7 @@ _BUNDLE_DIRECTORY = re.compile(
     r"^(?P<session>[A-Za-z0-9][A-Za-z0-9._-]{0,255})-(?P<transaction>[0-9a-f]{64})$"
 )
 _BUNDLE_FILE = re.compile(r"^[0-9a-f]{64}\.json$")
+_TEMP_FILE = re.compile(r"^\.cco-transaction-[A-Za-z0-9_-]+$")
 
 
 class DispatchTransactionError(RuntimeError):
@@ -1645,7 +1645,12 @@ def exact_abort_for_payload(payload: Mapping[str, Any]) -> str | None:
 def cleanup_stale_dispatch_state(
     ledger_root: Path, *, keep_session_id: str, max_age_seconds: float
 ) -> list[Path]:
-    """Remove bounded stale transaction files and orphan full dispatch bundles."""
+    """Remove bounded stale transaction files and orphan full dispatch bundles.
+
+    Every decision and unlink happens while holding the session's shared OS
+    lock.  A stale check made before acquiring that lock is not evidence that
+    the file is still safe to remove.
+    """
 
     keep = _session(keep_session_id)
     if max_age_seconds < 60:
@@ -1660,32 +1665,43 @@ def cleanup_stale_dispatch_state(
     if root.is_dir():
         for state in sorted(root.glob(f"*{_STATE_SUFFIX}")):
             session_id = state.name[: -len(_STATE_SUFFIX)]
-            if SESSION_ID.fullmatch(session_id) is None:
-                continue
-            if session_id == keep:
+            if SESSION_ID.fullmatch(session_id) is None or session_id == keep:
                 continue
             try:
-                expired = now - state.lstat().st_mtime > max_age_seconds
-            except OSError:
-                protected_sessions.add(session_id)
-                continue
-            lock_fresh = state_lock_is_held(root, session_id)
-            if lock_fresh or not expired:
-                protected_sessions.add(session_id)
-                try:
-                    document = _read_document(root, session_id)
-                except DispatchTransactionError:
-                    continue
-                for transaction_id in document["transactions"]:
-                    live_directories.add(
-                        bundle_root / f"{session_id}-{transaction_id[7:]}"
+                with acquire_state_lock(root, session_id, timeout=0):
+                    if not state.exists() or state.is_symlink() or not state.is_file():
+                        protected_sessions.add(session_id)
+                        continue
+                    expired = now - state.stat().st_mtime > max_age_seconds
+                    try:
+                        document = _read_document(root, session_id)
+                    except DispatchTransactionError:
+                        # Unknown or malformed state is never deleted by a
+                        # cleanup pass; it needs explicit operator recovery.
+                        protected_sessions.add(session_id)
+                        continue
+                    live = any(
+                        _transaction_pending(transaction)
+                        or any(
+                            node["state"] in {"dispatching", "active"}
+                            for node in transaction["nodes"].values()
+                        )
+                        for transaction in (
+                            _validate_transaction(transaction_id, value)
+                            for transaction_id, value in document["transactions"].items()
+                        )
                     )
-                continue
-            if state.is_symlink() or not state.is_file():
+                    if live or not expired:
+                        protected_sessions.add(session_id)
+                        for transaction_id in document["transactions"]:
+                            live_directories.add(
+                                bundle_root / f"{session_id}-{transaction_id[7:]}"
+                            )
+                        continue
+                    state.unlink(missing_ok=True)
+                    removed.append(state)
+            except (StateLockBusy, OSError):
                 protected_sessions.add(session_id)
-                continue
-            state.unlink(missing_ok=True)
-            removed.append(state)
 
     if _has_reparse_ancestor(bundle_root):
         return sorted(removed, key=str)
@@ -1703,29 +1719,77 @@ def cleanup_stale_dispatch_state(
             if session_id in protected_sessions or directory in live_directories:
                 continue
             try:
-                expired = now - directory.lstat().st_mtime > max_age_seconds
-            except OSError:
+                with acquire_state_lock(root, session_id, timeout=0):
+                    state = _state_path(root, session_id)
+                    if state.exists():
+                        try:
+                            current = _read_document(root, session_id)
+                        except DispatchTransactionError:
+                            continue
+                        transaction_id = "sha256:" + match.group("transaction")
+                        if transaction_id in current["transactions"]:
+                            continue
+                    if (
+                        not directory.exists()
+                        or directory.is_symlink()
+                        or _is_reparse(directory)
+                        or not directory.is_dir()
+                    ):
+                        continue
+                    files = list(directory.iterdir())
+                    temp_files = [
+                        candidate
+                        for candidate in files
+                        if _TEMP_FILE.fullmatch(candidate.name)
+                    ]
+                    for temporary in temp_files:
+                        try:
+                            if (
+                                not temporary.is_symlink()
+                                and temporary.is_file()
+                                and now - temporary.stat().st_mtime > max_age_seconds
+                            ):
+                                temporary.unlink(missing_ok=True)
+                                removed.append(temporary)
+                        except OSError:
+                            continue
+                    files = list(directory.iterdir())
+                    if not files:
+                        directory.rmdir()
+                        continue
+                    if any(
+                        _BUNDLE_FILE.fullmatch(candidate.name) is None
+                        or candidate.is_symlink()
+                        or not candidate.is_file()
+                        for candidate in files
+                    ):
+                        continue
+                    expired = now - directory.stat().st_mtime > max_age_seconds
+                    if not expired:
+                        expired = all(
+                            now - candidate.stat().st_mtime > max_age_seconds
+                            for candidate in files
+                        )
+                    if not expired:
+                        continue
+                    for candidate in files:
+                        candidate.unlink(missing_ok=True)
+                        removed.append(candidate)
+                    directory.rmdir()
+            except (StateLockBusy, OSError):
                 continue
-            files = list(directory.iterdir())
-            if any(
-                _BUNDLE_FILE.fullmatch(candidate.name) is None
-                or candidate.is_symlink()
-                or not candidate.is_file()
-                for candidate in files
-            ):
+    if root.is_dir():
+        for temporary in root.iterdir():
+            if _TEMP_FILE.fullmatch(temporary.name) is None:
                 continue
-            if not expired:
-                expired = bool(files) and all(
-                    now - candidate.lstat().st_mtime > max_age_seconds
-                    for candidate in files
-                )
-            if not expired:
-                continue
-            for candidate in files:
-                candidate.unlink(missing_ok=True)
-                removed.append(candidate)
             try:
-                directory.rmdir()
+                if (
+                    not temporary.is_symlink()
+                    and temporary.is_file()
+                    and now - temporary.stat().st_mtime > max_age_seconds
+                ):
+                    temporary.unlink(missing_ok=True)
+                    removed.append(temporary)
             except OSError:
                 continue
         try:

@@ -33,6 +33,25 @@ class V8PreflightTests(unittest.TestCase):
                 self.assertEqual(outcome["decision"], "block")
                 self.assertIn("CCO_PROTECTED_MESSAGE", outcome["reason"])
 
+    def test_deeply_json_wrapped_protected_payload_is_blocked(self) -> None:
+        message: object = {
+            "type": "reasoning",
+            "encrypted_content": "gAAAA" + "A" * 96,
+        }
+        for _ in range(8):
+            message = json.dumps(message)
+
+        outcome = agent_preflight.evaluate(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_input": {"message": message, "target": "/root/unmanaged"},
+                "tool_name": "send_message",
+            }
+        )
+
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("CCO_PROTECTED_MESSAGE", outcome["reason"])
+
     def test_raw_spawn_is_blocked_and_explicit_bypass_is_stripped(self) -> None:
         raw = {
             "agent_type": "explorer",

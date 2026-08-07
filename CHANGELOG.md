@@ -2,6 +2,28 @@
 
 The project follows semantic versioning.
 
+## 1.3.1 - 2026-08-07
+
+- Extended the workspace write lease through `continuable` worker ownership and
+  rejected every worker result containing graph delta outside that worker's exact
+  node scopes, closing continuation and sibling-attribution gaps without adding a
+  second snapshot store.
+- Made prepared `workspace_root` authoritative across spawn activation,
+  continuation pre/postflight, and result lifecycle lookup even when the Desktop
+  event `cwd` is a repository parent.
+- Protected old graph artifacts whenever a live dispatch or continuable ledger row
+  can still reach them; terminal and orphan artifacts retain bounded cleanup.
+- Replaced check-then-delete stale cleanup with shared OS-lock revalidation,
+  strengthened complete TaskLedger row validation, and preserved malformed state
+  for explicit recovery instead of treating a `state` label as terminal proof.
+- Removed the fixed JSON-wrapper depth bypass for protected collaboration payloads
+  and added bounded decoded-byte, node-count, and recursion limits.
+- Added binary bounded rollout reads, a 256 MiB total decompression ceiling,
+  explicit UTF-8 errors, and bounded session-metadata/terminal-tail inspection for
+  plain and compressed Codex rollouts.
+- Reclaimed expired `.cco-transaction-*` crash residue while retaining fresh or
+  live transaction files and bundles.
+
 ## 1.3.0 - 2026-08-07
 
 - Published the clean-break `cco.v8` capsule/result contract and `cco.graph.v5`

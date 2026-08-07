@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -226,6 +227,52 @@ class V8LifecycleTests(unittest.TestCase):
             self.assertEqual(removed, [])
             self.assertTrue(terminal_ledger.exists())
             self.assertTrue(artifact.exists())
+
+    def test_session_start_never_ages_out_a_live_prior_graph_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "pending.txt").write_text("baseline\n", encoding="utf-8")
+            ledger_root = root / "ledger"
+            prior_session = "prior-live-session"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "CCO_LEDGER_DIR": str(ledger_root),
+                    "CODEX_THREAD_ID": prior_session,
+                },
+            ):
+                prepared = prepare_dispatch_graph(
+                    [node("n01_pending", "pending.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                batch = dispatch_transaction.prepare_dispatch_batch(
+                    compact_dispatch_batch(prepared),
+                    ledger_root=ledger_root,
+                    repo=repo,
+                    session_id=prior_session,
+                )
+            artifact = Path(str(batch["baseline_path"]))
+            old = time.time() - (8 * 24 * 60 * 60)
+            os.utime(artifact, (old, old))
+
+            with mock.patch.dict(os.environ, {"CCO_LEDGER_DIR": str(ledger_root)}):
+                ledger_runtime.start_task(
+                    {
+                        "cwd": str(repo),
+                        "session_id": "current-session",
+                        "source": "startup",
+                    }
+                )
+
+            self.assertTrue(artifact.exists())
+            self.assertTrue(
+                (ledger_root / f"{prior_session}.dispatch-transactions.json").exists()
+            )
 
     def test_invalid_subagent_stop_retires_once_without_a_second_model_turn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -580,6 +627,80 @@ class V8LifecycleTests(unittest.TestCase):
                     ).read_rows()[0]["state"],
                     "retired",
                 )
+
+    def test_worker_result_rejects_a_delta_in_another_graph_node_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("owned\n", encoding="utf-8")
+            (repo / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+            session_id = "v8-node-scope-delta"
+            env = {
+                "CCO_LEDGER_DIR": str(root / "ledger"),
+                "CODEX_THREAD_ID": session_id,
+            }
+            with mock.patch.dict(os.environ, env):
+                prepared = prepare_dispatch_graph(
+                    [
+                        node("n01_worker", "owned.txt"),
+                        node("n02_explorer", "sibling.txt", role="explorer"),
+                    ],
+                    native_capacity=2,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+                dispatch = next(
+                    item
+                    for item in prepared["dispatches"]
+                    if item["task_name"].startswith("worker_")
+                )
+                capsule = parse_message(dispatch["message"])
+                owner = "/root/" + dispatch["task_name"]
+                preflight = {
+                    "cwd": str(repo),
+                    "hook_event_name": "PreToolUse",
+                    "session_id": session_id,
+                    "tool_input": dispatch,
+                    "tool_name": "spawn_agent",
+                    "tool_use_id": "spawn-node-scope-delta",
+                }
+                self.assertEqual(agent_preflight.evaluate(preflight), {})
+                ledger_runtime.evaluate(
+                    {
+                        **preflight,
+                        "hook_event_name": "PostToolUse",
+                        "tool_response": {"task_path": owner},
+                    }
+                )
+                (repo / "owned.txt").write_text("worker change\n", encoding="utf-8")
+                (repo / "sibling.txt").write_text(
+                    "unattributed change\n", encoding="utf-8"
+                )
+                result = compile_result(
+                    capsule,
+                    status="complete",
+                    disposition="retire",
+                    blockers=[],
+                    changed_paths=["owned.txt"],
+                    deviations=[],
+                    evidence={"A01": "worker changed its declared file"},
+                    failure_signature=None,
+                    summary="worker claimed only its node delta",
+                )
+                rejected = subagent_stop.evaluate(
+                    {
+                        "agent_id": owner,
+                        "agent_type": dispatch["agent_type"],
+                        "cwd": str(repo),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": result,
+                        "session_id": session_id,
+                        "stop_hook_active": False,
+                    }
+                )
+                self.assertIn("CCO result was rejected", rejected["systemMessage"])
 
     def test_terminal_graph_keeps_tombstones_and_deletes_artifact_only_after_last_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -50,6 +50,57 @@ def identity(
 
 
 class TaskLedgerTests(unittest.TestCase):
+    def test_continuable_worker_keeps_the_workspace_write_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = TaskLedger(root, "session-a")
+            repo = root / "repo"
+            repo.mkdir()
+            graph_scopes = [
+                {"kind": "exact", "path": "one.txt"},
+                {"kind": "exact", "path": "two.txt"},
+            ]
+
+            first = {
+                **identity(),
+                "baseline": "sha256:" + "d" * 64,
+                "baseline_path": str(root / "graph.json"),
+                "graph_scopes": graph_scopes,
+                "graph_sha256": "sha256:" + "e" * 64,
+                "repo": str(repo),
+                "scopes": [{"kind": "exact", "path": "one.txt"}],
+                "workspace_backend": "git",
+                "workspace_mode": "light",
+            }
+            owner = "/root/worker_n01_worker_g01"
+            ledger.reserve("spawn-first", first)
+            ledger.activate("spawn-first", owner)
+            ledger.record_result(
+                node="n01_worker",
+                contract_rev=1,
+                run="worker_n01_worker_g01",
+                generation=1,
+                input_sha256="sha256:" + "b" * 64,
+                owner=owner,
+                disposition="continuable",
+            )
+
+            second = {
+                **identity(generation=2),
+                "baseline": "sha256:" + "f" * 64,
+                "baseline_path": str(root / "next-graph.json"),
+                "graph_scopes": [{"kind": "exact", "path": "two.txt"}],
+                "graph_sha256": "sha256:" + "1" * 64,
+                "node": "n02_worker",
+                "repo": str(repo),
+                "run": "worker_n02_worker_g02",
+                "scopes": [{"kind": "exact", "path": "two.txt"}],
+                "workspace_backend": "git",
+                "workspace_mode": "light",
+            }
+            with self.assertRaisesRegex(LedgerConflict, "write lease"):
+                ledger.reserve("spawn-second", second)
+
     def test_prethread_fallback_requires_each_confirmed_rank_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = TaskLedger(Path(directory), "session-a")
@@ -296,6 +347,29 @@ class TaskLedgerTests(unittest.TestCase):
                 live_max_age_seconds=180,
             )
             self.assertEqual(removed, [active.path])
+
+    def test_stale_cleanup_preserves_a_malformed_terminal_looking_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            malformed = root / "malformed.json"
+            malformed.write_text(
+                '{"fenced_owners":[],"guarded_floors":[],"rows":{"n01@1":{"state":"retired"}}}',
+                encoding="utf-8",
+            )
+            old = time.time() - 240
+            os.utime(malformed, (old, old))
+
+            removed = TaskLedger.cleanup_stale(
+                root,
+                keep_session_id="current",
+                max_age_seconds=60,
+                live_max_age_seconds=180,
+            )
+
+            self.assertEqual(removed, [])
+            self.assertTrue(malformed.exists())
+            with self.assertRaisesRegex(LedgerConflict, "row is malformed"):
+                TaskLedger(root, "malformed").read_rows()
 
 
 if __name__ == "__main__":

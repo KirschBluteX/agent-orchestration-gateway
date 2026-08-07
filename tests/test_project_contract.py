@@ -41,7 +41,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertRegex(
-            manifest["version"], r"^1\.3\.0\+codex\.[a-z0-9-]+$"
+            manifest["version"], r"^1\.3\.1\+codex\.[a-z0-9-]+$"
         )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(

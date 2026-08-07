@@ -38,6 +38,9 @@ READ_ROLE = "cost_orchestrator_read_leaf"
 WRITE_ROLE = "cost_orchestrator_write_leaf"
 BYPASS_HEADER = "CCO_NATIVE_BYPASS v1"
 OLD_HEADERS = ("CCO_DISPATCH cco.v6", "CCO_DISPATCH cco.v7")
+MAX_PROTECTED_DEPTH = 32
+MAX_PROTECTED_NODES = 10_000
+MAX_PROTECTED_DECODED_BYTES = 1024 * 1024
 
 
 class PacketError(ValueError):
@@ -113,18 +116,22 @@ def _is_protected_payload_text(message: object) -> bool:
 
     seen: set[int] = set()
     visited = 0
+    decoded_bytes = 0
 
     def protected(item: object, *, depth: int = 0) -> bool:
-        nonlocal visited
+        nonlocal decoded_bytes, visited
         visited += 1
-        if visited > 10_000 or depth > 32:
+        if visited > MAX_PROTECTED_NODES or depth > MAX_PROTECTED_DEPTH:
             return True
         if isinstance(item, str):
             stripped = item.strip()
             if PROTECTED_TOKEN.fullmatch(stripped) is not None:
                 return True
-            if depth >= 4 or not stripped.startswith(("{", "[", '"')):
+            if not stripped.startswith(("{", "[", '"')):
                 return False
+            decoded_bytes += len(stripped.encode("utf-8"))
+            if decoded_bytes > MAX_PROTECTED_DECODED_BYTES:
+                return True
             try:
                 decoded = json.loads(stripped)
             except json.JSONDecodeError:

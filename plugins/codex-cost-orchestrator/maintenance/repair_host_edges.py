@@ -29,7 +29,12 @@ from packet_compiler import (  # noqa: E402
     parse_result_message,
     validate_result_for_dispatch,
 )
-from rollout_io import RolloutError, iter_records, is_rollout_path  # noqa: E402
+from rollout_io import (  # noqa: E402
+    RolloutError,
+    first_record,
+    is_rollout_path,
+    iter_tail_records,
+)
 from task_ledger import LedgerBusy, LedgerConflict, TaskLedger  # noqa: E402
 
 
@@ -167,13 +172,24 @@ def _assistant_result_messages(record: Mapping[str, Any]) -> list[str]:
 
 
 def _rollout_proof(path: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
-    first: Mapping[str, Any] | None = None
+    try:
+        first = first_record(path)
+    except RolloutError as error:
+        raise HostEdgeRepairError("agent rollout cannot be read") from error
+    try:
+        first_size = len(
+            json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise HostEdgeRepairError("agent session metadata is invalid") from error
+    if first_size > MAX_SESSION_META_BYTES:
+        raise HostEdgeRepairError("agent session metadata exceeds the size limit")
     last: Mapping[str, Any] | None = None
     result_messages: list[str] = []
     try:
-        for record in iter_records(path):
-            if first is None:
-                first = record
+        for record in iter_tail_records(path, max_bytes=MAX_TERMINAL_TAIL_BYTES):
             last = record
             result_messages.extend(_assistant_result_messages(record))
     except RolloutError as error:

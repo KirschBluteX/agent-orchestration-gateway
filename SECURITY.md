@@ -38,6 +38,9 @@ full conversation.
 
 The optional `maintenance/repair_host_edges.py` command is not part of routing or any
 Hook. Its default mode reads only native thread metadata and bounded rollout evidence.
+Rollout readers cap each record at 4 MiB and total decompressed input at 256 MiB;
+host-edge proof additionally caps session metadata at 64 KiB and reads only a 1 MiB
+terminal tail from plain JSONL files. Invalid UTF-8 fails closed.
 An explicit `--repair` additionally requires exact parent/child IDs, creates a
 minimal rollback journal containing no conversation or source content, revalidates
 every requested completed CCO edge under a write transaction, and changes only
@@ -51,13 +54,15 @@ and reparse-ancestor paths are rejected, including the sibling prepared-artifact
 dispatch-bundle state roots.
 
 Large graph artifacts are deleted once the graph transaction has no pending,
-dispatching, or active nodes. Settled full dispatch bundles delete immediately;
-abandoned bundles share the seven-day stale bound. Small owner tombstones remain
+dispatching, active, or continuable owner that can still reach them. Settled full
+dispatch bundles delete immediately; abandoned bundles and atomic-write residue share
+the seven-day stale bound. Small owner tombstones remain
 across turns to fence late results and raw continuations. On a Codex Desktop
 restart, the next SessionStart retires and fences active or dispatching children as
-`host_restart` interruptions before removing validated terminal residue. Unknown,
-locked, or malformed abandoned state remains only for bounded recovery of up to
-seven days.
+`host_restart` interruptions before removing validated terminal residue. Cleanup
+revalidates state while holding the shared OS lock. Locked state is retried later;
+malformed state remains fail-closed for explicit recovery and is never deleted from
+a terminal-looking label alone.
 
 ## Hook behavior
 
@@ -76,7 +81,9 @@ authoritative `hooks/list` result. A host-level failure to launch a hook may fol
 host policy, so Primary exact-state verification remains mandatory.
 
 Worker result paths must equal the real post-baseline delta inside that node's typed
-scopes. Every cco.v8 capsule binds the exact absolute workspace root used by its
+scopes, and a continuable worker retains the workspace write lease until it retires.
+Any worker result containing a graph delta outside that worker's node scopes is
+rejected. Every cco.v8 capsule binds the exact absolute workspace root used by its
 graph, transaction, and TaskLedger claim; host cwd cannot replace it. Git graphs
 fingerprint ignored files within bounded global budgets and explicitly include scoped
 `skip-worktree` and `assume-unchanged` entries.

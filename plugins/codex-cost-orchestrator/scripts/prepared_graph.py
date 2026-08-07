@@ -20,6 +20,7 @@ from protocol_hash import (
     require_repository_scope,
 )
 from routing_catalog import RoutingCatalogError, validate_route_constraints, validate_route_pair
+from state_lock import StateLockBusy, acquire as acquire_state_lock
 from directory_state import (
     DirectoryStateError,
     directory_root,
@@ -126,27 +127,57 @@ def cleanup_graph_artifact(ledger_root: Path, session_id: str, identity: str) ->
     return existed
 
 
-def cleanup_stale_artifacts(ledger_root: Path, *, keep_session_id: str, max_age_seconds: float) -> list[Path]:
+def cleanup_stale_artifacts(
+    ledger_root: Path,
+    *,
+    keep_session_id: str,
+    max_age_seconds: float,
+    protected_session_ids: set[str] | None = None,
+) -> list[Path]:
     if SESSION_ID.fullmatch(keep_session_id) is None or max_age_seconds < 60:
         raise PreparedGraphError("prepared workspace cleanup bounds are invalid")
     root = Path(os.path.abspath(Path(ledger_root).expanduser())).resolve()
     workspace = root.parent / "workspace"
     if _has_reparse_ancestor(workspace) or not workspace.is_dir():
         return []
+    protected = set(protected_session_ids or ())
+    if any(SESSION_ID.fullmatch(session_id) is None for session_id in protected):
+        raise PreparedGraphError("prepared workspace protected session identity is invalid")
+    protected.add(keep_session_id)
     now = time.time()
     removed: list[Path] = []
     for candidate in workspace.iterdir():
-        if candidate.name.startswith(f"{keep_session_id}-"):
+        artifact_match = ARTIFACT_FILENAME.fullmatch(candidate.name)
+        if not (artifact_match or candidate.name.startswith(".cco-state-")):
             continue
-        if not (ARTIFACT_FILENAME.fullmatch(candidate.name) or candidate.name.startswith(".cco-state-")):
+        session_id: str | None = None
+        if artifact_match is not None:
+            session_id = candidate.name[:-5].rsplit("-", 1)[0]
+            if SESSION_ID.fullmatch(session_id) is None or session_id in protected:
+                continue
+
+        def remove_if_expired() -> None:
+            try:
+                expired = now - candidate.lstat().st_mtime > max_age_seconds
+            except OSError:
+                return
+            if expired and (candidate.is_symlink() or candidate.is_file()):
+                candidate.unlink(missing_ok=True)
+                removed.append(candidate)
+
+        if session_id is None or not root.is_dir():
+            remove_if_expired()
             continue
         try:
-            expired = now - candidate.lstat().st_mtime > max_age_seconds
-        except OSError:
+            with acquire_state_lock(root, session_id, timeout=0):
+                if (
+                    (root / f"{session_id}.json").exists()
+                    or (root / f"{session_id}.dispatch-transactions.json").exists()
+                ):
+                    continue
+                remove_if_expired()
+        except StateLockBusy:
             continue
-        if expired and (candidate.is_symlink() or candidate.is_file()):
-            candidate.unlink(missing_ok=True)
-            removed.append(candidate)
     try:
         workspace.rmdir()
     except OSError:

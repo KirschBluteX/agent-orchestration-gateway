@@ -103,14 +103,18 @@ graph-level failure and fences the undispatched remainder.
 | UserPromptSubmit | Restore compact active/pending transaction context after user input |
 | SubagentStop | Map native UUID to owner; validate result, evidence, role, scope, and exact delta; retire once without a formatting-only second response |
 
-Large terminal artifacts and settled dispatch bundles delete immediately. On a Codex
+Large terminal artifacts and settled dispatch bundles delete immediately. A
+continuable worker keeps both its workspace write lease and reachable graph artifact
+until it retires. On a Codex
 Desktop restart, `SessionStart` retires active/dispatching children as
 `host_restart`, records a guarded floor, and keeps owner tombstones so late results
 remain fenced. It then removes validated terminal ledgers and their workspace
-artifacts from prior sessions. Unknown, locked, or malformed state remains subject
-to bounded stale cleanup of up to seven days. This keeps fencing across multiple
-turns without adding an optional SessionEnd hook that the current desktop browser
-cannot expose for trust review.
+artifacts from prior sessions. Valid orphan state and bundles use bounded stale
+cleanup; expired `.cco-transaction-*` crash residue is reclaimed. Every cleanup
+decision is rechecked under the shared OS lock. Locked state is retried later, while
+malformed state remains fail-closed for explicit recovery. This keeps fencing across
+multiple turns without adding an optional SessionEnd hook that the current desktop
+browser cannot expose for trust review.
 
 Cross-session cleanup checks the matching dispatch-transaction file before deleting
 a terminal TaskLedger or its graph artifact. A pending, dispatching, or active sibling
@@ -163,7 +167,10 @@ CCO does not keep read-only siblings by weakening that batch to a partial baseli
 
 Python 3.14 reads Codex `.jsonl.zst` rollouts with the standard library. Python
 3.11–3.13 need the optional `zstandard` package only when inspecting compressed
-rollouts; ordinary routing and execution do not require it.
+rollouts; ordinary routing and execution do not require it. Rollout inspection caps
+each binary record at 4 MiB and total decompressed data at 256 MiB. Host-edge repair
+also caps the first session metadata at 64 KiB and terminal evidence at a 1 MiB tail;
+plain JSONL tails are read from the end instead of scanning the full history.
 
 ## Reviewer delta baseline
 
@@ -195,6 +202,8 @@ derived fields must match the ledger or preparation fails closed.
 - Interrupted pending dispatch: one exact recovery; a second abandonment fences only
   nodes that never became active.
 - Managed malformed capsule, wrong owner/cursor, or raw follow-up: block before delivery.
+- A `continuable` worker keeps the workspace write lease; a second write worker or a
+  result containing another node's delta is rejected.
 - Invalid or stale SubagentStop result: retire and fence once, show Primary a concise
   status, and do not trigger another child response merely to repair formatting.
 - SubagentStop workspace verification uses the prepare-time repository bound in the

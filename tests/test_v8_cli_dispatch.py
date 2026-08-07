@@ -10,7 +10,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts" / "graph_compiler.py"
+SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
+SCRIPT = SCRIPTS / "graph_compiler.py"
+sys.path.insert(0, str(SCRIPTS))
+
+from task_ledger import TaskLedger  # noqa: E402
 
 
 def no_risks() -> dict[str, str]:
@@ -44,40 +48,68 @@ class V8CliDispatchTests(unittest.TestCase):
             ledger_root = root / "ledger"
             ledger_root.mkdir()
             old_baseline = "sha256:" + ("a" * 64)
-            (ledger_root / f"{session_id}.json").write_text(
-                json.dumps(
-                    {
-                        "fenced_owners": [],
-                        "guarded_floors": [],
-                        "rows": {
-                            "n01_worker@1": {
-                                "acceptance_ids": ["A01"],
-                                "baseline": old_baseline,
-                                "contract_rev": 1,
-                                "input_sha256": "sha256:" + ("b" * 64),
-                                "node": "n01_worker",
-                                "review_seed": {
-                                    "disposition": "retire",
-                                    "payload": {
-                                        "blockers": [],
-                                        "changed_paths": ["owned.txt"],
-                                        "deviations": [],
-                                        "evidence": {"A01": "focused worker check passed"},
-                                        "failure_signature": None,
-                                        "summary": "implemented owned.txt",
-                                    },
-                                    "status": "complete",
-                                },
-                                "scopes": [{"kind": "exact", "path": "owned.txt"}],
-                                "role": "worker",
-                                "state": "retired",
-                            }
+            result_seed = {
+                "disposition": "retire",
+                "payload": {
+                    "blockers": [],
+                    "changed_paths": ["owned.txt"],
+                    "deviations": [],
+                    "evidence": {"A01": "focused worker check passed"},
+                    "failure_signature": None,
+                    "summary": "implemented owned.txt",
+                },
+                "status": "complete",
+            }
+            owner = "/root/worker_n01_worker_g01"
+            ledger = TaskLedger(ledger_root, session_id)
+            ledger.reserve(
+                "spawn-worker",
+                {
+                    "acceptance_ids": ["A01"],
+                    "assurance": "guarded",
+                    "baseline": old_baseline,
+                    "baseline_path": str(root / "worker-graph.json"),
+                    "contract_rev": 1,
+                    "contract_sha256": "sha256:" + ("c" * 64),
+                    "cursor": 0,
+                    "generation": 1,
+                    "graph_scopes": [{"kind": "exact", "path": "owned.txt"}],
+                    "graph_sha256": "sha256:" + ("d" * 64),
+                    "input_sha256": "sha256:" + ("b" * 64),
+                    "node": "n01_worker",
+                    "repo": str(repo.resolve()),
+                    "role": "worker",
+                    "route": {
+                        "assurance": "guarded",
+                        "constraints": {
+                            "fixed_effort": None,
+                            "fixed_model": None,
+                            "source": "automatic",
+                        },
+                        "decision_sha256": "sha256:" + ("e" * 64),
+                        "plan_sha256": "sha256:" + ("f" * 64),
+                        "rank": 1,
+                        "selected": {
+                            "effort": "max",
+                            "model": "gpt-5.6-terra",
                         },
                     },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
+                    "run": owner.removeprefix("/root/"),
+                    "scopes": [{"kind": "exact", "path": "owned.txt"}],
+                    "workspace_backend": "git",
+                    "workspace_mode": "light",
+                },
+            )
+            ledger.activate("spawn-worker", owner)
+            ledger.record_result(
+                node="n01_worker",
+                contract_rev=1,
+                run=owner.removeprefix("/root/"),
+                generation=1,
+                input_sha256="sha256:" + ("b" * 64),
+                owner=owner,
+                disposition="retired",
+                review_seed=result_seed,
             )
             document = {
                 "native_catalog": {

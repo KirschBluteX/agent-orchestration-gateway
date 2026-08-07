@@ -22,6 +22,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from packet_compiler import (  # noqa: E402
     READ_ROLE,
     normalize_capsule,
+    parse_message,
     parse_result_message,
     validate_result_for_dispatch,
 )
@@ -98,7 +99,11 @@ def _has_reparse_ancestor(path: Path) -> bool:
     return any(_is_reparse(candidate) for candidate in (absolute, *absolute.parents))
 
 
-def _ledger_root(payload: Mapping[str, Any]) -> Path:
+def _ledger_root(
+    payload: Mapping[str, Any],
+    *,
+    workspace_root: Path | None = None,
+) -> Path:
     configured = os.environ.get("CCO_LEDGER_DIR")
     configured_root = Path(configured).expanduser() if configured else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "ledger"
     absolute_root = Path(os.path.abspath(configured_root))
@@ -106,11 +111,14 @@ def _ledger_root(payload: Mapping[str, Any]) -> Path:
         raise ValueError("ledger directory cannot use a reparse ancestor")
     try:
         root = absolute_root.resolve()
-        cwd = Path(payload.get("cwd")).resolve() if isinstance(payload.get("cwd"), str) else Path.cwd().resolve()
-        try:
-            protected_root = repository_root(cwd)
-        except StateError:
-            protected_root = cwd
+        if workspace_root is not None:
+            protected_root = Path(workspace_root).resolve(strict=True)
+        else:
+            cwd = Path(payload.get("cwd")).resolve() if isinstance(payload.get("cwd"), str) else Path.cwd().resolve()
+            try:
+                protected_root = repository_root(cwd)
+            except StateError:
+                protected_root = cwd
         if root == protected_root or protected_root in root.parents or root in protected_root.parents:
             raise ValueError("ledger directory must be outside repository")
     except OSError as error:
@@ -118,11 +126,18 @@ def _ledger_root(payload: Mapping[str, Any]) -> Path:
     return root
 
 
-def ledger_for(payload: Mapping[str, Any]) -> TaskLedger | None:
+def ledger_for(
+    payload: Mapping[str, Any],
+    *,
+    workspace_root: Path | None = None,
+) -> TaskLedger | None:
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or SESSION_ID.fullmatch(session_id) is None:
         return None
-    return TaskLedger(_ledger_root(payload), session_id)
+    return TaskLedger(
+        _ledger_root(payload, workspace_root=workspace_root),
+        session_id,
+    )
 
 
 def _sessions_root() -> Path:
@@ -201,6 +216,21 @@ def _result_owner(payload: Mapping[str, Any]) -> str:
     raise LedgerConflict("result has no canonical owner mapping")
 
 
+def ledger_for_owner(
+    payload: Mapping[str, Any],
+    owner: str,
+) -> TaskLedger | None:
+    """Resolve a live owner's ledger from its prepared workspace, never host cwd."""
+
+    try:
+        workspace_root = repository_for_owner(payload, owner)
+    except DispatchTransactionError:
+        # Direct-capsule compatibility has no dispatch transaction. Its caller
+        # still uses the legacy cwd-bound ledger path and remains fail-closed.
+        return ledger_for(payload)
+    return ledger_for(payload, workspace_root=workspace_root)
+
+
 def prepared_workspace_claim(payload: Mapping[str, Any], capsule: Mapping[str, Any]) -> dict[str, Any]:
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or SESSION_ID.fullmatch(session_id) is None:
@@ -210,12 +240,10 @@ def prepared_workspace_claim(payload: Mapping[str, Any], capsule: Mapping[str, A
         repo = (
             Path(str(transaction_claim["repo"]))
             if transaction_claim is not None
-            else Path(payload["cwd"])
-            if isinstance(payload.get("cwd"), str)
-            else Path.cwd()
+            else Path(str(capsule["workspace_root"]))
         )
         return dispatch_workspace_claim(
-            ledger_root=_ledger_root(payload),
+            ledger_root=_ledger_root(payload, workspace_root=repo),
             session_id=session_id,
             capsule=capsule,
             repo=repo,
@@ -259,7 +287,14 @@ def claim_from_fields(fields: Mapping[str, Any], *, role: str | None = None, wor
 
 
 def reserve_spawn(payload: Mapping[str, Any], fields: Mapping[str, Any], role: str, *, workspace: Mapping[str, Any] | None = None) -> None:
-    ledger = ledger_for(payload)
+    ledger = ledger_for(
+        payload,
+        workspace_root=(
+            Path(str(workspace["repo"]))
+            if isinstance(workspace, Mapping) and isinstance(workspace.get("repo"), str)
+            else None
+        ),
+    )
     call_id = payload.get("tool_use_id")
     if ledger is None or not isinstance(call_id, str):
         return
@@ -322,7 +357,10 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
         except DispatchTransactionError as error:
             return {"decision": "block", "reason": f"CCO transaction state is invalid: {error}"}
     if transaction_claim is not None:
-        ledger = ledger_for(payload)
+        ledger = ledger_for(
+            payload,
+            workspace_root=Path(str(transaction_claim["repo"])),
+        )
         call_id = payload.get("tool_use_id")
         if ledger is None or not ledger.path.exists() or not isinstance(call_id, str):
             try:
@@ -375,7 +413,11 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, Mapping) or not isinstance(tool_input.get("message"), str) or not tool_input["message"].startswith(V8_HEADER):
         return {}
-    ledger = ledger_for(payload)
+    capsule = parse_message(tool_input["message"])
+    ledger = ledger_for(
+        payload,
+        workspace_root=Path(str(capsule["workspace_root"])),
+    )
     call_id = payload.get("tool_use_id")
     if ledger is None or not ledger.path.exists() or not isinstance(call_id, str):
         return {}
@@ -393,7 +435,15 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
 
 
 def preflight_continuation(payload: Mapping[str, Any], fields: Mapping[str, Any] | None = None) -> None:
-    ledger = ledger_for(payload)
+    capsule = normalize_capsule(dict(fields)) if fields is not None else None
+    ledger = ledger_for(
+        payload,
+        workspace_root=(
+            Path(str(capsule["workspace_root"]))
+            if capsule is not None
+            else None
+        ),
+    )
     if ledger is None or not ledger.path.exists():
         return
     tool_input = payload.get("tool_input")
@@ -407,7 +457,7 @@ def preflight_continuation(payload: Mapping[str, Any], fields: Mapping[str, Any]
     call_id = payload.get("tool_use_id")
     if not isinstance(target, str) or not isinstance(call_id, str):
         raise LedgerConflict("continuation has no exact call or target")
-    capsule = normalize_capsule(dict(fields))
+    assert capsule is not None
     workspace = prepared_workspace_claim(payload, capsule)
     matching = [row for row in ledger.read_rows() if row.get("owner") == target]
     if len(matching) != 1:
@@ -447,7 +497,18 @@ def preflight_continuation(payload: Mapping[str, Any], fields: Mapping[str, Any]
 
 
 def postflight_continuation(payload: Mapping[str, Any]) -> None:
-    ledger = ledger_for(payload)
+    tool_input = payload.get("tool_input")
+    if (
+        not isinstance(tool_input, Mapping)
+        or not isinstance(tool_input.get("message"), str)
+        or not tool_input["message"].startswith(V8_HEADER)
+    ):
+        return
+    capsule = parse_message(tool_input["message"])
+    ledger = ledger_for(
+        payload,
+        workspace_root=Path(str(capsule["workspace_root"])),
+    )
     call_id = payload.get("tool_use_id")
     if ledger is None or not ledger.path.exists() or not isinstance(call_id, str):
         return
@@ -505,21 +566,21 @@ def _cleanup_terminal_graph_artifact(
 def retire_invalid_subagent_stop(payload: Mapping[str, Any]) -> None:
     """Fence a final invalid result without issuing another stop block."""
 
-    ledger = ledger_for(payload)
+    owner = _result_owner(payload)
+    ledger = ledger_for_owner(payload, owner)
     if ledger is None or not ledger.path.exists():
         raise LedgerConflict("v8 result has no live dispatch ledger")
-    owner = _result_owner(payload)
     row = ledger.retire_after_invalid_stop(owner)
     retire_transaction_owner(payload, owner, fenced=True)
     _cleanup_terminal_graph_artifact(ledger, payload, row)
 
 
 def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any] | None = None) -> None:
-    ledger = ledger_for(payload)
     parsed = fields or parse_result_message(payload.get("last_assistant_message"))
+    owner = _result_owner(payload)
+    ledger = ledger_for_owner(payload, owner)
     if ledger is None or not ledger.path.exists():
         raise LedgerConflict("v8 result has no live dispatch ledger")
-    owner = _result_owner(payload)
     rows = [row for row in ledger.read_rows() if row.get("owner") == owner and row.get("input_sha256") == parsed.get("dispatch_sha256")]
     if len(rows) != 1:
         raise LedgerConflict("v8 result dispatch identity is stale")
@@ -568,6 +629,14 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
                 for scope in row["scopes"]
             )
         )
+        outside_node_paths = sorted(
+            set(verification["changed_paths"]) - set(actual_node_paths)
+        )
+        if row.get("role") == "worker" and outside_node_paths:
+            raise LedgerConflict(
+                "worker result includes an unattributed graph delta: "
+                + ",".join(outside_node_paths)
+            )
         if declared_paths != actual_node_paths:
             raise LedgerConflict("result changed paths do not match the exact node workspace delta")
     disposition = "continuable" if parsed.get("disposition") == "continue" else "retired"
@@ -639,6 +708,46 @@ def cleanup_terminal_prior_sessions(
     return removed
 
 
+def live_artifact_sessions(
+    ledger_root: Path,
+    *,
+    keep_session_id: str,
+) -> set[str]:
+    """Return sessions whose graph artifacts are still lifecycle-reachable."""
+
+    directory = Path(ledger_root)
+    protected = {keep_session_id}
+    if not directory.is_dir():
+        return protected
+    for state in directory.glob("*.dispatch-transactions.json"):
+        session_id = state.name.removesuffix(".dispatch-transactions.json")
+        if SESSION_ID.fullmatch(session_id) is None:
+            continue
+        try:
+            live = session_has_live_transaction(directory, session_id)
+        except (DispatchTransactionError, OSError, ValueError):
+            live = True
+        if live:
+            protected.add(session_id)
+    for candidate in directory.glob("*.json"):
+        if candidate.name.endswith(".dispatch-transactions.json"):
+            continue
+        session_id = candidate.stem
+        if SESSION_ID.fullmatch(session_id) is None:
+            continue
+        try:
+            rows = TaskLedger(directory, session_id).read_rows()
+            live = any(
+                row.get("state") in {"reserved", "rejected", "owned", "continuable"}
+                for row in rows
+            )
+        except (LedgerBusy, LedgerConflict, OSError, ValueError):
+            live = True
+        if live:
+            protected.add(session_id)
+    return protected
+
+
 def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
     ledger = ledger_for(payload)
     if ledger is not None:
@@ -665,10 +774,15 @@ def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
             ledger.root,
             keep_session_id=session_id,
         )
+        protected_artifact_sessions = live_artifact_sessions(
+            ledger.root,
+            keep_session_id=session_id,
+        )
         cleanup_stale_artifacts(
             ledger.root,
             keep_session_id=session_id,
             max_age_seconds=LIVE_STALE_SECONDS,
+            protected_session_ids=protected_artifact_sessions,
         )
         cleanup_stale_dispatch_state(
             ledger.root,
