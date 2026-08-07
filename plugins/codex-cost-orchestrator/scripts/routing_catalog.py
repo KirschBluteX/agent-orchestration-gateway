@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Network-free v7 route policy and native capability adapter.
+"""Network-free v8 route policy and native capability adapter.
 
 The module has one deep interface: resolve a complete node route plan from a
 static policy, explicit user pins, and the host's native capability catalogue.
@@ -108,6 +108,19 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
     for index, model in enumerate(catalog["models"]):
         if not isinstance(model, Mapping):
             raise RoutingCatalogError(f"native model {index} is malformed")
+        visibility_values = (
+            ("show_in_picker", True),
+            ("hidden", False),
+            ("disabled", False),
+        )
+        if any(
+            key in model
+            and (type(model[key]) is not bool or model[key] is not required)
+            for key, required in visibility_values
+        ):
+            continue
+        if "visibility" in model and model.get("visibility") not in {"list", "visible", "picker"}:
+            continue
         version = model.get("multi_agent_version")
         if version not in NATIVE_MULTI_AGENT_VERSIONS:
             continue

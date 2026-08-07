@@ -2,6 +2,27 @@
 
 The project follows semantic versioning.
 
+## 1.3.0 - 2026-08-07
+
+- Published the clean-break `cco.v8` capsule/result contract and `cco.graph.v5`
+  workspace-root identity. The prepare-time root now remains immutable through
+  artifacts, transactions, continuations, ledgers, and SubagentStop verification.
+- Added shared OS-backed state locking and restart reconciliation so TaskLedger and
+  dispatch transactions cannot race or lose active-child fencing.
+- Enforced one write-capable worker per workspace while retaining non-conflicting
+  read-only concurrency; scope order is normalized at graph input and overlap is
+  rejected before dispatch.
+- Closed Git change-detection gaps for ignored files and scoped
+  `skip-worktree`/`assume-unchanged` paths, and replaced the non-Git file-only budget
+  with a bounded entry budget.
+- Hardened protected collaboration payload detection for nested and re-encoded host
+  values, including `reasoning` objects carrying `encrypted_content`.
+- Hardened host-edge repair with proof-backed terminal evidence, Windows extended
+  paths, `.jsonl.zst` rollout support, and minimal permission-restricted rollback
+  journals with bounded retention.
+- Updated native capability parsing for current Desktop `visibility: "list"` model
+  entries while keeping unknown, hidden, and disabled values fail-closed.
+
 ## 1.2.2 - 2026-08-06
 
 - Distinguish CCO lifecycle recovery from Codex Desktop's persisted V2 task-card

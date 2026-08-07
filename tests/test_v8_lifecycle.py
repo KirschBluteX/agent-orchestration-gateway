@@ -71,7 +71,7 @@ def render_capsule(capsule: dict[str, object]) -> str:
     value = deepcopy(capsule)
     value["capsule_sha256"] = capsule_sha256(value)
     return (
-        "CCO_DISPATCH cco.v7\n"
+        "CCO_DISPATCH cco.v8\n"
         f"CAPSULE_SHA256: {value['capsule_sha256']}\n"
         f"CAPSULE_JSON: {canonical_bytes(value).decode('utf-8')}"
     )
@@ -123,7 +123,7 @@ def node(
     return value
 
 
-class V7LifecycleTests(unittest.TestCase):
+class V8LifecycleTests(unittest.TestCase):
     def test_global_lifecycle_hooks_are_noops_outside_a_git_repository_without_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -592,7 +592,10 @@ class V7LifecycleTests(unittest.TestCase):
             env = {"CCO_LEDGER_DIR": str(root / "ledger"), "CODEX_THREAD_ID": "v7-lifecycle"}
             with mock.patch.dict(os.environ, env):
                 prepared = prepare_dispatch_graph(
-                    [node("n01_worker", "one.txt"), node("n02_worker", "two.txt")],
+                    [
+                        node("n01_worker", "one.txt"),
+                        node("n02_explorer", "two.txt", role="explorer"),
+                    ],
                     native_capacity=2,
                     native_catalog=native_catalog(),
                     repo=repo,
@@ -663,21 +666,27 @@ class V7LifecycleTests(unittest.TestCase):
                 self.assertEqual(subagent_stop.evaluate(first_stop), {})
                 self.assertTrue(artifact.exists())
 
-                (repo / "two.txt").write_text("two changed\n", encoding="utf-8")
                 second_capsule = parse_message(dispatches[1]["message"])
                 second_message = compile_result(
                     second_capsule,
                     status="complete",
                     disposition="retire",
                     blockers=[],
-                    changed_paths=["two.txt"],
+                    changed_paths=[],
                     deviations=[],
-                    evidence={"A01": "owned file changed and verified"},
+                    evidence={"A01": "read-only sibling verified two.txt"},
                     failure_signature=None,
-                    summary="completed second worker contract",
+                    summary="completed read-only sibling contract",
                 )
                 self.assertEqual(
-                    subagent_stop.evaluate({**first_stop, "agent_id": owners[1], "last_assistant_message": second_message}),
+                    subagent_stop.evaluate(
+                        {
+                            **first_stop,
+                            "agent_id": owners[1],
+                            "agent_type": dispatches[1]["agent_type"],
+                            "last_assistant_message": second_message,
+                        }
+                    ),
                     {},
                 )
                 self.assertFalse(artifact.exists())
@@ -722,7 +731,10 @@ class V7LifecycleTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, env):
                 prepared = prepare_dispatch_graph(
-                    [node("n01_worker", "one.txt"), node("n02_worker", "two.txt")],
+                    [
+                        node("n01_worker", "one.txt"),
+                        node("n02_explorer", "two.txt", role="explorer"),
+                    ],
                     native_capacity=2,
                     native_catalog=native_catalog(),
                     repo=repo,
@@ -798,7 +810,7 @@ class V7LifecycleTests(unittest.TestCase):
 
             hook = outcome["hookSpecificOutput"]
             self.assertEqual(hook["hookEventName"], "SessionStart")
-            self.assertIn("cco.v7", hook["additionalContext"])
+            self.assertIn("cco.v8", hook["additionalContext"])
             self.assertIn("CCO_NATIVE_BYPASS v1", hook["additionalContext"])
             self.assertFalse(stale.exists())
 

@@ -17,7 +17,67 @@ INSPECTOR = (
 )
 
 
+def write_zstd(path: Path, text: str) -> bool:
+    try:
+        from compression import zstd
+    except ImportError:
+        try:
+            import zstandard
+        except ImportError:
+            return False
+        path.write_bytes(zstandard.ZstdCompressor().compress(text.encode("utf-8")))
+        return True
+    with zstd.open(path, "wt", encoding="utf-8", newline="") as stream:
+        stream.write(text)
+    return True
+
+
 class RuntimeInspectorBehaviorTests(unittest.TestCase):
+    def test_reads_zstd_compressed_rollout_when_the_runtime_supports_it(self) -> None:
+        thread_id = "10101010-1010-7010-8010-101010101010"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions_root = Path(temp_dir) / "sessions"
+            sessions = sessions_root / "2026" / "08" / "07"
+            sessions.mkdir(parents=True)
+            rollout = sessions / f"rollout-compressed-{thread_id}.jsonl.zst"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "agent_role": "cost_orchestrator_read_leaf",
+                        "id": thread_id,
+                    },
+                },
+                {
+                    "type": "turn_context",
+                    "payload": {"effort": "max", "model": "gpt-5.6-terra"},
+                },
+            ]
+            available = write_zstd(
+                rollout,
+                "".join(json.dumps(record) + "\n" for record in records),
+            )
+            if not available:
+                self.skipTest("zstd support is unavailable on this Python runtime")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSPECTOR),
+                    "--sessions-dir",
+                    str(sessions_root),
+                    thread_id,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["model"], "gpt-5.6-terra")
+            self.assertEqual(output["effort"], "max")
+
     def test_resolves_canonical_path_with_exact_parent_thread(self) -> None:
         parent_id = "aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
         child_id = "bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"

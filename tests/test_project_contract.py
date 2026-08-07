@@ -26,7 +26,7 @@ def current_runtime_text() -> str:
         *PLUGIN.glob("scripts/*.py"),
         SKILL,
         REFERENCES / "runtime-gates.md",
-        REFERENCES / "contracts-v7.md",
+        REFERENCES / "contracts-v8.md",
     ]
     return "\n".join(text(path) for path in paths)
 
@@ -41,7 +41,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertRegex(
-            manifest["version"], r"^1\.2\.2\+codex\.[a-z0-9-]+$"
+            manifest["version"], r"^1\.3\.0\+codex\.[a-z0-9-]+$"
         )
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
@@ -99,7 +99,8 @@ class ProjectContractTests(unittest.TestCase):
             self.assertNotIn("model_reasoning_effort", profile)
             self.assertFalse(profile["features"]["multi_agent"])
             self.assertEqual(profile["features"]["multi_agent_v2"], {"enabled": False})
-            self.assertIn("CCO_DISPATCH cco.v7", profile["developer_instructions"])
+            self.assertIn("CCO_DISPATCH cco.v8", profile["developer_instructions"])
+            self.assertIn("workspace_root", profile["developer_instructions"])
             self.assertIn("RESULT_SHA256: sha256:<64-lowercase-hex>", profile["developer_instructions"])
             self.assertIn('RESULT_JSON: {"dispatch_sha256":', profile["developer_instructions"])
             for field in (
@@ -116,7 +117,7 @@ class ProjectContractTests(unittest.TestCase):
             "read-only",
         )
 
-    def test_hooks_use_supported_v7_transaction_and_wait_events(self) -> None:
+    def test_hooks_use_supported_v8_transaction_and_wait_events(self) -> None:
         hooks = json.loads(text(HOOKS))["hooks"]
         self.assertEqual(
             set(hooks),
@@ -167,17 +168,17 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("20,000", combined_docs)
         self.assertIn("1 GiB", combined_docs)
         self.assertIn("non-Git", combined_docs)
-        self.assertIn("DEFAULT_MAX_FILES = 20_000", directory)
+        self.assertIn("DEFAULT_MAX_ENTRIES = 20_000", directory)
         self.assertIn("DEFAULT_MAX_BYTES = 1024 * 1024 * 1024", directory)
         self.assertNotIn('subprocess.run(["git", "init"', runtime)
 
-    def test_current_protocol_is_v7_and_runtime_route_is_static_and_network_free(self) -> None:
+    def test_current_protocol_is_v8_and_runtime_route_is_static_and_network_free(self) -> None:
         packet = text(PLUGIN / "scripts" / "packet_compiler.py")
         routing = text(PLUGIN / "scripts" / "routing_catalog.py")
         graph = text(PLUGIN / "scripts" / "graph_compiler.py")
-        self.assertIn('PROTOCOL = "cco.v7"', packet)
+        self.assertIn('PROTOCOL = "cco.v8"', packet)
         self.assertIn('ROUTE_PLAN_PROTOCOL = "cco.route-plan.v5"', routing)
-        self.assertIn('GRAPH_PROTOCOL = "cco.graph.v4"', graph)
+        self.assertIn('GRAPH_PROTOCOL = "cco.graph.v5"', graph)
         self.assertIn('DISPATCH_BATCH_PROTOCOL = "cco.dispatch-batch.v2"', graph)
         for forbidden in (
             "urllib.request",
@@ -252,6 +253,8 @@ class ProjectContractTests(unittest.TestCase):
             "SECURITY.md",
             "docs/BENCHMARK.md",
             "docs/OPERATIONS.md",
+            "benchmarks/cco_benchmark.py",
+            "benchmarks/manifests/featurebench-pilot-v1.json",
             ".github/ISSUE_TEMPLATE/bug_report.yml",
             ".github/ISSUE_TEMPLATE/feature_request.yml",
         ):
@@ -259,10 +262,10 @@ class ProjectContractTests(unittest.TestCase):
 
     def test_skill_reference_links_resolve(self) -> None:
         contents = text(SKILL)
-        for filename in ("runtime-gates.md", "contracts-v7.md"):
+        for filename in ("runtime-gates.md", "contracts-v8.md"):
             self.assertTrue((REFERENCES / filename).is_file())
             self.assertIn(f"references/{filename}", contents)
-        self.assertFalse((REFERENCES / "contracts-v6.md").exists())
+        self.assertFalse((REFERENCES / "contracts-v7.md").exists())
 
     def test_repository_reachable_history_has_one_root_without_author_restrictions(self) -> None:
         roots = subprocess.check_output(

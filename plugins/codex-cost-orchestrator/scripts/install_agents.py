@@ -38,7 +38,7 @@ PROFILE_AGENT_NAMES = {
     "write": "cost_orchestrator_write_leaf",
 }
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "1.2.2"
+PLUGIN_VERSION = "1.3.0"
 REQUIRED_HOOK_EVENTS = Counter(
     {
         "sessionStart": 1,
@@ -56,6 +56,8 @@ LEGACY_PROFILE_SHA256 = {
             "61429cc3b87befab48353b6a9c8203a364a04dc2e6ddfafa0be61ef03c75af68",
             # Published 1.1.3 model-neutral read leaf.
             "c88e3ca0b09f3fe25219f0d219c207519899ef15b3015d982f73e10288baa7a0",
+            # Published 1.2.2 cco.v7 read leaf.
+            "b19664ff37c7977bdf7cbc2e3158e56d1f99b7add41fb7501def4023c08af6e1",
         }
     ),
     "codex-cost-orchestrator-write-leaf.toml": frozenset(
@@ -64,6 +66,8 @@ LEGACY_PROFILE_SHA256 = {
             "e3759c8092e929e6f1dbde98a08b9b3a2f003304ed244531aa1ea6cd9c1415f1",
             # Published 1.1.3 model-neutral write leaf.
             "3d00f207cafc8e4eba5434349edddbd7672a570cad4884f5e6c51eb5de2b4611",
+            # Published 1.2.2 cco.v7 write leaf.
+            "55aa043d3c572c9c80664bd7c5a3b5e45c717f1e0cbe72e6dc241749d44491d6",
         }
     ),
     "codex-cost-orchestrator-routine-worker.toml": frozenset(

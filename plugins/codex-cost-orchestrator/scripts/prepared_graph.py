@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persist and verify one compact cco.v7 prepared-workspace artifact."""
+"""Persist and verify one compact cco.v8 prepared-workspace artifact."""
 
 from __future__ import annotations
 
@@ -41,13 +41,9 @@ from workspace_state import (
 )
 
 
-ARTIFACT_PROTOCOL = "cco.prepared-workspace.v3"
-GRAPH_PROTOCOL = "cco.graph.v4"
-LEGACY_GRAPH_PROTOCOL = "cco.graph.v3"
-GRAPH_DOMAINS = {
-    GRAPH_PROTOCOL: b"cco.graph.v4\0",
-    LEGACY_GRAPH_PROTOCOL: b"cco.graph.v3\0",
-}
+ARTIFACT_PROTOCOL = "cco.prepared-workspace.v4"
+GRAPH_PROTOCOL = "cco.graph.v5"
+GRAPH_DOMAINS = {GRAPH_PROTOCOL: b"cco.graph.v5\0"}
 MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_ROUTE_BINDINGS = 4
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -223,6 +219,13 @@ def _manifest_header(value: Mapping[str, Any]) -> tuple[str, str | None]:
         raise PreparedGraphError("prepared graph route plan identity is invalid")
     if value.get("workspace_mode") not in {"light", "strict"}:
         raise PreparedGraphError("prepared graph workspace mode is invalid")
+    workspace_root = value.get("workspace_root")
+    if (
+        not isinstance(workspace_root, str)
+        or not Path(workspace_root).is_absolute()
+        or os.path.normpath(workspace_root) != workspace_root
+    ):
+        raise PreparedGraphError("prepared graph workspace root is invalid")
     return str(baseline), route_plan_sha256
 
 
@@ -325,19 +328,17 @@ def _manifest(value: object) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise PreparedGraphError("prepared graph manifest is malformed")
     protocol = value.get("protocol")
-    legacy_fields = {
+    fields = {
         "baseline",
+        "completed_nodes",
+        "member_mapping",
         "nodes",
         "protocol",
         "route_plan_sha256",
         "workspace_mode",
+        "workspace_root",
     }
-    v4_fields = legacy_fields | {"completed_nodes", "member_mapping"}
-    if protocol == LEGACY_GRAPH_PROTOCOL and set(value) == legacy_fields:
-        baseline, route_plan_sha256 = _manifest_header(value)
-        selection = False
-        require_child_route = True
-    elif protocol == GRAPH_PROTOCOL and set(value) == v4_fields:
+    if protocol == GRAPH_PROTOCOL and set(value) == fields:
         baseline, route_plan_sha256 = _manifest_header(value)
         selection = True
         require_child_route = False
@@ -367,10 +368,8 @@ def _manifest(value: object) -> dict[str, Any]:
         "protocol": protocol,
         "route_plan_sha256": route_plan_sha256,
         "workspace_mode": value["workspace_mode"],
+        "workspace_root": value["workspace_root"],
     }
-    if not selection:
-        return manifest
-
     completed = value["completed_nodes"]
     if (
         not isinstance(completed, list)
@@ -464,7 +463,13 @@ def normalize_artifact(value: object) -> dict[str, Any]:
     dispatch_baselines = {
         node: str(dispatch_baselines_value[node]) for node in dispatch_nodes
     }
-    if identity != graph_sha256(manifest) or manifest["baseline"] != snapshot["state_id"] or manifest["workspace_mode"] != snapshot_mode:
+    snapshot_root = snapshot.get("root_path", snapshot.get("repo_root"))
+    if (
+        identity != graph_sha256(manifest)
+        or manifest["baseline"] != snapshot["state_id"]
+        or manifest["workspace_mode"] != snapshot_mode
+        or manifest["workspace_root"] != snapshot_root
+    ):
         raise PreparedGraphError("prepared workspace identity is inconsistent")
     return {
         "dispatch_baselines": dispatch_baselines,
@@ -496,8 +501,11 @@ def write_artifact(
         }
     )
     serialized = json.dumps(artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    manifest_root = str(artifact["manifest"]["workspace_root"])
     if artifact["snapshot"].get("backend") == "directory":
         root = directory_root(Path(repo))
+        if str(root) != manifest_root:
+            raise PreparedGraphError("prepared artifact workspace root does not match repository")
         requested = Path(os.path.abspath(Path(output).expanduser()))
         if requested.is_symlink():
             raise PreparedGraphError("prepared artifact must not be a symlink")
@@ -541,7 +549,10 @@ def write_artifact(
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
     else:
-        write_snapshot(repository_root(Path(repo)), output, serialized)
+        root = repository_root(Path(repo))
+        if str(root) != manifest_root:
+            raise PreparedGraphError("prepared artifact workspace root does not match repository")
+        write_snapshot(root, output, serialized)
     return artifact
 
 
@@ -588,6 +599,7 @@ def dispatch_workspace_claim(*, ledger_root: Path, session_id: str, capsule: Map
     decision = node["decision"]
     if (
         artifact["graph_sha256"] != identity
+        or capsule.get("workspace_root") != manifest.get("workspace_root")
         or artifact["dispatch_baselines"].get(str(capsule.get("node")))
         != capsule.get("baseline")
         or len(route_match) != 1
@@ -611,6 +623,8 @@ def dispatch_workspace_claim(*, ledger_root: Path, session_id: str, capsule: Map
             raise PreparedGraphError("prepared workspace repository does not match dispatch")
         workspace_backend = "git"
         workspace_mode = str(snapshot["ignored_mode"])
+    if str(root) != manifest["workspace_root"] or str(root) != capsule["workspace_root"]:
+        raise PreparedGraphError("prepared workspace root does not match dispatch")
     return {
         "baseline": snapshot["state_id"],
         "baseline_path": str(path),
@@ -634,10 +648,14 @@ def verify_artifact_workspace(path: Path, *, repo: Path, baseline: str, graph_sh
         raise PreparedGraphError("ledger workspace identity does not match artifact")
     if snapshot.get("backend") == "directory":
         try:
+            if str(directory_root(Path(repo))) != manifest["workspace_root"]:
+                raise PreparedGraphError("ledger workspace root does not match artifact")
             return verify_directory_state(repo, snapshot, allowed_scopes=scopes)
         except DirectoryStateError as error:
             raise PreparedGraphError(f"directory workspace verification is invalid: {error}") from error
     root = repository_root(Path(repo))
+    if str(root) != manifest["workspace_root"]:
+        raise PreparedGraphError("ledger workspace root does not match artifact")
     control_roots = repository_control_roots(root)
     index_records = repository_index_records(root)
     gitlinks = repository_gitlinks(root, index_records)

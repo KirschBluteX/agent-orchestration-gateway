@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict v7 dispatch gate with one explicit native-bypass marker."""
+"""Strict v8 dispatch gate with one explicit native-bypass marker."""
 
 from __future__ import annotations
 
@@ -33,15 +33,15 @@ CONTINUATION_FIELDS = frozenset({"message", "target"})
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 PROTECTED_TOKEN = re.compile(r"^gAAAA[A-Za-z0-9_-]{80,}={0,2}$")
-DISPATCH_HEADER = "CCO_DISPATCH cco.v7"
+DISPATCH_HEADER = "CCO_DISPATCH cco.v8"
 READ_ROLE = "cost_orchestrator_read_leaf"
 WRITE_ROLE = "cost_orchestrator_write_leaf"
 BYPASS_HEADER = "CCO_NATIVE_BYPASS v1"
-OLD_HEADER = "CCO_DISPATCH cco.v6"
+OLD_HEADERS = ("CCO_DISPATCH cco.v6", "CCO_DISPATCH cco.v7")
 
 
 class PacketError(ValueError):
-    """Native arguments do not match a canonical v7 capsule."""
+    """Native arguments do not match a canonical v8 capsule."""
 
 
 def _transaction_module() -> Any:
@@ -109,38 +109,54 @@ def _bypass_outcome(tool_input: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_protected_payload_text(message: object) -> bool:
-    """Reject opaque host payloads that were copied into a plain-string tool field."""
+    """Reject opaque payloads across host objects and repeated JSON wrapping."""
 
-    if not isinstance(message, str):
-        return False
-    stripped = message.strip()
-    if PROTECTED_TOKEN.fullmatch(stripped) is not None:
-        return True
-    if not stripped.startswith(("{", "[")):
-        return False
-    try:
-        value = json.loads(stripped)
-    except json.JSONDecodeError:
-        return False
+    seen: set[int] = set()
+    visited = 0
 
-    def protected(item: object) -> bool:
+    def protected(item: object, *, depth: int = 0) -> bool:
+        nonlocal visited
+        visited += 1
+        if visited > 10_000 or depth > 32:
+            return True
+        if isinstance(item, str):
+            stripped = item.strip()
+            if PROTECTED_TOKEN.fullmatch(stripped) is not None:
+                return True
+            if depth >= 4 or not stripped.startswith(("{", "[", '"')):
+                return False
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                return False
+            if decoded == item:
+                return False
+            return protected(decoded, depth=depth + 1)
         if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen:
+                return False
+            seen.add(identity)
             encrypted = item.get("encrypted_content")
             if isinstance(encrypted, str) and encrypted and (
                 item.get("type") in {"encrypted_content", "reasoning"}
                 or PROTECTED_TOKEN.fullmatch(encrypted.strip()) is not None
             ):
                 return True
-            return any(protected(child) for child in item.values())
+            return any(protected(child, depth=depth + 1) for child in item.values())
         if isinstance(item, list):
-            return any(protected(child) for child in item)
+            identity = id(item)
+            if identity in seen:
+                return False
+            seen.add(identity)
+            return any(protected(child, depth=depth + 1) for child in item)
         return False
 
-    return protected(value)
+    return protected(message)
 
 
 def _expanded_reference_outcome(payload: dict[str, Any]) -> dict[str, Any]:
-    """Turn one persisted exact v2 ref into the canonical native v7 input."""
+    """Turn one persisted exact v2 ref into the canonical native v8 input."""
 
     transaction = _transaction_module()
     ledger = _ledger_module()
@@ -189,7 +205,7 @@ def _pending_transaction_outcome(payload: dict[str, Any]) -> dict[str, Any]:
 
 def validate_dispatch(tool_input: object) -> dict[str, Any]:
     if not isinstance(tool_input, dict) or set(tool_input) != SPAWN_FIELDS:
-        raise PacketError("v7 native spawn shape is invalid")
+        raise PacketError("v8 native spawn shape is invalid")
     capsule = _packet_module().parse_message(tool_input.get("message"))
     expected_role = WRITE_ROLE if capsule["role"] == "worker" else READ_ROLE
     expected = {
@@ -201,15 +217,15 @@ def validate_dispatch(tool_input: object) -> dict[str, Any]:
     }
     for field, value in expected.items():
         if tool_input.get(field) != value:
-            raise PacketError(f"v7 native {field} does not match capsule")
+            raise PacketError(f"v8 native {field} does not match capsule")
     if capsule["execution"]["cursor"] != 0:
         raise PacketError("spawn requires an initial cursor")
     return capsule
 
 
-def validate_v7_continuation(tool_input: object) -> dict[str, Any]:
+def validate_v8_continuation(tool_input: object) -> dict[str, Any]:
     if not isinstance(tool_input, dict) or set(tool_input) != CONTINUATION_FIELDS:
-        raise PacketError("v7 continuation shape is invalid")
+        raise PacketError("v8 continuation shape is invalid")
     capsule = _packet_module().parse_message(tool_input.get("message"))
     target = tool_input.get("target")
     if (
@@ -218,7 +234,7 @@ def validate_v7_continuation(tool_input: object) -> dict[str, Any]:
         or TASK_PATH.fullmatch(target) is None
         or target != "/root/" + capsule["execution"]["task_name"]
     ):
-        raise PacketError("v7 continuation target or cursor is invalid")
+        raise PacketError("v8 continuation target or cursor is invalid")
     return capsule
 
 
@@ -237,9 +253,9 @@ def evaluate(value: object) -> dict[str, Any]:
         try:
             pending = transaction.has_pending_transaction(value)
         except transaction.DispatchTransactionError as error:
-            # Older direct-v7 callers/tests have no host session identity.  The
+            # Older direct-capsule callers/tests have no host session identity.  The
             # host always supplies one for transaction enforcement; a v2 ref is
-            # still fail-closed below because it cannot be a direct v7 packet.
+            # still fail-closed below because it cannot be a direct v8 packet.
             if isinstance(value.get("session_id"), str):
                 return block_outcome(error, code="CCO_TRANSACTION_STATE")
             pending = False
@@ -253,7 +269,7 @@ def evaluate(value: object) -> dict[str, Any]:
             message = tool_input.get("message")
             if isinstance(message, str) and message.startswith(BYPASS_HEADER):
                 return _bypass_outcome(tool_input)
-            if isinstance(message, str) and message.startswith(OLD_HEADER):
+            if isinstance(message, str) and message.startswith(OLD_HEADERS):
                 return block_outcome(
                     code="CCO_OLD_TASK_REQUIRES_NEW_TASK",
                 )
@@ -261,7 +277,7 @@ def evaluate(value: object) -> dict[str, Any]:
                 return block_outcome(
                     code="CCO_REQUIRED",
                     error=PacketError(
-                        "prepare the spawn through cco.v7 or use the user-authorized CCO_NATIVE_BYPASS v1 marker"
+                        "prepare the spawn through cco.v8 or use the user-authorized CCO_NATIVE_BYPASS v1 marker"
                     ),
                 )
             capsule = validate_dispatch(tool_input)
@@ -285,7 +301,7 @@ def evaluate(value: object) -> dict[str, Any]:
                     code="CCO_PROTECTED_MESSAGE",
                 )
             if isinstance(message, str) and message.startswith(DISPATCH_HEADER):
-                capsule = validate_v7_continuation(tool_input)
+                capsule = validate_v8_continuation(tool_input)
                 _ledger_module().preflight_continuation(value, capsule)
                 return {}
             # Native-bypass owners are unmanaged. Managed owners still fail closed.

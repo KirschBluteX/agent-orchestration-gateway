@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -13,7 +14,25 @@ sys.path[:0] = [str(HOOKS), str(SCRIPTS)]
 import agent_preflight  # noqa: E402
 
 
-class V7PreflightTests(unittest.TestCase):
+class V8PreflightTests(unittest.TestCase):
+    def test_nested_and_twice_encoded_protected_payloads_are_blocked(self) -> None:
+        token = "gAAAA" + "A" * 96
+        messages: list[object] = [
+            [{"type": "reasoning", "encrypted_content": token}],
+            json.dumps(json.dumps({"type": "reasoning", "encrypted_content": token})),
+        ]
+        for index, message in enumerate(messages):
+            with self.subTest(index=index):
+                outcome = agent_preflight.evaluate(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "tool_input": {"message": message, "target": "/root/unmanaged"},
+                        "tool_name": "send_message",
+                    }
+                )
+                self.assertEqual(outcome["decision"], "block")
+                self.assertIn("CCO_PROTECTED_MESSAGE", outcome["reason"])
+
     def test_raw_spawn_is_blocked_and_explicit_bypass_is_stripped(self) -> None:
         raw = {
             "agent_type": "explorer",
@@ -51,21 +70,23 @@ class V7PreflightTests(unittest.TestCase):
             "hook_event_name": "PreToolUse",
             "tool_name": "spawn_agent",
         }
-        old = agent_preflight.evaluate(
-            {
-                **base,
-                "tool_input": {
-                    "agent_type": "cost_orchestrator_write_leaf",
-                    "fork_turns": "none",
-                    "message": "CCO_DISPATCH cco.v6\nlegacy",
-                    "model": "gpt-5.6-luna",
-                    "reasoning_effort": "max",
-                    "task_name": "worker_legacy_g01",
-                },
-            }
-        )
-        self.assertEqual(old["decision"], "block")
-        self.assertIn("CCO_OLD_TASK_REQUIRES_NEW_TASK", old["reason"])
+        for protocol in ("cco.v6", "cco.v7"):
+            with self.subTest(protocol=protocol):
+                old = agent_preflight.evaluate(
+                    {
+                        **base,
+                        "tool_input": {
+                            "agent_type": "cost_orchestrator_write_leaf",
+                            "fork_turns": "none",
+                            "message": f"CCO_DISPATCH {protocol}\nlegacy",
+                            "model": "gpt-5.6-luna",
+                            "reasoning_effort": "max",
+                            "task_name": "worker_legacy_g01",
+                        },
+                    }
+                )
+                self.assertEqual(old["decision"], "block")
+                self.assertIn("CCO_OLD_TASK_REQUIRES_NEW_TASK", old["reason"])
 
         malformed = agent_preflight.evaluate(
             {

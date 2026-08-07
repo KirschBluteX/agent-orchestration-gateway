@@ -5,7 +5,7 @@
 | Dimension | Current support |
 | --- | --- |
 | Host | Codex CLI/Desktop with plugins, hooks, and native Agents |
-| Tested Codex contract | CLI 0.146.0; Desktop build 26.730.8199.0 |
+| Tested Codex contract | Desktop build 26.803.5235.0; CLI 0.146.0 catalogue fallback |
 | Operating system | Windows and Linux |
 | macOS | Not currently tested or claimed |
 | Python | 3.11+; CI exercises 3.11 and 3.14 |
@@ -58,14 +58,17 @@ Both CCO leaf profiles are model-neutral. The compiler sends the selected model 
 effort explicitly on native spawn, so Luna does not require a dedicated profile. The
 graph compiler accepts host capability metadata to avoid a CLI round trip. If it
 is absent, CCO reads the PATH Codex bundled catalogue once for that preparation. It
-does not contact a model or network service. The actual native spawn response remains
-the final capability evidence.
+does not contact a model or network service. Desktop catalogues may mark eligible
+models with `visibility: "list"`; hidden, disabled, and unknown visibility values are
+ignored. The actual native spawn response remains the final capability evidence.
 
 ## Fast dispatch sequence
 
 1. Close the complete graph from facts already present in the user request and known
    repository policy. If one material fact is missing, use one narrow explorer.
-2. Put shared facts in graph `defaults` and invoke `graph_compiler.py` once.
+2. Put shared facts in graph `defaults` and invoke `graph_compiler.py` once. A ready
+   batch admits at most one write worker; non-overlapping read-only nodes may share
+   the batch.
    A terminal worker can be handed to a reviewer with `review_source`; the compiler
    reuses its ledger baseline, acceptance IDs, scopes, changed paths, and evidence.
 3. Issue every ready short spawn reference in the same Primary model turn. No other
@@ -119,6 +122,24 @@ The state root defaults to the OS temporary directory under
 location. Do not manually delete state belonging to an active task; a Desktop
 restart performs the safe `host_restart` retirement at `SessionStart`.
 
+`compact` is not a host restart: it preserves confirmed active owners. On
+`startup`, `resume`, or `clear` (and on older hosts without a reliable source), CCO
+uses restart reconciliation and fences active/dispatching children. This prevents
+normal context compaction from killing valid work while still clearing stale Desktop
+state after a real restart.
+
+Every cco.v8 graph and capsule binds one canonical absolute `workspace_root`. The
+artifact, transaction, TaskLedger claim, continuation, and result verification must
+all use that same root; host cwd is never substituted.
+
+## Git workspaces
+
+Git status and control-state checks remain repository-wide. Content fingerprints are
+scope-bounded, while ignored files are captured globally within configured file/byte
+budgets so a new out-of-scope ignored write is still attributable. Scoped
+`skip-worktree` and `assume-unchanged` entries are fingerprinted explicitly. Budget
+overflow fails closed rather than silently weakening workspace verification.
+
 ## Non-Git directory workspaces
 
 CCO does not run `git init`. If the exact target root is not a Git worktree, the
@@ -127,7 +148,7 @@ prepared-workspace adapter uses directory mode:
 - explorer and reviewer snapshots cover only their declared scopes and accept no
   change;
 - worker snapshots cover the complete root, while only its declared scope may change;
-- path/type/size preflight is limited to 20,000 files and 1 GiB by default and runs
+- path/type/size preflight is limited to 20,000 entries and 1 GiB by default and runs
   before any file content is read; the workspace-scanning PreToolUse hook allows 30
   seconds while its ordinary no-transaction path remains a lightweight fast exit;
 - symlinks, junctions/reparse points, special files, case-insensitive aliases, root
@@ -139,6 +160,10 @@ An over-budget workspace returns the prepared batch to Primary. It is never sile
 filtered, including for `node_modules` or other large dependency trees. If a ready
 batch contains any worker, the shared directory baseline covers the complete root;
 CCO does not keep read-only siblings by weakening that batch to a partial baseline.
+
+Python 3.14 reads Codex `.jsonl.zst` rollouts with the standard library. Python
+3.11–3.13 need the optional `zstandard` package only when inspecting compressed
+rollouts; ordinary routing and execution do not require it.
 
 ## Reviewer delta baseline
 
@@ -201,21 +226,23 @@ The optional maintenance CLI is outside every Hook and is read-only by default. 
 close active child work, then inspect proof-backed stale CCO edges:
 
 ```text
-python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --check
+python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --ledger-root <CCO_LEDGER_DIR> --check
 ```
 
 Repair only the exact parent and children you reviewed. Repeat `--child-thread-id`
 for each selected child:
 
 ```text
-python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID> --repair
+python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --ledger-root <CCO_LEDGER_DIR> --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID> --repair
 ```
 
 Repair is allowed only when the host row, CCO role, canonical Agent path, first
 `session_meta`, parent/child identities, and final `task_complete` event all agree.
-Before writing, the tool creates a consistent backup below
-`~/.codex/backups/cco-host-edge-repair/`, acquires a database write transaction, and
-revalidates every requested child. Any missing, changed, duplicated, non-CCO, or
-unproven child fails the entire command. Restart Codex Desktop afterward so its task
-list reloads the corrected edge state. Do not use this command for a genuinely active
+Before writing, the tool creates a minimal rollback journal (parent/child IDs and
+prior status only) below `~/.codex/backups/cco-host-edge-repair/`, acquires a database
+write transaction, and revalidates every requested child. Any missing, changed,
+duplicated, non-CCO, or unproven child fails the entire command. The journal is
+permission-restricted where the host allows it, and only the newest three journals
+for a state database are retained. Restart Codex Desktop afterward so its task list
+reloads the corrected edge state. Do not use this command for a genuinely active
 Agent or as an automatic SessionStart action.

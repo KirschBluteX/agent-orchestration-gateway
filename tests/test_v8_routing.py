@@ -48,7 +48,7 @@ def native_catalog() -> dict[str, object]:
     }
 
 
-class V7RoutingTests(unittest.TestCase):
+class V8RoutingTests(unittest.TestCase):
     def test_plan_is_bound_by_node_role_and_assurance(self) -> None:
         plan = resolve_route_plan(
             [
@@ -292,6 +292,79 @@ class V7RoutingTests(unittest.TestCase):
             }
         )
         self.assertEqual(records, [{"effort": "max", "model": "gpt-5.6-luna"}])
+
+    def test_native_catalog_matches_0147_visible_non_disabled_leaf_semantics(self) -> None:
+        records = native_capability_records(
+            {
+                "models": [
+                    {
+                        "multi_agent_version": "v1",
+                        "show_in_picker": True,
+                        "slug": "legacy-visible",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                    {
+                        "hidden": False,
+                        "multi_agent_version": "v2",
+                        "slug": "current-visible",
+                        "supported_reasoning_levels": [{"effort": "xhigh"}],
+                    },
+                    {
+                        "multi_agent_version": "v2",
+                        "show_in_picker": False,
+                        "slug": "hidden-model",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                    {
+                        "multi_agent_version": "disabled",
+                        "show_in_picker": True,
+                        "slug": "disabled-model",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                    {
+                        "disabled": True,
+                        "multi_agent_version": "v2",
+                        "slug": "explicitly-disabled",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                    {
+                        "multi_agent_version": "future",
+                        "show_in_picker": True,
+                        "slug": "unknown-version",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                    },
+                ]
+            }
+        )
+        self.assertEqual(
+            records,
+            [
+                {"effort": "xhigh", "model": "current-visible"},
+                {"effort": "max", "model": "legacy-visible"},
+            ],
+        )
+
+    def test_native_catalog_accepts_desktop_list_visibility_and_rejects_unknown_values(self) -> None:
+        records = native_capability_records(
+            {
+                "models": [
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "desktop-listed",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                        "visibility": "list",
+                    },
+                    {
+                        "multi_agent_version": "v2",
+                        "slug": "future-visibility",
+                        "supported_reasoning_levels": [{"effort": "max"}],
+                        "visibility": "future",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(records, [{"effort": "max", "model": "desktop-listed"}])
 
     def test_trusted_project_policy_overrides_global_policy_without_silent_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

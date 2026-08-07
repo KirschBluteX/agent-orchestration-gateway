@@ -63,7 +63,96 @@ def no_risks() -> dict[str, str]:
     }
 
 
-class V7PrepareTests(unittest.TestCase):
+def closed_node(name: str, path: str) -> dict[str, object]:
+    return {
+        "acceptance_facts": {
+            "acceptance_ids": ["A01"],
+            "deterministic_graph_coverage": ["A01"],
+            "events": [],
+            "required_verification_strengths": ["deterministic"],
+            "risk_assessment": no_risks(),
+        },
+        "closure": {
+            "acceptance_closed": True,
+            "criteria_closed": True,
+            "decision_space": "acceptance_equivalent",
+            "interfaces_closed": True,
+            "objective_closed": True,
+            "ownership_closed": True,
+        },
+        "contract": {"contract_rev": 1, "node": name, "task": "bounded edit"},
+        "generation": 1,
+        "node": name,
+        "placement": {
+            "benefits": [
+                {"evidence": ["independent file"], "kind": "parallel_ready"}
+            ],
+            "direct_action_count": 2,
+            "direct_verification_count": 1,
+        },
+        "role": "worker",
+        "scopes": [{"kind": "exact", "path": path}],
+        "selection": {"depends_on": [], "responsibility": name},
+    }
+
+
+class V8PrepareTests(unittest.TestCase):
+    def test_prepared_graph_and_capsule_bind_the_canonical_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "owned.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "owned.txt"], cwd=repo, check=True)
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "v8-workspace-root"}):
+                prepared = prepare_dispatch_graph(
+                    [closed_node("n01_worker", "owned.txt")],
+                    native_capacity=1,
+                    native_catalog=native_catalog(),
+                    repo=repo,
+                )
+
+        expected_root = str(repo.resolve())
+        capsule = parse_message(prepared["dispatches"][0]["message"])
+        self.assertEqual(prepared["manifest"]["workspace_root"], expected_root)
+        self.assertEqual(capsule["workspace_root"], expected_root)
+
+    def test_compiler_normalizes_scope_order_but_rejects_overlapping_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "one.txt").write_text("one\n", encoding="utf-8")
+            (repo / "two.txt").write_text("two\n", encoding="utf-8")
+            base = closed_node("n01_worker", "one.txt")
+            base["scopes"] = [
+                {"kind": "exact", "path": "two.txt"},
+                {"kind": "exact", "path": "one.txt"},
+            ]
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "v8-scope-order"}):
+                prepared = prepare_dispatch_graph(
+                    [base], native_capacity=1, native_catalog=native_catalog(), repo=repo
+                )
+            self.assertEqual(
+                parse_message(prepared["dispatches"][0]["message"])["scopes"],
+                [
+                    {"kind": "exact", "path": "one.txt"},
+                    {"kind": "exact", "path": "two.txt"},
+                ],
+            )
+            overlapping = dict(base)
+            overlapping["scopes"] = [
+                {"kind": "prefix", "path": "src"},
+                {"kind": "exact", "path": "src/file.py"},
+            ]
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "v8-scope-overlap"}):
+                with self.assertRaises(GraphCompilerError):
+                    prepare_dispatch_graph(
+                        [overlapping], native_capacity=1, native_catalog=native_catalog(), repo=repo
+                    )
+
     def test_valid_graph_resolves_static_routes_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -277,7 +366,7 @@ class V7PrepareTests(unittest.TestCase):
         self.assertEqual(row["route"]["rank"], 2)
         self.assertEqual(row["owner"], fallback_owner)
 
-    def test_single_entry_prepares_static_route_and_v7_capsule(self) -> None:
+    def test_single_entry_prepares_static_route_and_v8_capsule(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = root / "repo"
@@ -378,11 +467,11 @@ class V7PrepareTests(unittest.TestCase):
                 )
                 row = ledger.read_rows()[0]
 
-        self.assertEqual(prepared["protocol"], "cco.prepared-graph.v3")
+        self.assertEqual(prepared["protocol"], "cco.prepared-graph.v4")
         self.assertEqual(len(prepared["dispatches"]), 1)
         native = prepared["dispatches"][0]
         capsule = parse_message(native["message"])
-        self.assertEqual(capsule["protocol"], "cco.v7")
+        self.assertEqual(capsule["protocol"], "cco.v8")
         self.assertEqual(capsule["role"], "worker")
         self.assertEqual(capsule["assurance"], "mechanical")
         self.assertEqual(capsule["acceptance_ids"], ["A01"])
@@ -812,8 +901,8 @@ class V7PrepareTests(unittest.TestCase):
             {"kind": "exact", "path": "first.txt"},
             {"kind": "exact", "path": "second.txt"},
         ])
-        self.assertEqual(prepared["protocol"], "cco.prepared-graph.v3")
-        self.assertEqual(prepared["manifest"]["protocol"], "cco.graph.v4")
+        self.assertEqual(prepared["protocol"], "cco.prepared-graph.v4")
+        self.assertEqual(prepared["manifest"]["protocol"], "cco.graph.v5")
         self.assertEqual(compact_dispatch_batch(prepared)["protocol"], "cco.dispatch-batch.v2")
         with self.assertRaisesRegex(GraphCompilerError, "prepared graph is malformed"):
             compact_dispatch_batch({**prepared, "protocol": "cco.prepared-graph.v2"})

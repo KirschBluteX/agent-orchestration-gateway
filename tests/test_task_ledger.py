@@ -182,6 +182,34 @@ class TaskLedgerTests(unittest.TestCase):
             )
             self.assertNotIn("review_seed", ledger.read_rows()[0])
 
+    def test_incomplete_continue_and_terra_interrupt_both_set_a_guarded_floor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owner = "/root/worker_n01_worker_g01"
+            continued = TaskLedger(root, "continued")
+            continued.reserve("spawn", identity(model="gpt-5.6-terra"))
+            continued.activate("spawn", owner)
+            continued.record_result(
+                node="n01_worker",
+                contract_rev=1,
+                run="worker_n01_worker_g01",
+                generation=1,
+                input_sha256="sha256:" + "b" * 64,
+                owner=owner,
+                disposition="continuable",
+                require_guarded=True,
+            )
+            continued.retire(owner)
+            with self.assertRaisesRegex(LedgerConflict, "guarded assurance"):
+                continued.reserve("retry", identity(generation=2, model="gpt-5.6-terra"))
+
+            interrupted = TaskLedger(root, "interrupted")
+            interrupted.reserve("spawn", identity(model="gpt-5.6-terra"))
+            interrupted.activate("spawn", owner)
+            self.assertTrue(interrupted.retire_if_present(owner))
+            with self.assertRaisesRegex(LedgerConflict, "guarded assurance"):
+                interrupted.reserve("retry", identity(generation=2, model="gpt-5.6-terra"))
+
     def test_retired_and_superseded_owners_remain_fenced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger = TaskLedger(Path(directory), "session-a")

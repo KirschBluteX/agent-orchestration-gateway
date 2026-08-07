@@ -11,6 +11,8 @@ import re
 import sys
 from typing import Any
 
+from rollout_io import RolloutError, iter_records, matching_rollouts
+
 
 THREAD_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -65,15 +67,11 @@ def one_consistent(
 def read_session_metadata(path: Path) -> dict[str, Any] | None:
     """Read only far enough to identify one rollout during path resolution."""
     try:
-        with path.open(encoding="utf-8") as rollout:
-            for line in rollout:
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise InspectionError("rollout contains a non-object record")
-                payload = value.get("payload")
-                if value.get("type") == "session_meta" and isinstance(payload, dict):
-                    return payload
-    except (OSError, json.JSONDecodeError) as error:
+        for value in iter_records(path):
+            payload = value.get("payload")
+            if value.get("type") == "session_meta" and isinstance(payload, dict):
+                return payload
+    except RolloutError as error:
         raise InspectionError("rollout is unavailable or invalid") from error
     return None
 
@@ -82,7 +80,7 @@ def resolve_rollout(
     sessions_dir: Path, target: str, parent_thread_id: str | None
 ) -> tuple[str, Path]:
     if THREAD_ID_PATTERN.fullmatch(target) is not None:
-        matches = list(sessions_dir.rglob(f"rollout-*-{target}.jsonl"))
+        matches = matching_rollouts(sessions_dir, target)
         if len(matches) != 1:
             raise InspectionError("expected exactly one rollout for the requested thread")
         return target, matches[0]
@@ -95,7 +93,11 @@ def resolve_rollout(
         raise InspectionError("canonical task path requires a lowercase parent thread UUID")
 
     matches: list[tuple[str, Path]] = []
-    for rollout_path in sessions_dir.rglob("rollout-*.jsonl"):
+    rollout_paths = [
+        *sessions_dir.rglob("rollout-*.jsonl"),
+        *sessions_dir.rglob("rollout-*.jsonl.zst"),
+    ]
+    for rollout_path in sorted(set(rollout_paths), key=str):
         try:
             session = read_session_metadata(rollout_path)
         except InspectionError:
@@ -126,19 +128,15 @@ def inspect(
     sessions: list[dict[str, Any]] = []
     turns: list[dict[str, Any]] = []
     try:
-        with rollout_path.open(encoding="utf-8") as rollout:
-            for line in rollout:
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise InspectionError("rollout contains a non-object record")
-                payload = record.get("payload")
-                if not isinstance(payload, dict):
-                    continue
-                if record.get("type") == "session_meta":
-                    sessions.append(payload)
-                elif record.get("type") == "turn_context":
-                    turns.append(payload)
-    except (OSError, json.JSONDecodeError) as error:
+        for record in iter_records(rollout_path):
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if record.get("type") == "session_meta":
+                sessions.append(payload)
+            elif record.get("type") == "turn_context":
+                turns.append(payload)
+    except RolloutError as error:
         raise InspectionError("rollout is unavailable or invalid") from error
     if len(sessions) != 1 or not turns:
         raise InspectionError("missing or ambiguous routing metadata")

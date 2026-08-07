@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a compact CCO v7 result and fence stale owners."""
+"""Validate a compact CCO v8 result and fence stale owners."""
 
 from __future__ import annotations
 

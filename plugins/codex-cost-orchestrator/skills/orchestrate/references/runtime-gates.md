@@ -1,4 +1,4 @@
-# CCO v7 runtime gates
+# CCO v8 runtime gates
 
 ## Install, trust, and profile health
 
@@ -22,15 +22,18 @@ never writes trust state and never uses `--dangerously-bypass-hook-trust`.
 
 Start a new Codex task after plugin/profile changes. SessionStart injects one compact
 mandatory-dispatch reminder. PreToolUse remains the mechanical enforcement point.
-The 1.2 release contract was exercised with Codex CLI 0.146.0; an updated desktop or
-CLI host is required when an older host rejects a model that its catalogue lists.
+The 1.3 release contract was exercised with Codex Desktop 26.803.5235.0 and retains
+Codex CLI 0.146.0 only as a catalogue fallback. Current host capability metadata is
+authoritative when available; an older fallback CLI must not hide a model supported
+by the active Desktop.
 
 ## Native capability and route health
 
 Use capability metadata exposed by the active host when available. The PATH Codex CLI
 bundled catalogue is only a fallback. An entry is eligible only when it explicitly
-advertises native multi-Agent v1 or v2 plus the selected reasoning effort. The actual
-spawn response remains final evidence.
+advertises native multi-Agent v1 or v2, a recognized visible/listed state, and the
+selected reasoning effort. Unknown visibility values, hidden entries, and disabled
+entries fail closed. The actual spawn response remains final evidence.
 
 The two physical leaf profiles intentionally do not pin a model or effort. CCO passes
 the selected model and effort explicitly on each native spawn, which preserves user
@@ -98,10 +101,15 @@ strict whole-repository content inspection. Path aliases, reparses, junctions, a
 submodules remain protected. Ignored scans fail closed above the configured file/byte
 bounds.
 
+Every v8 capsule binds the canonical absolute workspace root captured by the graph.
+The graph artifact, dispatch transaction, TaskLedger claim, continuation, and result
+verification must resolve to that exact root. Leaves use the capsule root rather than
+host cwd and return blocked without touching the workspace if it is unavailable.
+
 For an exact non-Git root, CCO never initializes Git. Explorer and reviewer capture
 only declared scopes and must leave them unchanged. Worker capture covers the complete
 root so scope-external writes remain visible. A path/type/size preflight defaults to
-20,000 files and 1 GiB and happens before content hashing. The workspace-scanning
+20,000 entries and 1 GiB and happens before content hashing. The workspace-scanning
 PreToolUse hook has a 30-second bound; its ordinary no-transaction path still exits
 before loading the workspace runtime. Over-budget roots return to
 Primary; no directory such as `node_modules` is silently ignored. Reparse points,

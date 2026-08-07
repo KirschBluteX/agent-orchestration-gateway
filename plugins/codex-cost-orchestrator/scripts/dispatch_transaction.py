@@ -3,7 +3,7 @@
 
 The transaction is intentionally only a crash-safe gate around Codex's native
 Agent tool.  It never starts, schedules, polls, or waits for an agent itself.
-Full v7 spawn inputs live briefly in immutable files outside the repository;
+Full v8 spawn inputs live briefly in immutable files outside the repository;
 the durable state file contains only hashes, native argument metadata, and the
 small lifecycle cursor needed by hooks.
 """
@@ -26,6 +26,12 @@ from packet_compiler import parse_message
 from protocol_hash import ProtocolHashError, canonical_bytes, require_repository_scope
 from workspace_state import StateError, repository_root
 from directory_state import DirectoryStateError, directory_root
+from state_lock import (
+    StateLockBusy,
+    acquire as acquire_state_lock,
+    is_locked as state_lock_is_held,
+    lock_path as state_lock_path,
+)
 
 from prepared_graph import (
     graph_scopes,
@@ -63,8 +69,6 @@ NODE_STATES = frozenset(
     {"prepared", "dispatching", "active", "rejected", "exhausted", "fenced", "terminal"}
 )
 TRANSACTION_STATES = NODE_STATES - {"exhausted"}
-_LOCK_WAIT_SECONDS = 0.25
-_STALE_LOCK_SECONDS = 60.0
 _MAX_STATE_BYTES = 4 * 1024 * 1024
 _MAX_BUNDLE_BYTES = 2 * 1024 * 1024
 _MAX_TRANSACTIONS = 32
@@ -197,7 +201,7 @@ def _state_path(root: Path, session_id: str) -> Path:
 
 
 def _lock_path(root: Path, session_id: str) -> Path:
-    return root / f".{session_id}.dispatch-transactions.lock"
+    return state_lock_path(root, session_id)
 
 
 def bundle_path(ledger_root: Path, session_id: str, transaction_id: str, spawn_ref: str) -> Path:
@@ -244,29 +248,11 @@ def _write_atomic(path: Path, value: Mapping[str, Any]) -> None:
 
 @contextmanager
 def _lock(root: Path, session_id: str) -> Iterator[None]:
-    root.mkdir(parents=True, exist_ok=True)
-    lock = _lock_path(root, session_id)
-    deadline = time.monotonic() + _LOCK_WAIT_SECONDS
-    descriptor: int | None = None
-    while descriptor is None:
-        try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-        except FileExistsError:
-            try:
-                if time.time() - lock.stat().st_mtime > _STALE_LOCK_SECONDS:
-                    lock.unlink(missing_ok=True)
-                    continue
-            except FileNotFoundError:
-                continue
-            if time.monotonic() >= deadline:
-                raise DispatchTransactionBusy("transaction lock acquisition timed out")
-            time.sleep(0.01)
-    os.close(descriptor)
     try:
-        yield
-    finally:
-        lock.unlink(missing_ok=True)
+        with acquire_state_lock(root, session_id):
+            yield
+    except StateLockBusy as error:
+        raise DispatchTransactionBusy("transaction lock acquisition timed out") from error
 
 
 def _empty_document(session_id: str) -> dict[str, Any]:
@@ -312,7 +298,21 @@ def _write_document(root: Path, session_id: str, document: Mapping[str, Any]) ->
     transactions = document.get("transactions")
     if not isinstance(transactions, Mapping) or len(transactions) > _MAX_TRANSACTIONS:
         raise DispatchTransactionError("transaction state capacity is exhausted")
-    _write_atomic(_state_path(root, session_id), document)
+    # Full dispatch state is disposable once every native call has settled.  The
+    # TaskLedger retains the small owner tombstone for late-result fencing; keeping
+    # a second terminal graph here only increases hook work and stale-card risk.
+    mutable = dict(document)
+    mutable_transactions = dict(transactions)
+    for transaction_id, raw in list(mutable_transactions.items()):
+        transaction = _validate_transaction(str(transaction_id), raw)
+        if _transaction_settled(transaction):
+            _remove_transaction_bundles(root, session_id, transaction)
+            del mutable_transactions[transaction_id]
+    mutable["transactions"] = mutable_transactions
+    if not mutable_transactions:
+        _state_path(root, session_id).unlink(missing_ok=True)
+        return
+    _write_atomic(_state_path(root, session_id), mutable)
 
 
 def _prune_terminal_transactions(
@@ -609,7 +609,7 @@ def _canonical_dispatch(value: object, *, batch: Mapping[str, Any], fallback: bo
     try:
         capsule = parse_message(dispatch["message"])
     except Exception as error:
-        raise DispatchTransactionError("prepared native dispatch is not a canonical v7 input") from error
+        raise DispatchTransactionError("prepared native dispatch is not a canonical v8 input") from error
     if capsule["graph_sha256"] != batch["graph_sha256"]:
         raise DispatchTransactionError("prepared native dispatch does not match its graph identity")
     expected_agent_type = (
@@ -625,7 +625,7 @@ def _canonical_dispatch(value: object, *, batch: Mapping[str, Any], fallback: bo
         "task_name": capsule["execution"]["task_name"],
     }
     if any(dispatch[name] != expected[name] for name in expected):
-        raise DispatchTransactionError("prepared native dispatch fields do not match its v7 capsule")
+        raise DispatchTransactionError("prepared native dispatch fields do not match its v8 capsule")
     route = capsule["route"]
     return {
         "agent_type": dispatch["agent_type"],
@@ -770,6 +770,19 @@ def _transaction_pending(transaction: Mapping[str, Any]) -> bool:
         or (node["state"] == "rejected" and node["eligible_ref"] is not None)
         for node in transaction["nodes"].values()
     )
+
+
+def _transaction_settled(transaction: Mapping[str, Any]) -> bool:
+    """Whether no late native call can still refer to this transaction."""
+
+    return transaction["state"] in {"terminal", "fenced"} and all(
+        node["state"] in {"terminal", "fenced", "exhausted", "rejected"}
+        and node.get("owner") is None
+        and node.get("call_id") is None
+        and node.get("dispatch_ref") is None
+        and node.get("eligible_ref") is None
+        for node in transaction["nodes"].values()
+    ) and not _transaction_pending(transaction)
 
 
 def graph_has_live_transaction(
@@ -965,6 +978,10 @@ def prepare_dispatch_batch(
                 empty[name] = deepcopy(batch[name])
         return empty
     artifact = load_artifact(Path(str(batch["baseline_path"])))
+    if artifact["manifest"].get("workspace_root") != str(resolved_repo):
+        raise DispatchTransactionError(
+            "prepared batch workspace root does not match its repository"
+        )
     if artifact["snapshot"]["state_id"] != batch["baseline"]:
         raise DispatchTransactionError(
             "prepared batch workspace baseline does not match its artifact"
@@ -976,6 +993,13 @@ def prepare_dispatch_batch(
     ):
         raise DispatchTransactionError(
             "prepared native dispatch baseline does not match its artifact"
+        )
+    if any(
+        candidate["capsule"].get("workspace_root") != str(resolved_repo)
+        for candidate in raw_candidates
+    ):
+        raise DispatchTransactionError(
+            "prepared native dispatch workspace root does not match its transaction"
         )
     transaction_id = _transaction_identity(
         session_id=session,
@@ -1183,7 +1207,7 @@ def _fence_transaction(
                 ):
                     candidate["state"] = "fenced"
             # Retain one tiny call/ref tombstone for a late PostToolUse.  Clearing
-            # it would let the host's updated full v7 input fall through to the
+            # it would let the host's updated full v8 input fall through to the
             # legacy activation branch after an exact abort or Stop fence.
             if not was_dispatching:
                 node["call_id"] = None
@@ -1216,12 +1240,13 @@ def abort_pending_transaction(payload: Mapping[str, Any], transaction_id: str) -
         _cleanup_settled_bundles(root, session, transaction)
 
 
-def retire_active_for_host_restart(payload: Mapping[str, Any]) -> list[str]:
-    """Fence active native owners when the Desktop host restarts."""
+def retire_for_host_restart(payload: Mapping[str, Any]) -> dict[str, list[str]]:
+    """Idempotently fence every dispatch that cannot survive a host restart."""
 
     session = _session(payload.get("session_id"))
     root = ledger_root_for_payload(payload)
     retired: set[str] = set()
+    graphs: set[str] = set()
     settled: list[dict[str, Any]] = []
     with _lock(root, session):
         document = _read_document(root, session)
@@ -1229,10 +1254,11 @@ def retire_active_for_host_restart(payload: Mapping[str, Any]) -> list[str]:
         for transaction_id, raw in document["transactions"].items():
             transaction = _validate_transaction(transaction_id, raw)
             if not any(
-                node["state"] in {"active", "dispatching"}
+                node["state"] in {"prepared", "rejected", "dispatching", "active"}
                 for node in transaction["nodes"].values()
             ):
                 continue
+            graphs.add(str(transaction["graph_sha256"]))
             retired.update(
                 node["owner"]
                 for node in transaction["nodes"].values()
@@ -1246,7 +1272,13 @@ def retire_active_for_host_restart(payload: Mapping[str, Any]) -> list[str]:
             _write_document(root, session, document)
             for transaction in settled:
                 _cleanup_settled_bundles(root, session, transaction)
-    return sorted(retired)
+    return {"graphs": sorted(graphs), "owners": sorted(retired)}
+
+
+def retire_active_for_host_restart(payload: Mapping[str, Any]) -> list[str]:
+    """Compatibility wrapper for callers that only need retired owners."""
+
+    return retire_for_host_restart(payload)["owners"]
 
 
 def _fail_graph(root: Path, session_id: str, document: dict[str, Any], transaction: dict[str, Any]) -> None:
@@ -1299,7 +1331,11 @@ def claim_spawn_reference(payload: Mapping[str, Any]) -> dict[str, Any]:
             _workspace_verdict(transaction, repo, pending_node=node_name)
             dispatch = _read_bundle(root, session, transaction_id, candidate, expected_node=node_name)
             capsule = parse_message(dispatch["message"])
-            if capsule["node"] != node_name or capsule["capsule_sha256"] not in dispatch["message"]:
+            if (
+                capsule["node"] != node_name
+                or capsule["capsule_sha256"] not in dispatch["message"]
+                or capsule["workspace_root"] != transaction["repo"]
+            ):
                 raise DispatchTransactionError("transaction bundle capsule is inconsistent")
         except Exception as error:
             _fail_graph(root, session, document, transaction)
@@ -1628,20 +1664,12 @@ def cleanup_stale_dispatch_state(
                 continue
             if session_id == keep:
                 continue
-            lock = _lock_path(root, session_id)
             try:
                 expired = now - state.lstat().st_mtime > max_age_seconds
             except OSError:
                 protected_sessions.add(session_id)
                 continue
-            lock_fresh = False
-            if lock.exists() or lock.is_symlink():
-                try:
-                    lock_fresh = (
-                        now - lock.lstat().st_mtime <= _STALE_LOCK_SECONDS
-                    )
-                except OSError:
-                    lock_fresh = True
+            lock_fresh = state_lock_is_held(root, session_id)
             if lock_fresh or not expired:
                 protected_sessions.add(session_id)
                 try:

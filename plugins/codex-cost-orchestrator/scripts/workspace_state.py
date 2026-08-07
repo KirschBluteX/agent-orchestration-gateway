@@ -512,6 +512,31 @@ def repository_index_records(root: Path) -> dict[str, list[dict[str, str]]]:
     return index_records
 
 
+def repository_status_hidden_paths(root: Path) -> frozenset[str]:
+    """Return tracked paths whose worktree content Git status may suppress.
+
+    ``git ls-files -v`` uses the normal ``H`` tag for ordinary cached paths,
+    ``S`` for skip-worktree, and a lowercase tag when assume-unchanged is set.
+    Fingerprinting the non-``H`` set closes the typed-scope blind spot without
+    hashing every tracked file in a large repository.
+    """
+
+    raw = git(root, "ls-files", "-v", "-z")
+    hidden: set[str] = set()
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            marker, raw_path = record.split(b" ", 1)
+        except ValueError as error:
+            raise StateError("unexpected Git visibility record") from error
+        if len(marker) != 1:
+            raise StateError("unexpected Git visibility marker")
+        if marker != b"H":
+            hidden.add(decode_path(raw_path))
+    return frozenset(hidden)
+
+
 def repository_gitlinks(
     root: Path,
     index_records: dict[str, list[dict[str, str]]] | None = None,
@@ -562,10 +587,15 @@ def tracked_entries(
         repository_index_records(root) if index_records is None else index_records
     )
     entries: dict[str, dict[str, Any]] = {}
+    status_hidden = repository_status_hidden_paths(root) if scopes is not None else frozenset()
     selected_records = (
         index_records
         if scopes is None
-        else {path: records for path, records in index_records.items() if is_allowed(path, scopes)}
+        else {
+            path: records
+            for path, records in index_records.items()
+            if is_allowed(path, scopes) or path in status_hidden
+        }
     )
     for path, records in sorted(selected_records.items()):
         ordered_records = sorted(
@@ -633,7 +663,10 @@ def workspace_entries(
             root,
             max_files=ignored_max_files,
             max_bytes=ignored_max_bytes,
-            scopes=normalized_scopes,
+            # Git status cannot reveal ignored changes outside typed scopes.
+            # Capture the bounded ignored set globally so "writes only in scope"
+            # remains an exact promise rather than a heuristic.
+            scopes=None,
         )
         if ignored_mode == "strict" or normalized_scopes is not None
         else {}

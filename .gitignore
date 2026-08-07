@@ -20,3 +20,6 @@ routing-state-v2.json
 radar-lkg-v1.*.tmp
 routing-state-v2.*.tmp
 routing-v1.lock
+benchmarks/runs/
+benchmarks/results/
+benchmarks/.cache/

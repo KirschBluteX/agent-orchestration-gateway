@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small transactional v7 owner cursor with terminal tombstones."""
+"""Small transactional v8 owner cursor with terminal tombstones."""
 
 from __future__ import annotations
 
@@ -12,6 +12,13 @@ import re
 import tempfile
 import time
 from typing import Any, Iterator, Mapping
+
+from state_lock import (
+    StateLockBusy,
+    acquire as acquire_state_lock,
+    is_locked as state_lock_is_held,
+    lock_path as state_lock_path,
+)
 
 
 class LedgerConflict(RuntimeError):
@@ -37,8 +44,6 @@ _EPOCH = re.compile(r"^e[0-9]{2,}$")
 _RETIRE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _POSITIVE_INTEGER = re.compile(r"^[1-9][0-9]*$")
 _WORKSPACE_FIELDS = frozenset({"baseline", "baseline_path", "graph_scopes", "graph_sha256", "repo", "scopes", "workspace_backend", "workspace_mode"})
-_LOCK_WAIT_SECONDS = 0.25
-_STALE_LOCK_SECONDS = 60.0
 _MAX_REVIEW_SEED_BYTES = 64 * 1024
 
 
@@ -50,32 +55,16 @@ class TaskLedger:
             raise ValueError("session_id is invalid")
         self.root = Path(root)
         self.path = self.root / f"{session_id}.json"
-        self.lock_path = self.root / f".{session_id}.lock"
+        self.session_id = session_id
+        self.lock_path = state_lock_path(self.root, session_id)
 
     @contextmanager
     def _lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + _LOCK_WAIT_SECONDS
-        descriptor: int | None = None
-        while descriptor is None:
-            try:
-                descriptor = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-            except FileExistsError:
-                try:
-                    if time.time() - self.lock_path.stat().st_mtime > _STALE_LOCK_SECONDS:
-                        self.lock_path.unlink(missing_ok=True)
-                        continue
-                except FileNotFoundError:
-                    continue
-                if time.monotonic() >= deadline:
-                    raise LedgerBusy("ledger lock acquisition timed out")
-                time.sleep(0.01)
-        os.close(descriptor)
         try:
-            yield
-        finally:
-            self.lock_path.unlink(missing_ok=True)
+            with acquire_state_lock(self.root, self.session_id):
+                yield
+        except StateLockBusy as error:
+            raise LedgerBusy("ledger lock acquisition timed out") from error
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -375,7 +364,7 @@ class TaskLedger:
             row.pop("_pending", None)
             row.pop("review_seed", None)
             self._fence_owner(document, owner)
-            self._set_guarded_floor(document, row)
+            self._set_guarded_floor(document, row, force=True)
             self._write(document)
             return self._public(row)
 
@@ -398,7 +387,7 @@ class TaskLedger:
             row.pop("_pending", None)
             row.pop("review_seed", None)
             self._fence_owner(document, owner)
-            self._set_guarded_floor(document, row)
+            self._set_guarded_floor(document, row, force=True)
             self._write(document)
             return True
 
@@ -499,9 +488,11 @@ class TaskLedger:
                 row["review_seed"] = normalized_seed
             else:
                 row.pop("review_seed", None)
+            if require_guarded:
+                self._set_guarded_floor(document, row, force=True)
             if disposition == "retired":
                 self._fence_owner(document, owner)
-                self._set_guarded_floor(document, row, force=require_guarded)
+                self._set_guarded_floor(document, row)
             self._write(document)
             return self._public(row)
 
@@ -590,7 +581,6 @@ class TaskLedger:
         for candidate in directory.glob("*.json"):
             if candidate.stem == keep_session_id or candidate.stem.startswith("."):
                 continue
-            lock = directory / f".{candidate.stem}.lock"
             try:
                 age = now - candidate.stat().st_mtime
             except FileNotFoundError:
@@ -606,7 +596,7 @@ class TaskLedger:
             except (OSError, ValueError):
                 live = True
             expired = age > (live_threshold if live else max_age_seconds)
-            if expired and not lock.exists():
+            if expired and not state_lock_is_held(directory, candidate.stem):
                 candidate.unlink(missing_ok=True)
                 removed.append(candidate)
         return sorted(removed, key=lambda path: path.name)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v7 lifecycle adapter: reserve, fence, verify, and retain tiny tombstones."""
+"""v8 lifecycle adapter: reserve, fence, verify, and retain tiny tombstones."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ from dispatch_transaction import (  # noqa: E402
     fence_spawn_call,
     graph_has_live_transaction,
     repository_for_owner,
-    retire_active_for_host_restart,
+    retire_for_host_restart as retire_dispatch_for_host_restart,
     retire_owner as retire_transaction_owner,
     session_has_live_transaction,
     settle_spawn_rejection,
@@ -54,6 +54,9 @@ from dispatch_transaction import (  # noqa: E402
 )
 from protocol_hash import canonical_bytes, repository_scopes_overlap  # noqa: E402
 from task_ledger import LedgerBusy, LedgerConflict, TaskLedger  # noqa: E402
+from state_lock import acquire as acquire_state_lock  # noqa: E402
+from host_paths import HostPathError, host_path, is_within  # noqa: E402
+from rollout_io import RolloutError, first_record, is_rollout_path  # noqa: E402
 from workspace_state import StateError, repository_root  # noqa: E402
 
 
@@ -65,12 +68,12 @@ TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 TASK_NAME = re.compile(
     r"^(?:(?:explorer|worker)_[a-z0-9][a-z0-9_]*_g[0-9]{2,}|review_e[0-9]{2,}_[a-z0-9][a-z0-9_]*_g[0-9]{2,})$"
 )
-V7_HEADER = "CCO_DISPATCH cco.v7"
+V8_HEADER = "CCO_DISPATCH cco.v8"
 TERMINAL_STALE_SECONDS = 24 * 60 * 60
 LIVE_STALE_SECONDS = 7 * TERMINAL_STALE_SECONDS
 REVIEW_SEED_MAX_BYTES = 64 * 1024
 SESSION_CONTEXT = (
-    "CCO is mandatory for every native Agent spawn. Prepare one closed cco.v7 "
+    "CCO is mandatory for every native Agent spawn. Prepare one closed cco.v8 "
     "graph before dispatch. Only an explicit user-authorized CCO_NATIVE_BYPASS v1 "
     "may use native inheritance. CCO leaves never delegate. After dispatch, wait for "
     "a native terminal, blocking-input, or user event; never forward opaque progress. "
@@ -125,42 +128,39 @@ def ledger_for(payload: Mapping[str, Any]) -> TaskLedger | None:
 def _sessions_root() -> Path:
     configured = os.environ.get("CODEX_HOME")
     codex_home = Path(configured).expanduser() if configured else Path.home() / ".codex"
-    return Path(os.path.abspath(codex_home / "sessions")).resolve()
+    try:
+        return host_path(codex_home / "sessions").resolve()
+    except (HostPathError, OSError) as error:
+        raise LedgerConflict("Codex sessions root is unavailable") from error
 
 
 def _transcript_owner(payload: Mapping[str, Any], agent_id: str) -> str:
     transcript_value = payload.get("agent_transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
         raise LedgerConflict("UUID result has no agent transcript")
-    transcript = Path(os.path.abspath(Path(transcript_value).expanduser()))
+    try:
+        transcript = host_path(transcript_value)
+    except HostPathError as error:
+        raise LedgerConflict("agent transcript path is unsupported") from error
     sessions_root = _sessions_root()
     if _is_reparse(transcript):
         raise LedgerConflict("agent transcript cannot be a reparse point")
     try:
         resolved = transcript.resolve(strict=True)
-        normalized_root = os.path.normcase(str(sessions_root))
-        normalized_transcript = os.path.normcase(str(resolved))
-        if (
-            os.path.commonpath((normalized_root, normalized_transcript))
-            != normalized_root
-        ):
+        if not is_within(sessions_root, resolved):
             raise LedgerConflict("agent transcript is outside the Codex sessions root")
     except (OSError, ValueError) as error:
         if isinstance(error, LedgerConflict):
             raise
         raise LedgerConflict("agent transcript is unavailable") from error
-    if not resolved.name.endswith(f"-{agent_id}.jsonl"):
+    if not is_rollout_path(resolved) or not (
+        resolved.name.endswith(f"-{agent_id}.jsonl")
+        or resolved.name.endswith(f"-{agent_id}.jsonl.zst")
+    ):
         raise LedgerConflict("agent transcript does not match the native thread")
     try:
-        with resolved.open("rb") as stream:
-            line = stream.readline(65_537)
-    except OSError as error:
-        raise LedgerConflict("agent transcript is unavailable") from error
-    if not line or len(line) > 65_536:
-        raise LedgerConflict("agent session metadata is missing or oversized")
-    try:
-        record = json.loads(line.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        record = first_record(resolved)
+    except RolloutError as error:
         raise LedgerConflict("agent session metadata is invalid") from error
     metadata = record.get("payload") if isinstance(record, Mapping) else None
     if record.get("type") != "session_meta" or not isinstance(metadata, Mapping):
@@ -243,6 +243,8 @@ def claim_from_fields(fields: Mapping[str, Any], *, role: str | None = None, wor
         "route": {"assurance": capsule["assurance"], **capsule["route"]},
     }
     if workspace is not None:
+        if capsule["workspace_root"] != workspace.get("repo"):
+            raise LedgerConflict("capsule workspace root does not match prepared workspace")
         claim.update({
             "baseline": workspace.get("baseline"),
             "baseline_path": workspace.get("baseline_path"),
@@ -312,7 +314,7 @@ def _native_rejection(value: Any) -> bool:
 
 def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
     # A v2 reference was expanded during PreToolUse.  PostToolUse may expose the
-    # original ref or the updated v7 input, so the exact call id is authoritative.
+    # original ref or the updated v8 input, so the exact call id is authoritative.
     transaction_claim = None
     if isinstance(payload.get("session_id"), str):
         try:
@@ -371,7 +373,7 @@ def postflight_spawn(payload: Mapping[str, Any]) -> dict[str, str]:
             pass
         return {"decision": "block", "reason": "CCO transaction spawn did not expose its exact native owner"}
     tool_input = payload.get("tool_input")
-    if not isinstance(tool_input, Mapping) or not isinstance(tool_input.get("message"), str) or not tool_input["message"].startswith(V7_HEADER):
+    if not isinstance(tool_input, Mapping) or not isinstance(tool_input.get("message"), str) or not tool_input["message"].startswith(V8_HEADER):
         return {}
     ledger = ledger_for(payload)
     call_id = payload.get("tool_use_id")
@@ -400,7 +402,7 @@ def preflight_continuation(payload: Mapping[str, Any], fields: Mapping[str, Any]
     target = tool_input.get("target")
     if fields is None:
         if ledger.is_managed_owner(target):
-            raise LedgerConflict("managed CCO owner requires a v7 continuation capsule")
+            raise LedgerConflict("managed CCO owner requires a v8 continuation capsule")
         return
     call_id = payload.get("tool_use_id")
     if not isinstance(target, str) or not isinstance(call_id, str):
@@ -505,7 +507,7 @@ def retire_invalid_subagent_stop(payload: Mapping[str, Any]) -> None:
 
     ledger = ledger_for(payload)
     if ledger is None or not ledger.path.exists():
-        raise LedgerConflict("v7 result has no live dispatch ledger")
+        raise LedgerConflict("v8 result has no live dispatch ledger")
     owner = _result_owner(payload)
     row = ledger.retire_after_invalid_stop(owner)
     retire_transaction_owner(payload, owner, fenced=True)
@@ -516,14 +518,14 @@ def accept_subagent_result(payload: Mapping[str, Any], fields: Mapping[str, Any]
     ledger = ledger_for(payload)
     parsed = fields or parse_result_message(payload.get("last_assistant_message"))
     if ledger is None or not ledger.path.exists():
-        raise LedgerConflict("v7 result has no live dispatch ledger")
+        raise LedgerConflict("v8 result has no live dispatch ledger")
     owner = _result_owner(payload)
     rows = [row for row in ledger.read_rows() if row.get("owner") == owner and row.get("input_sha256") == parsed.get("dispatch_sha256")]
     if len(rows) != 1:
-        raise LedgerConflict("v7 result dispatch identity is stale")
+        raise LedgerConflict("v8 result dispatch identity is stale")
     row = rows[0]
     if row.get("state") not in {"owned", "continuable"}:
-        raise LedgerConflict("v7 result dispatch identity is stale")
+        raise LedgerConflict("v8 result dispatch identity is stale")
     physical = payload.get("agent_type")
     expected_physical = "cost_orchestrator_write_leaf" if row["role"] == "worker" else READ_ROLE
     if physical != expected_physical:
@@ -641,12 +643,24 @@ def start_task(payload: Mapping[str, Any]) -> dict[str, Any]:
     ledger = ledger_for(payload)
     if ledger is not None:
         session_id = str(payload.get("session_id"))
-        retired_owners = set(ledger.retire_for_host_restart())
-        retired_owners.update(retire_active_for_host_restart(payload))
-        if retired_owners:
-            for row in ledger.read_rows():
-                if row.get("owner") in retired_owners and row.get("state") == "retired":
-                    _cleanup_terminal_graph_artifact(ledger, payload, row)
+        source = payload.get("source")
+        if source not in {None, "startup", "resume", "clear", "compact"}:
+            raise LedgerConflict("SessionStart source is unsupported")
+        if source != "compact":
+            # Both stores share this OS-backed lock.  A crash can still occur
+            # between file replacements, so the transition is deliberately
+            # idempotent and is repeated on the next non-compact SessionStart.
+            with acquire_state_lock(ledger.root, session_id):
+                retired_owners = set(ledger.retire_for_host_restart())
+                dispatch_recovery = retire_dispatch_for_host_restart(payload)
+                retired_owners.update(dispatch_recovery["owners"])
+            for graph_identity in dispatch_recovery["graphs"]:
+                if not graph_has_live_transaction(payload, graph_identity):
+                    cleanup_graph_artifact(ledger.root, session_id, graph_identity)
+            if retired_owners:
+                for row in ledger.read_rows():
+                    if row.get("owner") in retired_owners and row.get("state") == "retired":
+                        _cleanup_terminal_graph_artifact(ledger, payload, row)
         cleanup_terminal_prior_sessions(
             ledger.root,
             keep_session_id=session_id,

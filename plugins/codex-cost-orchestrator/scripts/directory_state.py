@@ -20,11 +20,11 @@ from protocol_hash import (
 )
 
 
-SCHEMA = "cco.directory-state.v1"
+SCHEMA = "cco.directory-state.v2"
 CAPTURE_MODES = frozenset({"full", "scope"})
-DEFAULT_MAX_FILES = 20_000
+DEFAULT_MAX_ENTRIES = 20_000
 DEFAULT_MAX_BYTES = 1024 * 1024 * 1024
-_DOMAIN = b"cco.directory-state.v1\0"
+_DOMAIN = b"cco.directory-state.v2\0"
 _SNAPSHOT_FIELDS = frozenset(
     {
         "backend",
@@ -187,11 +187,44 @@ def _inspect_entry(path: Path, relative: str) -> tuple[dict[str, Any], tuple[Any
     raise DirectoryStateError(f"directory entry has an unsupported type: {relative}")
 
 
-def _walk_tree(root: Path, start: Path, relative: str) -> list[tuple[dict[str, Any], tuple[Any, ...], Path | None]]:
+def _append_with_budget(
+    found: list[tuple[dict[str, Any], tuple[Any, ...], Path | None]],
+    item: tuple[dict[str, Any], tuple[Any, ...], Path | None],
+    *,
+    max_entries: int,
+    max_bytes: int,
+    totals: dict[str, int],
+) -> None:
+    totals["entries"] += 1
+    if item[0]["kind"] == "file":
+        totals["bytes"] += int(item[0]["size"])
+    if totals["entries"] > max_entries or totals["bytes"] > max_bytes:
+        raise DirectoryBudgetError(
+            "directory snapshot exceeds the configured entry or byte budget"
+        )
+    found.append(item)
+
+
+def _walk_tree(
+    root: Path,
+    start: Path,
+    relative: str,
+    *,
+    found: list[tuple[dict[str, Any], tuple[Any, ...], Path | None]],
+    max_entries: int,
+    max_bytes: int,
+    totals: dict[str, int],
+) -> None:
     record, token = _inspect_entry(start, relative)
-    found = [(record, token, start if record["kind"] == "file" else None)]
+    _append_with_budget(
+        found,
+        (record, token, start if record["kind"] == "file" else None),
+        max_entries=max_entries,
+        max_bytes=max_bytes,
+        totals=totals,
+    )
     if record["kind"] != "directory":
-        return found
+        return
     stack: list[tuple[Path, str]] = [(start, relative)]
     while stack:
         current, prefix = stack.pop()
@@ -200,47 +233,78 @@ def _walk_tree(root: Path, start: Path, relative: str) -> list[tuple[dict[str, A
             child = current / name
             child_relative = _canonical_child_path(f"{prefix}/{name}" if prefix else name)
             child_record, child_token = _inspect_entry(child, child_relative)
-            found.append(
+            _append_with_budget(
+                found,
                 (
                     child_record,
                     child_token,
                     child if child_record["kind"] == "file" else None,
-                )
+                ),
+                max_entries=max_entries,
+                max_bytes=max_bytes,
+                totals=totals,
             )
             if child_record["kind"] == "directory":
                 directories.append((child, child_relative))
         stack.extend(reversed(directories))
-    return found
-
-
 def _enumerate(
     root: Path,
     scopes: list[dict[str, str]],
     capture_mode: str,
+    *,
+    max_entries: int,
+    max_bytes: int,
 ) -> list[tuple[dict[str, Any], tuple[Any, ...], Path | None]]:
     found: list[tuple[dict[str, Any], tuple[Any, ...], Path | None]] = []
+    totals = {"bytes": 0, "entries": 0}
     if capture_mode == "full":
         for name in _child_names(root):
             child = root / name
             relative = _canonical_child_path(name)
-            found.extend(_walk_tree(root, child, relative))
+            _walk_tree(
+                root,
+                child,
+                relative,
+                found=found,
+                max_entries=max_entries,
+                max_bytes=max_bytes,
+                totals=totals,
+            )
     else:
         for scope in scopes:
             target = root / Path(scope["path"])
             if not target.exists() and not target.is_symlink():
-                found.append(
+                _append_with_budget(
+                    found,
                     (
                         {"kind": "missing", "path": scope["path"]},
                         ("missing",),
                         None,
-                    )
+                    ),
+                    max_entries=max_entries,
+                    max_bytes=max_bytes,
+                    totals=totals,
                 )
                 continue
             record, token = _inspect_entry(target, scope["path"])
             if scope["kind"] == "prefix" and record["kind"] == "directory":
-                found.extend(_walk_tree(root, target, scope["path"]))
+                _walk_tree(
+                    root,
+                    target,
+                    scope["path"],
+                    found=found,
+                    max_entries=max_entries,
+                    max_bytes=max_bytes,
+                    totals=totals,
+                )
             else:
-                found.append((record, token, target if record["kind"] == "file" else None))
+                _append_with_budget(
+                    found,
+                    (record, token, target if record["kind"] == "file" else None),
+                    max_entries=max_entries,
+                    max_bytes=max_bytes,
+                    totals=totals,
+                )
 
     unique: dict[str, tuple[dict[str, Any], tuple[Any, ...], Path | None]] = {}
     for item in found:
@@ -252,17 +316,17 @@ def _enumerate(
     return [unique[key] for key in sorted(unique)]
 
 
-def _limits(max_files: int, max_bytes: int) -> dict[str, int]:
+def _limits(max_entries: int, max_bytes: int) -> dict[str, int]:
     if (
-        isinstance(max_files, bool)
-        or not isinstance(max_files, int)
-        or max_files < 1
+        isinstance(max_entries, bool)
+        or not isinstance(max_entries, int)
+        or max_entries < 1
         or isinstance(max_bytes, bool)
         or not isinstance(max_bytes, int)
         or max_bytes < 1
     ):
         raise DirectoryStateError("directory snapshot limits are invalid")
-    return {"max_bytes": max_bytes, "max_files": max_files}
+    return {"max_bytes": max_bytes, "max_entries": max_entries}
 
 
 def _counts(items: list[tuple[dict[str, Any], tuple[Any, ...], Path | None]]) -> tuple[int, int, int]:
@@ -301,7 +365,7 @@ def capture_directory_state(
     *,
     scopes: object,
     capture_mode: str,
-    max_files: int = DEFAULT_MAX_FILES,
+    max_entries: int = DEFAULT_MAX_ENTRIES,
     max_bytes: int = DEFAULT_MAX_BYTES,
     workspace_mode: str = "light",
 ) -> dict[str, Any]:
@@ -316,21 +380,29 @@ def capture_directory_state(
     normalized.sort(key=lambda item: (item["kind"], item["path"]))
     if len({(item["kind"], _case_key(item["path"])) for item in normalized}) != len(normalized):
         raise DirectoryStateError("directory snapshot scopes are duplicated")
-    limits = _limits(max_files, max_bytes)
+    limits = _limits(max_entries, max_bytes)
     root_before = _root_metadata(workspace)
-    first = _enumerate(workspace, normalized, capture_mode)
+    first = _enumerate(
+        workspace,
+        normalized,
+        capture_mode,
+        max_entries=max_entries,
+        max_bytes=max_bytes,
+    )
     file_count, directory_count, total_bytes = _counts(first)
-    if file_count > max_files or total_bytes > max_bytes:
-        raise DirectoryBudgetError(
-            "directory snapshot exceeds the configured file or byte budget"
-        )
     entries: list[dict[str, Any]] = []
     for record, token, path in first:
         item = dict(record)
         if path is not None:
             item["sha256"] = _digest_file(path, token)
         entries.append(item)
-    second = _enumerate(workspace, normalized, capture_mode)
+    second = _enumerate(
+        workspace,
+        normalized,
+        capture_mode,
+        max_entries=max_entries,
+        max_bytes=max_bytes,
+    )
     if [(item[0], item[1]) for item in first] != [(item[0], item[1]) for item in second]:
         raise DirectoryStateError("directory workspace changed during snapshot capture")
     root_after = _root_metadata(workspace)
@@ -376,9 +448,9 @@ def validate_directory_snapshot(value: object) -> dict[str, Any]:
     ):
         raise DirectoryStateError("directory snapshot root is invalid")
     limits = value.get("limits")
-    if not isinstance(limits, Mapping) or set(limits) != {"max_bytes", "max_files"}:
+    if not isinstance(limits, Mapping) or set(limits) != {"max_bytes", "max_entries"}:
         raise DirectoryStateError("directory snapshot limits are malformed")
-    normalized_limits = _limits(limits["max_files"], limits["max_bytes"])
+    normalized_limits = _limits(limits["max_entries"], limits["max_bytes"])
     scopes_value = value.get("scopes")
     try:
         scopes = [require_repository_scope(item, "directory snapshot scope") for item in scopes_value]
@@ -438,7 +510,7 @@ def validate_directory_snapshot(value: object) -> dict[str, Any]:
         value.get("file_count") != file_count
         or value.get("directory_count") != directory_count
         or value.get("total_bytes") != total_bytes
-        or file_count > normalized_limits["max_files"]
+        or len(entries) > normalized_limits["max_entries"]
         or total_bytes > normalized_limits["max_bytes"]
     ):
         raise DirectoryStateError("directory snapshot counts are inconsistent")
@@ -483,7 +555,7 @@ def verify_directory_state(
         workspace,
         scopes=baseline["scopes"],
         capture_mode=baseline["capture_mode"],
-        max_files=baseline["limits"]["max_files"],
+        max_entries=baseline["limits"]["max_entries"],
         max_bytes=baseline["limits"]["max_bytes"],
         workspace_mode=baseline["workspace_mode"],
     )
@@ -532,7 +604,7 @@ def verify_directory_pre_spawn(
         workspace,
         scopes=baseline["scopes"],
         capture_mode=baseline["capture_mode"],
-        max_files=baseline["limits"]["max_files"],
+        max_entries=baseline["limits"]["max_entries"],
         max_bytes=baseline["limits"]["max_bytes"],
         workspace_mode=baseline["workspace_mode"],
     )

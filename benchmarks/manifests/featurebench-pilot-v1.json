@@ -1,0 +1,155 @@
+{
+  "protocol": "cco.benchmark-manifest.v1",
+  "study_id": "featurebench-pilot-v1",
+  "dataset": {
+    "name": "LiberCoders/FeatureBench",
+    "revision": "e99d6efdfe511ea832c1b5735c536129561ec96a",
+    "split": "fast"
+  },
+  "runner": {
+    "name": "FeatureBench",
+    "repository": "https://github.com/LiberCoders/FeatureBench",
+    "revision": "445dcbaec0b2e136061b0acb54e753c0a9f1888e",
+    "version": "0.2.1"
+  },
+  "selection": {
+    "algorithm": "cco.featurebench-stratified-v1",
+    "source_rows": 100,
+    "unique_repositories": true,
+    "rank": "sha256(dataset.revision + ':' + task.id)",
+    "filters": {
+      "files_min": 4,
+      "files_max": 30,
+      "removed_lines_min": 200,
+      "removed_lines_max": 2000,
+      "problem_chars_min": 8000,
+      "problem_chars_max": 70000,
+      "fail_to_pass_min": 1,
+      "pass_to_pass_min": 4
+    },
+    "buckets": {
+      "small": "files 4-7; select 2",
+      "medium": "files 8-15; select 2",
+      "large": "files 16-30; select 2"
+    }
+  },
+  "repetitions": 1,
+  "arms": [
+    {
+      "id": "primary-sol-max",
+      "mode": "primary_only",
+      "primary_model": "gpt-5.6-sol",
+      "primary_effort": "max"
+    },
+    {
+      "id": "cco-static",
+      "mode": "cco_static",
+      "primary_model": "gpt-5.6-sol",
+      "primary_effort": "max"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "mlflow__mlflow.93dab383.test_client.42de781c.lv1",
+      "repo": "mlflow/mlflow",
+      "base_commit": "93dab383a1a3fc9882ebc32283ad2a05d79ff70f",
+      "image": "libercoders/featurebench-specs_mlflow-instance_efffa87e",
+      "partition": "development",
+      "task_sha256": "sha256:817d1f7aa95fe706754c75ba092fb35c90ba4ffa5f14adcfd661810d4e3bd1d7",
+      "acceptance_sha256": "sha256:5172cb2da8bacdf26d6289cde4b30756b408ff1f48f64897215314ed37287e25",
+      "selection": {
+        "bucket": "small",
+        "files": 4,
+        "removed_lines": 213,
+        "problem_chars": 18716,
+        "rank_sha256": "sha256:05b4f98ee013e11bcc68be65ca4ba89ed62a66e1cdfb4417d2372ab0f7d652bb",
+        "source_row": 2
+      }
+    },
+    {
+      "id": "astropy__astropy.b0db0daa.test_basic_rgb.067e927c.lv1",
+      "repo": "astropy/astropy",
+      "base_commit": "b0db0daac6b851596851cb43e5456fb6c916c071",
+      "image": "libercoders/featurebench-specs_astropy-instance_493bb78b",
+      "partition": "development",
+      "task_sha256": "sha256:8042cfd40aa54123b0ad182939f7ffce83e3d85678261a276ff70f051e480aa2",
+      "acceptance_sha256": "sha256:1c4e75f7f90c335cdc2920eb3dffd2cf2f990c424922cb447c21d4968ff269c8",
+      "selection": {
+        "bucket": "small",
+        "files": 4,
+        "removed_lines": 201,
+        "problem_chars": 11638,
+        "rank_sha256": "sha256:18e47d34e8b69e89d5e1fb015f51e682d976b3f085a0a7158766689912c52702",
+        "source_row": 66
+      }
+    },
+    {
+      "id": "pandas-dev__pandas.82fa2715.test_reduction.3ac3b298.lv1",
+      "repo": "pandas-dev/pandas",
+      "base_commit": "82fa27153e5b646ecdb78cfc6ecf3e1750443892",
+      "image": "libercoders/featurebench-specs_pandas-instance_15f634a6",
+      "partition": "development",
+      "task_sha256": "sha256:5c7cdca773d500004d7296a5dae42795c6900cac2cbc85985da234daf57aa59c",
+      "acceptance_sha256": "sha256:ee3c65593dc618cc27374282acf96e23de02954001cb79c6f3d5ffb34b25eea5",
+      "selection": {
+        "bucket": "medium",
+        "files": 11,
+        "removed_lines": 1838,
+        "problem_chars": 56448,
+        "rank_sha256": "sha256:48bc01d37546cc3174d6374ac2c15cb01eba3f7440305eb4bee6e26e2417c266",
+        "source_row": 37
+      }
+    },
+    {
+      "id": "mwaskom__seaborn.7001ebe7.test_distributions.f700676d.lv1",
+      "repo": "mwaskom/seaborn",
+      "base_commit": "7001ebe72423238e99c0434a2ef0a0ebc9cb55c1",
+      "image": "libercoders/featurebench-specs_seaborn-instance_52738fbb",
+      "partition": "development",
+      "task_sha256": "sha256:23617039312104bd8991567ad9a8f0380d45fbc86b5529a290d2a25137282c59",
+      "acceptance_sha256": "sha256:ac2949327589cbb24837295612904abd7929b5bec2ee271a9102c5e49817a2ca",
+      "selection": {
+        "bucket": "medium",
+        "files": 12,
+        "removed_lines": 1174,
+        "problem_chars": 17784,
+        "rank_sha256": "sha256:51bf3e1d6be6ac185ffb04c8176842fb40e79bfaf57c221ddb79bbcc30c1176a",
+        "source_row": 85
+      }
+    },
+    {
+      "id": "pydata__xarray.97f3a746.test_range_index.7b95ba66.lv1",
+      "repo": "pydata/xarray",
+      "base_commit": "97f3a7465a66638f68129581b658853a3992dd89",
+      "image": "libercoders/featurebench-specs_xarray-instance_62de996a",
+      "partition": "development",
+      "task_sha256": "sha256:2e9ffc763916ad0a44579b4ffac5d3be2866452d082729ee8ade5629660fa38f",
+      "acceptance_sha256": "sha256:8853229518edc1fa09cdcdeb574bd0e66073b981e4c79c1bd6970dd38efc88d3",
+      "selection": {
+        "bucket": "large",
+        "files": 22,
+        "removed_lines": 745,
+        "problem_chars": 55112,
+        "rank_sha256": "sha256:0cbcc0c9815d9a4c3757dd824a0ddf58dc220963e8aa5b2718a5062d1338789e",
+        "source_row": 51
+      }
+    },
+    {
+      "id": "sphinx-doc__sphinx.e347e59c.test_build_gettext.2721e644.lv1",
+      "repo": "sphinx-doc/sphinx",
+      "base_commit": "e347e59ccc27a646c974526252e39a63870f6ea3",
+      "image": "libercoders/featurebench-specs_sphinx-instance_6191afb1",
+      "partition": "development",
+      "task_sha256": "sha256:91b92cbc69ec7b4b5c03d9a1d16082a2539d2c4f63db81d0fd17f43c7d3656ac",
+      "acceptance_sha256": "sha256:7d960a19b49f3da2a63a7e4204e879433dce1cc5a6ec48c546d8016981801a5e",
+      "selection": {
+        "bucket": "large",
+        "files": 30,
+        "removed_lines": 781,
+        "problem_chars": 10563,
+        "rank_sha256": "sha256:5838a14a6638a55f244929429206eb102d48d293b9edd53e0416956a63223ef4",
+        "source_row": 93
+      }
+    }
+  ]
+}

@@ -57,6 +57,10 @@ The Primary remains responsible for the overall goal, integration, and final ans
 If a task cannot be split safely or delegation would add overhead, it stays in the
 Primary.
 
+CCO admits at most one write-capable worker per workspace at a time. Independent,
+non-overlapping explorers and reviewers may still run concurrently with that worker,
+so read parallelism is preserved without ambiguous write ownership.
+
 ## Default model routing
 
 CCO uses the first supported route in each row. The current user's explicit model or
@@ -83,8 +87,9 @@ current Codex host does not expose the stronger effort level.
 - Git is optional; it improves workspace change detection when the folder is a Git
   worktree
 
-The published contract has been validated with Codex CLI `0.146.0` and desktop build
-`26.730.8199.0`. Newer hosts may work, but should be checked with `--doctor`.
+The published contract has been validated with Codex Desktop `26.803.5235.0`; PATH
+Codex CLI `0.146.0` remains a capability-catalogue fallback. Other hosts should be
+checked with `--doctor`.
 
 ## Install
 
@@ -155,8 +160,12 @@ A trusted project may add `.codex/cco.toml` with the same route tables. See
 ## Workspace and data boundaries
 
 - Git and non-Git folders are supported; CCO never runs `git init` automatically.
+- Every delegated capsule binds one canonical absolute workspace root. Children do
+  not infer their repository from the task's current directory.
 - Delegated writes are checked against the declared scope. Read-only roles must leave
   their scope unchanged.
+- Git checks include ignored files and scoped `skip-worktree`/`assume-unchanged`
+  paths within bounded scan budgets.
 - Symlinks, junctions/reparse points, ambiguous aliases, special files, and root
   replacement fail closed.
 - Temporary state contains contracts, routes, metadata, and hashes—not source copies,

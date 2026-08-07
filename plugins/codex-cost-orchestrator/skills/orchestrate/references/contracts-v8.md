@@ -1,7 +1,7 @@
-# cco.v7 contract reference
+# cco.v8 contract reference
 
-`cco.v7` is a clean protocol break. A task that still owns a v6 capsule must start a
-new task and prepare a new graph; v6 and v7 owners never share a ledger.
+`cco.v8` is a clean protocol break. A task that still owns a v6 or v7 capsule must
+start a new task and prepare a new graph; older owners never share a v8 ledger.
 
 ## Prepared graph
 
@@ -23,7 +23,7 @@ are derived once for the ready graph; callers never run a per-node model-classif
 request. A one-action context-partition node is child-eligible only with both
 `capsule:self-contained` and `context:history-not-required` evidence. The normal CLI commits a
 `cco.dispatch-batch.v2` transaction and returns only short spawn references;
-`--full` exposes the diagnostic `cco.graph.v4` manifest, full capsules, and route
+`--full` exposes the diagnostic `cco.graph.v5` manifest, full capsules, and route
 plan without committing a transaction. No caller supplies a selected route pair or
 graph hash.
 
@@ -37,7 +37,7 @@ The prepared-workspace layer has two adapters without changing the capsule: `git
 uses Git/control-state identity; `directory` binds the exact non-Git root. Directory
 workers capture the full root, while explorers/reviewers capture declared scopes.
 Directory preparation never runs `git init` and fails before content hashing when the
-default 20,000-file / 1 GiB budget is exceeded.
+default 20,000-entry / 1 GiB budget is exceeded.
 
 ## Dispatch transaction
 
@@ -68,7 +68,7 @@ a plain `send_message` or `followup_task` string.
 The exact wire format is three lines:
 
 ```text
-CCO_DISPATCH cco.v7
+CCO_DISPATCH cco.v8
 CAPSULE_SHA256: sha256:<64 lowercase hex>
 CAPSULE_JSON: <canonical JSON object>
 ```
@@ -76,6 +76,7 @@ CAPSULE_JSON: <canonical JSON object>
 The capsule binds:
 
 - protocol, logical role, assurance, node, generation, optional review epoch;
+- the canonical absolute `workspace_root` captured at graph preparation;
 - acceptance mode/reasons and sorted acceptance IDs;
 - canonical contract and typed scopes;
 - baseline, graph identity, and light/strict/fresh/delta mode;
@@ -105,16 +106,20 @@ an unmanaged native spawn. PreToolUse removes the prefix before Codex sees the t
 ## Continuation
 
 A continuation keeps node, contract, generation, route, baseline, graph, scopes,
-task name, and owner. It changes mode to `delta`, increments cursor by exactly one,
+workspace root, task name, and owner. It changes mode to `delta`, increments cursor by exactly one,
 binds the previous capsule hash, and supplies a non-empty evidence delta. Raw messages
 to a live or fenced CCO owner are rejected.
+
+The capsule `workspace_root` must exactly match the prepared graph artifact and
+dispatch transaction repository. It never comes from a host cwd or SubagentStop
+event. A leaf works from that root or returns blocked if the root is unavailable.
 
 ## Result envelope
 
 The exact wire format is:
 
 ```text
-CCO_RESULT cco.v7
+CCO_RESULT cco.v8
 RESULT_SHA256: sha256:<64 lowercase hex>
 RESULT_JSON: <canonical JSON object>
 ```

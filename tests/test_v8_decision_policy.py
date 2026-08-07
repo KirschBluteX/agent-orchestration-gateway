@@ -37,7 +37,39 @@ def no_risks() -> dict[str, str]:
     }
 
 
-class V7DecisionPolicyTests(unittest.TestCase):
+class V8DecisionPolicyTests(unittest.TestCase):
+    def test_write_workers_are_never_selected_concurrently_even_when_scopes_are_disjoint(self) -> None:
+        selected = select_ready_nodes(
+            [
+                {
+                    "access": "write",
+                    "dependencies_ready": True,
+                    "node": "n01_write",
+                    "responsibility": "edit one",
+                    "scope": [{"kind": "exact", "path": "one.txt"}],
+                    "downstream_count": 0,
+                },
+                {
+                    "access": "write",
+                    "dependencies_ready": True,
+                    "node": "n02_write",
+                    "responsibility": "edit two",
+                    "scope": [{"kind": "exact", "path": "two.txt"}],
+                    "downstream_count": 0,
+                },
+                {
+                    "access": "read",
+                    "dependencies_ready": True,
+                    "node": "n03_read",
+                    "responsibility": "inspect three",
+                    "scope": [{"kind": "exact", "path": "three.txt"}],
+                    "downstream_count": 1,
+                },
+            ],
+            native_capacity=3,
+        )
+        self.assertEqual(selected, ["n01_write", "n03_read"])
+
     def test_mechanical_worker_is_derived_without_purpose_or_judgment(self) -> None:
         decision = derive_node_decision(
             {
@@ -254,7 +286,7 @@ class V7DecisionPolicyTests(unittest.TestCase):
         for index in range(5):
             nodes.append(
                 {
-                    "access": "write",
+                    "access": "write" if index < 2 else "read",
                     "dependencies_ready": True,
                     "downstream_count": 1,
                     "node": f"n{index}",

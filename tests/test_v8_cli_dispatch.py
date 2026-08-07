@@ -32,7 +32,7 @@ def no_risks() -> dict[str, str]:
     }
 
 
-class V7CliDispatchTests(unittest.TestCase):
+class V8CliDispatchTests(unittest.TestCase):
     def test_reviewer_fast_path_reuses_ledger_baseline_scopes_and_result_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -487,7 +487,7 @@ class V7CliDispatchTests(unittest.TestCase):
             self.assertEqual(result["dispatches"], [])
             self.assertEqual(result["primary_nodes"], ["n01_large"])
             self.assertIn(
-                "exceeds the configured file or byte budget",
+                "exceeds the configured entry or byte budget",
                 result["route_errors"]["n01_large"],
             )
             self.assertFalse((workspace / ".git").exists())

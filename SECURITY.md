@@ -39,8 +39,9 @@ full conversation.
 The optional `maintenance/repair_host_edges.py` command is not part of routing or any
 Hook. Its default mode reads only native thread metadata and bounded rollout evidence.
 An explicit `--repair` additionally requires exact parent/child IDs, creates a
-consistent backup, revalidates every requested completed CCO edge under a write
-transaction, and changes only matching `open` edges to `closed`. CCO never performs
+minimal rollback journal containing no conversation or source content, revalidates
+every requested completed CCO edge under a write transaction, and changes only
+matching `open` edges to `closed`. CCO never performs
 this host-state repair automatically.
 
 The default ledger is below the operating-system temporary directory at
@@ -75,8 +76,11 @@ authoritative `hooks/list` result. A host-level failure to launch a hook may fol
 host policy, so Primary exact-state verification remains mandatory.
 
 Worker result paths must equal the real post-baseline delta inside that node's typed
-scopes. Default light Git graphs fingerprint ignored files inside those scopes.
-Non-Git workers capture the complete root with a default 20,000-file / 1 GiB
+scopes. Every cco.v8 capsule binds the exact absolute workspace root used by its
+graph, transaction, and TaskLedger claim; host cwd cannot replace it. Git graphs
+fingerprint ignored files within bounded global budgets and explicitly include scoped
+`skip-worktree` and `assume-unchanged` entries.
+Non-Git workers capture the complete root with a default 20,000-entry / 1 GiB
 preflight; read-only roles capture declared scopes and must finish unchanged. These
 checks reduce accidental scope drift; they cannot prevent a process from writing after
 the check completes.

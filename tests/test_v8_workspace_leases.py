@@ -95,7 +95,48 @@ def node(name: str, path: str) -> dict[str, object]:
     }
 
 
-class V7WorkspaceLeaseTests(unittest.TestCase):
+class V8WorkspaceLeaseTests(unittest.TestCase):
+    def test_scoped_graph_detects_git_hidden_and_ignored_changes_outside_its_scope(self) -> None:
+        for marker in ("--assume-unchanged", "--skip-worktree"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                repo = root / "repo"
+                repo.mkdir()
+                subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+                (repo / "active.txt").write_text("active baseline\n", encoding="utf-8")
+                (repo / "external.txt").write_text("external baseline\n", encoding="utf-8")
+                (repo / ".gitignore").write_text("secret.tmp\n", encoding="utf-8")
+                (repo / "secret.tmp").write_text("secret baseline\n", encoding="utf-8")
+                subprocess.run(["git", "add", "active.txt", "external.txt", ".gitignore"], cwd=repo, check=True)
+                subprocess.run(["git", "update-index", marker, "external.txt"], cwd=repo, check=True)
+                with mock.patch.dict(
+                    os.environ,
+                    {"CCO_LEDGER_DIR": str(root / "ledger"), "CODEX_THREAD_ID": f"v8-hidden-{marker[2:]}"},
+                ):
+                    prepared = prepare_dispatch_graph(
+                        [node("n01_active", "active.txt")],
+                        native_capacity=1,
+                        native_catalog=native_catalog(),
+                        repo=repo,
+                    )
+
+                (repo / "external.txt").write_text("hidden overwrite\n", encoding="utf-8")
+                (repo / "secret.tmp").write_text("ignored overwrite\n", encoding="utf-8")
+                manifest = prepared["manifest"]
+                self.assertIsInstance(manifest, dict)
+                verdict = verify_artifact_workspace(
+                    Path(str(prepared["baseline_path"])),
+                    repo=repo,
+                    baseline=str(prepared["baseline"]),
+                    graph_sha256_value=str(prepared["graph_sha256"]),
+                    graph_scopes_value=graph_scopes(manifest),
+                    workspace_mode=str(manifest["workspace_mode"]),
+                )
+                self.assertEqual(verdict["verdict"], "violation")
+                self.assertEqual(verdict["changed_paths"], ["external.txt", "secret.tmp"])
+                self.assertIn("outside_lease:external.txt", verdict["violations"])
+                self.assertIn("outside_lease:secret.tmp", verdict["violations"])
+
     def prepare(self, root: Path, *, thread_id: str) -> tuple[Path, dict[str, object]]:
         repo = root / "repo"
         repo.mkdir()

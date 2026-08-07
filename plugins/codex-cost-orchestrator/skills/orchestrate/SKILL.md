@@ -4,7 +4,7 @@ description: >-
   Default role-aware router for medium or large Codex analysis, implementation,
   refactoring, fixes, and acceptance. Keeps Primary authoritative, dispatches only
   closed work through native Agents, prefers eligible Luna/Terra static routes, and
-  enforces compact cco.v7 lifecycle and exact-state evidence without runtime network
+  enforces compact cco.v8 lifecycle and exact-state evidence without runtime network
   requests, billing history, or a second Agent runtime.
 ---
 
@@ -15,13 +15,13 @@ owns user intent, unresolved choices, graph conflicts, final integration decisio
 and acceptance. A closed integration patch may be delegated like any other worker
 contract; authority does not move with the patch.
 
-Every ordinary native Agent spawn must use a prepared `cco.v7` request. Only an
+Every ordinary native Agent spawn must use a prepared `cco.v8` request. Only an
 explicit user instruction to use native behavior authorizes a message beginning with
 `CCO_NATIVE_BYPASS v1`; the hook removes that marker before dispatch, and Codex then
 uses native inheritance. Never infer bypass permission.
 
 Read `references/runtime-gates.md` for installation, trust, configuration, capacity,
-or recovery detail. Read `references/contracts-v7.md` before a continuation or an
+or recovery detail. Read `references/contracts-v8.md` before a continuation or an
 independent review. Keep reference prose out of leaf messages.
 
 ## Close, place, route
@@ -180,7 +180,7 @@ dispatch identity; older canonical owner IDs remain compatible. Every valid
 SubagentStop retires the native dispatch transaction. A `continue` disposition keeps
 only the TaskLedger owner continuable for an explicit later delta.
 
-Treat every result as a claim. `CCO_RESULT cco.v7` must cover acceptance IDs, declare
+Treat every result as a claim. `CCO_RESULT cco.v8` must cover acceptance IDs, declare
 exact changed paths, and match the current workspace delta inside that node's scopes.
 Only a complete reviewer may return `accept`; explorer and worker never claim Primary
 acceptance. Large terminal graph artifacts are deleted immediately. Small owner

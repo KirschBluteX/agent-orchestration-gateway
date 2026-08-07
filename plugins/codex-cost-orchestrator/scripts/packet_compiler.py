@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Canonical cco.v7 dispatch, continuation, and result envelopes."""
+"""Canonical cco.v8 dispatch, continuation, and result envelopes."""
 
 from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import os
+from pathlib import Path
 import re
 from typing import Any, Mapping
 
@@ -20,11 +22,11 @@ from protocol_hash import (
 from routing_catalog import RoutingCatalogError, validate_route_pair, validate_route_plan
 
 
-PROTOCOL = "cco.v7"
-DISPATCH_HEADER = "CCO_DISPATCH cco.v7"
-RESULT_HEADER = "CCO_RESULT cco.v7"
-CAPSULE_DOMAIN = b"cco.dispatch-capsule.v7\0"
-RESULT_DOMAIN = b"cco.result-capsule.v7\0"
+PROTOCOL = "cco.v8"
+DISPATCH_HEADER = "CCO_DISPATCH cco.v8"
+RESULT_HEADER = "CCO_RESULT cco.v8"
+CAPSULE_DOMAIN = b"cco.dispatch-capsule.v8\0"
+RESULT_DOMAIN = b"cco.result-capsule.v8\0"
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 NODE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 TASK_NAME = re.compile(r"^[a-z0-9][a-z0-9_]{0,95}$")
@@ -44,7 +46,7 @@ MAX_WIRE_BYTES = 1024 * 1024
 
 
 class CapsuleError(ValueError):
-    """A v7 envelope violates its complete interface."""
+    """A v8 envelope violates its complete interface."""
 
 
 def _text(value: object, label: str) -> str:
@@ -56,6 +58,17 @@ def _text(value: object, label: str) -> str:
 def _sha(value: object, label: str) -> str:
     if not isinstance(value, str) or SHA256.fullmatch(value) is None:
         raise CapsuleError(f"{label} must be a sha256 identity")
+    return value
+
+
+def _workspace_root(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise CapsuleError(f"{label} must be an absolute path")
+    path = Path(value)
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise CapsuleError(f"{label} must be an absolute path")
+    if os.path.normpath(value) != value:
+        raise CapsuleError(f"{label} must be a normalized absolute path")
     return value
 
 
@@ -213,7 +226,7 @@ def normalize_capsule(capsule: object) -> dict[str, Any]:
     required = {
         "acceptance", "acceptance_ids", "assurance", "baseline", "capsule_sha256", "contract",
         "execution", "generation", "graph_sha256", "mode", "node", "role",
-        "route", "scopes", "protocol",
+        "route", "scopes", "protocol", "workspace_root",
     }
     optional = {"current_state", "delta", "epoch", "evidence", "previous_capsule_sha256"}
     if set(value) - (required | optional) or not required <= set(value):
@@ -231,6 +244,7 @@ def normalize_capsule(capsule: object) -> dict[str, Any]:
     generation = _integer(value["generation"], "capsule.generation", minimum=1)
     _sha(value["baseline"], "capsule.baseline")
     _sha(value["graph_sha256"], "capsule.graph_sha256")
+    workspace_root = _workspace_root(value["workspace_root"], "capsule.workspace_root")
     contract = _canonical(value["contract"], "capsule.contract")
     if contract.get("node") != node:
         raise CapsuleError("contract node does not match capsule node")
@@ -300,6 +314,7 @@ def normalize_capsule(capsule: object) -> dict[str, Any]:
             "role": role,
             "route": route,
             "scopes": scopes,
+            "workspace_root": workspace_root,
         }
     )
     if capsule_sha256(normalized) != declared:
@@ -329,11 +344,11 @@ def _route_from_plan(plan_value: object, *, node: str, role: str, assurance: str
 
 
 def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
-    """Compile one v7 native spawn request from a prepared node."""
+    """Compile one v8 native spawn request from a prepared node."""
 
     required = {
         "acceptance", "acceptance_ids", "assurance", "baseline", "contract", "fork_turns", "generation",
-        "graph_sha256", "mode", "node", "role", "route", "scopes",
+        "graph_sha256", "mode", "node", "role", "route", "scopes", "workspace_root",
     }
     if set(spec) - (required | {"current_state", "epoch", "evidence", "route_plan"}) or not required <= set(spec):
         raise CapsuleError("dispatch specification is incomplete")
@@ -385,6 +400,7 @@ def compile_dispatch(spec: Mapping[str, Any]) -> dict[str, Any]:
         "role": role,
         "route": route,
         "scopes": _scope_list(spec["scopes"], "dispatch.scopes"),
+        "workspace_root": _workspace_root(spec["workspace_root"], "dispatch.workspace_root"),
     }
     for name in ("current_state", "epoch", "evidence"):
         if name in spec:
@@ -433,7 +449,7 @@ def parse_message(message: object) -> dict[str, Any]:
         raise CapsuleError("dispatch message is invalid or too large")
     lines = message.split("\n")
     if len(lines) != 3 or lines[0] != DISPATCH_HEADER or not lines[1].startswith("CAPSULE_SHA256: ") or not lines[2].startswith("CAPSULE_JSON: "):
-        raise CapsuleError("dispatch message is not a compact v7 envelope")
+        raise CapsuleError("dispatch message is not a compact v8 envelope")
     declared = _sha(lines[1][len("CAPSULE_SHA256: "):], "wire capsule hash")
     try:
         parsed = parse_canonical_json_object(lines[2][len("CAPSULE_JSON: "):], "CAPSULE_JSON")
@@ -450,7 +466,7 @@ def parse_result_message(message: object) -> dict[str, Any]:
         raise CapsuleError("result message is invalid or too large")
     lines = message.split("\n")
     if len(lines) != 3 or lines[0] != RESULT_HEADER or not lines[1].startswith("RESULT_SHA256: ") or not lines[2].startswith("RESULT_JSON: "):
-        raise CapsuleError("result message is not a compact v7 envelope")
+        raise CapsuleError("result message is not a compact v8 envelope")
     declared = _sha(lines[1][len("RESULT_SHA256: "):], "wire result hash")
     try:
         result = parse_canonical_json_object(lines[2][len("RESULT_JSON: "):], "RESULT_JSON")

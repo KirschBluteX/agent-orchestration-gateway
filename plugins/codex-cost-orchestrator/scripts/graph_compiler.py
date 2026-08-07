@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single deterministic entry point for preparing a cco.v7 dispatch graph."""
+"""Single deterministic entry point for preparing a cco.v8 dispatch graph."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from prepared_graph import (
 )
 from directory_state import (
     DEFAULT_MAX_BYTES as DEFAULT_DIRECTORY_MAX_BYTES,
-    DEFAULT_MAX_FILES as DEFAULT_DIRECTORY_MAX_FILES,
+    DEFAULT_MAX_ENTRIES as DEFAULT_DIRECTORY_MAX_ENTRIES,
     DirectoryBudgetError,
     DirectoryStateError,
     capture_directory_state,
@@ -79,8 +79,8 @@ from workspace_state import (
 )
 
 
-PROTOCOL = "cco.prepared-graph.v3"
-GRAPH_PROTOCOL = "cco.graph.v4"
+PROTOCOL = "cco.prepared-graph.v4"
+GRAPH_PROTOCOL = "cco.graph.v5"
 DISPATCH_BATCH_PROTOCOL = "cco.dispatch-batch.v2"
 CLI_INPUT_MAX_BYTES = 4 * 1024 * 1024
 SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -135,8 +135,12 @@ def _scopes(value: object, label: str) -> list[dict[str, str]]:
         scopes = [require_repository_scope(item, f"{label}[{i}]") for i, item in enumerate(value)]
     except ProtocolHashError as error:
         raise GraphCompilerError(str(error)) from error
-    if scopes != sorted(scopes, key=lambda item: (item["kind"], item["path"])) or len({(item["kind"], item["path"]) for item in scopes}) != len(scopes):
-        raise GraphCompilerError(f"{label} must be sorted and duplicate-free")
+    scopes.sort(key=lambda item: (item["kind"], item["path"]))
+    if len({(item["kind"], item["path"]) for item in scopes}) != len(scopes):
+        raise GraphCompilerError(f"{label} must be duplicate-free")
+    for position, scope in enumerate(scopes):
+        if any(repository_scopes_overlap(scope, other) for other in scopes[position + 1 :]):
+            raise GraphCompilerError(f"{label} must not overlap")
     return scopes
 
 
@@ -604,7 +608,7 @@ def prepare_dispatch_graph(
     workspace_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
-    directory_max_files: int = DEFAULT_DIRECTORY_MAX_FILES,
+    directory_max_entries: int = DEFAULT_DIRECTORY_MAX_ENTRIES,
     directory_max_bytes: int = DEFAULT_DIRECTORY_MAX_BYTES,
 ) -> dict[str, Any]:
     """Derive, route, baseline, and compile one complete graph in one call."""
@@ -818,7 +822,7 @@ def prepare_dispatch_graph(
                 root,
                 scopes=graph_scope_values,
                 capture_mode=capture_mode,
-                max_files=directory_max_files,
+                max_entries=directory_max_entries,
                 max_bytes=directory_max_bytes,
                 workspace_mode=workspace_mode,
             )
@@ -882,6 +886,7 @@ def prepare_dispatch_graph(
         "protocol": GRAPH_PROTOCOL,
         "route_plan_sha256": route_plan["plan_sha256"] if route_plan else None,
         "workspace_mode": workspace_mode,
+        "workspace_root": str(root),
     }
     identity = graph_sha256(manifest)
     baseline_path = _baseline_path(session_id, identity)
@@ -921,6 +926,7 @@ def prepare_dispatch_graph(
                 "selected": route["selected"],
             },
             "scopes": item["scopes"],
+            "workspace_root": str(root),
         }
         dispatch_baselines[node] = str(capsule_baseline)
         if "review_baseline" in optional:
@@ -1163,7 +1169,7 @@ def _review_source_row(source: object) -> dict[str, Any]:
             "dispatch_sha256": input_sha256,
             "disposition": seed["disposition"],
             "payload": seed["payload"],
-            "protocol": "cco.v7",
+            "protocol": "cco.v8",
             "status": seed["status"],
         }
         result["result_sha256"] = result_sha256(result)
@@ -1281,7 +1287,7 @@ def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, A
         "ignored_max_bytes",
         "ignored_max_files",
         "directory_max_bytes",
-        "directory_max_files",
+        "directory_max_entries",
         "native_catalog",
         "policy",
     }
@@ -1317,7 +1323,7 @@ def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, A
         workspace_mode=args.workspace_mode,
         ignored_max_files=document.get("ignored_max_files", DEFAULT_IGNORED_MAX_FILES),
         ignored_max_bytes=document.get("ignored_max_bytes", DEFAULT_IGNORED_MAX_BYTES),
-        directory_max_files=document.get("directory_max_files", DEFAULT_DIRECTORY_MAX_FILES),
+        directory_max_entries=document.get("directory_max_entries", DEFAULT_DIRECTORY_MAX_ENTRIES),
         directory_max_bytes=document.get("directory_max_bytes", DEFAULT_DIRECTORY_MAX_BYTES),
     )
     if args.full:
@@ -1345,7 +1351,7 @@ def _prepare_document(document: object, args: argparse.Namespace) -> dict[str, A
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
-        description="Prepare one network-free cco.v7 dispatch graph from JSON stdin."
+        description="Prepare one network-free cco.v8 dispatch graph from JSON stdin."
     )
     root.add_argument("--repo", type=Path, required=True)
     root.add_argument("--native-capacity", type=int, required=True)

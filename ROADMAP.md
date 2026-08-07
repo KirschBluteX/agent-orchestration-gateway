@@ -1,7 +1,15 @@
 # Roadmap
 
-## 1.2 adoption
+## 1.3 adoption
 
+- Ship the cco.v8 workspace-root binding, restart reconciliation, single-writer
+  admission, and current Desktop capability compatibility.
+- Provide a short installation/demo flow and collect user-reported compatibility
+  evidence without adding telemetry or billing history.
+
+- Added a development-only benchmark harness with a pinned, stratified FeatureBench
+  pilot, paired run plans, plan-bound result files, and per-model token evidence;
+  real execution remains gated on a reproducible Docker/WSL host.
 - Validate clean install, update, trust, first dispatch, and uninstall with Windows and
   Linux users.
 - Publish a tagged release and short reproducible demonstration after repository CI is

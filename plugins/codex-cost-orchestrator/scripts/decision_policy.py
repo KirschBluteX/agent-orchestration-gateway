@@ -259,7 +259,7 @@ def derive_assurance(
     closure: object,
     acceptance_facts: object,
 ) -> str:
-    """Derive the v7 mechanical, bounded, or guarded route assurance.
+    """Derive the v8 mechanical, bounded, or guarded route assurance.
 
     Closure decides whether meaningful choices remain. Acceptance facts can only
     raise the assurance floor; they never make an unresolved contract dispatchable.
@@ -275,7 +275,7 @@ def derive_assurance(
     return closure_assurance
 
 
-def select_v7_placement(
+def select_v8_placement(
     *,
     role: object,
     benefits: object,
@@ -336,11 +336,11 @@ def select_v7_placement(
 
 
 def derive_node_decision(value: object) -> dict[str, object]:
-    """Expose the complete v7 policy interface through one deep module."""
+    """Expose the complete v8 policy interface through one deep module."""
 
     fields = {"acceptance_facts", "closure", "placement", "role"}
     if not isinstance(value, Mapping) or set(value) != fields:
-        raise DecisionPolicyError("node decision must contain every v7 fact group")
+        raise DecisionPolicyError("node decision must contain every v8 fact group")
     role = require_role(value["role"])
     acceptance_facts = value["acceptance_facts"]
     if not isinstance(acceptance_facts, Mapping):
@@ -367,7 +367,7 @@ def derive_node_decision(value: object) -> dict[str, object]:
             closure=value["closure"],
             acceptance_facts=acceptance_facts,
         ),
-        "placement": select_v7_placement(
+        "placement": select_v8_placement(
             role=role,
             benefits=placement_facts["benefits"],
             direct_action_count=placement_facts["direct_action_count"],
@@ -441,13 +441,12 @@ def _normalize_dispatch_node(value: object, index: int) -> dict[str, Any]:
         ]
     except ProtocolHashError as error:
         raise DecisionPolicyError(str(error)) from error
-    if normalized_scope != sorted(
-        normalized_scope, key=lambda item: (item["kind"], item["path"])
-    ) or len({(item["kind"], item["path"]) for item in normalized_scope}) != len(
+    normalized_scope.sort(key=lambda item: (item["kind"], item["path"]))
+    if len({(item["kind"], item["path"]) for item in normalized_scope}) != len(
         normalized_scope
     ):
         raise DecisionPolicyError(
-            f"dispatch node {index}.scope must be sorted and duplicate-free"
+            f"dispatch node {index}.scope must be duplicate-free"
         )
     return {
         "access": access,
@@ -488,6 +487,12 @@ def select_ready_nodes(nodes: object, *, native_capacity: int) -> list[str]:
 
     def conflicts(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
         if left["responsibility"] == right["responsibility"]:
+            return True
+        # Git/directory baselines can prove a workspace delta, but they cannot
+        # attribute a later overwrite in one worker's scope to a different
+        # concurrently running writer.  Keep one writer per workspace and allow
+        # non-overlapping readers to retain native parallelism.
+        if left["access"] == right["access"] == "write":
             return True
         if left["access"] == right["access"] == "read":
             return False

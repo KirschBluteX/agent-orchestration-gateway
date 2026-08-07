@@ -23,7 +23,7 @@ import ledger_runtime  # noqa: E402
 import prepared_graph  # noqa: E402
 import subagent_stop  # noqa: E402
 from graph_compiler import compact_dispatch_batch, prepare_dispatch_graph  # noqa: E402
-from packet_compiler import compile_continuation, compile_result, parse_message  # noqa: E402
+from packet_compiler import compile_continuation, compile_dispatch, compile_result, parse_message  # noqa: E402
 
 
 def native_catalog() -> dict[str, object]:
@@ -216,6 +216,49 @@ class DispatchTransactionTests(unittest.TestCase):
             session_id=session_id,
         )
 
+    def test_transaction_rejects_a_capsule_bound_to_another_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "v8-root-mismatch"
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_worker", "owned.txt"),
+            )
+            capsule = parse_message(prepared["dispatches"][0]["message"])
+            forged = compile_dispatch(
+                {
+                    "acceptance": capsule["acceptance"],
+                    "acceptance_ids": capsule["acceptance_ids"],
+                    "assurance": capsule["assurance"],
+                    "baseline": capsule["baseline"],
+                    "contract": capsule["contract"],
+                    "fork_turns": capsule["execution"]["fork_turns"],
+                    "generation": capsule["generation"],
+                    "graph_sha256": capsule["graph_sha256"],
+                    "mode": capsule["mode"],
+                    "node": capsule["node"],
+                    "role": capsule["role"],
+                    "route": capsule["route"],
+                    "scopes": capsule["scopes"],
+                    "workspace_root": str((root / "another-workspace").resolve()),
+                }
+            )
+            batch = compact_dispatch_batch(prepared)
+            batch["dispatches"] = [forged]
+            batch["fallback_dispatches"] = {"n01_worker": []}
+
+            with self.assertRaisesRegex(
+                dispatch_transaction.DispatchTransactionError,
+                "workspace root",
+            ):
+                dispatch_transaction.prepare_dispatch_batch(
+                    batch,
+                    ledger_root=root / "ledger",
+                    repo=repo,
+                    session_id=session_id,
+                )
+
     def test_uuid_subagent_stop_maps_transcript_owner_and_retires_native_transaction_on_continue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -282,12 +325,15 @@ class DispatchTransactionTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            transcript_argument = (
+                "\\\\?\\" + str(transcript) if os.name == "nt" else str(transcript)
+            )
             with mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
                 self.assertEqual(
                     subagent_stop.evaluate(
                         {
                             "agent_id": child_id,
-                            "agent_transcript_path": str(transcript),
+                            "agent_transcript_path": transcript_argument,
                             "agent_type": expanded["agent_type"],
                             "cwd": str(repo),
                             "hook_event_name": "SubagentStop",
@@ -306,10 +352,10 @@ class DispatchTransactionTests(unittest.TestCase):
                 row["review_seed"]["payload"]["changed_paths"],
                 [],
             )
-            transaction = dispatch_transaction.read_transaction_state(
-                root / "ledger", session_id, batch["transaction_id"]
-            )
-            self.assertEqual(transaction["nodes"]["n01_worker"]["state"], "terminal")
+            with self.assertRaises(dispatch_transaction.DispatchTransactionError):
+                dispatch_transaction.read_transaction_state(
+                    root / "ledger", session_id, batch["transaction_id"]
+                )
             self.assertEqual(
                 dispatch_transaction.stop_outcome(
                     {"cwd": str(repo), "session_id": session_id}
@@ -358,7 +404,7 @@ class DispatchTransactionTests(unittest.TestCase):
                     subagent_stop.evaluate(
                         {
                             "agent_id": child_id,
-                            "agent_transcript_path": str(transcript),
+                            "agent_transcript_path": transcript_argument,
                             "agent_type": expanded["agent_type"],
                             "cwd": str(repo),
                             "hook_event_name": "SubagentStop",
@@ -456,9 +502,15 @@ class DispatchTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             session_id = "txn-activation"
-            repo, prepared = self._prepared(root, session_id, node("n01_one", "one.txt"), node("n02_two", "two.txt"))
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_one", "one.txt"),
+                node("n02_two", "two.txt", role="explorer"),
+            )
             batch = self._transaction(root, repo, prepared, session_id)
-            first, second = batch["dispatches"]
+            first = next(item for item in batch["dispatches"] if item["task_name"].startswith("worker_"))
+            second = next(item for item in batch["dispatches"] if item["task_name"].startswith("explorer_"))
             _transaction_id, first_ref = dispatch_transaction.parse_spawn_reference(first["message"])
             _transaction_id, second_ref = dispatch_transaction.parse_spawn_reference(second["message"])
             _transaction_id, first_fallback_ref = dispatch_transaction.parse_spawn_reference(
@@ -480,7 +532,7 @@ class DispatchTransactionTests(unittest.TestCase):
             }
             outcome = agent_preflight.evaluate(payload)
             updated = outcome["hookSpecificOutput"]["updatedInput"]
-            self.assertIn("CCO_DISPATCH cco.v7", updated["message"])
+            self.assertIn("CCO_DISPATCH cco.v8", updated["message"])
             self.assertEqual(updated["task_name"], first["task_name"])
             self.assertEqual(updated["agent_type"], "cost_orchestrator_write_leaf")
             self.assertEqual(updated["model"], "gpt-5.6-luna")
@@ -587,7 +639,7 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertIn("updatedInput", spawn["hookSpecificOutput"])
             self.assertTrue(
                 spawn["hookSpecificOutput"]["updatedInput"]["message"].startswith(
-                    "CCO_DISPATCH cco.v7"
+                    "CCO_DISPATCH cco.v8"
                 )
             )
             waiting = ledger_runtime.evaluate(
@@ -757,9 +809,15 @@ class DispatchTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             session_id = "txn-fallback"
-            repo, prepared = self._prepared(root, session_id, node("n01_one", "one.txt"), node("n02_two", "two.txt"))
+            repo, prepared = self._prepared(
+                root,
+                session_id,
+                node("n01_one", "one.txt"),
+                node("n02_two", "two.txt", role="explorer"),
+            )
             batch = self._transaction(root, repo, prepared, session_id)
-            first, sibling = batch["dispatches"]
+            first = next(item for item in batch["dispatches"] if item["task_name"].startswith("worker_"))
+            sibling = next(item for item in batch["dispatches"] if item["task_name"].startswith("explorer_"))
             fallback = batch["fallback_dispatches"]["n01_one"][0]
 
             sibling_payload = {
@@ -802,10 +860,11 @@ class DispatchTransactionTests(unittest.TestCase):
                 root,
                 session_id,
                 node("n01_one", "one.txt"),
-                node("n02_two", "two.txt"),
+                node("n02_two", "two.txt", role="explorer"),
             )
             batch = self._transaction(root, repo, prepared, session_id)
-            first, second = batch["dispatches"]
+            first = next(item for item in batch["dispatches"] if item["task_name"].startswith("worker_"))
+            second = next(item for item in batch["dispatches"] if item["task_name"].startswith("explorer_"))
 
             first_payload = {
                 "cwd": str(repo),
@@ -896,10 +955,10 @@ class DispatchTransactionTests(unittest.TestCase):
                 root,
                 session_id,
                 node("n01_one", "one.txt"),
-                node("n02_two", "two.txt"),
+                node("n02_two", "two.txt", role="explorer"),
             )
             batch = self._transaction(root, repo, prepared, session_id)
-            first = batch["dispatches"][0]
+            first = next(item for item in batch["dispatches"] if item["task_name"].startswith("worker_"))
             candidates = [first, *batch["fallback_dispatches"]["n01_one"]]
             for index, candidate in enumerate(candidates, start=1):
                 payload = {
@@ -932,7 +991,7 @@ class DispatchTransactionTests(unittest.TestCase):
             )
             self.assertEqual(state["nodes"]["n01_one"]["state"], "exhausted")
             (repo / "one.txt").write_text("unowned change\n", encoding="utf-8")
-            second = batch["dispatches"][1]
+            second = next(item for item in batch["dispatches"] if item["task_name"].startswith("explorer_"))
             rejected = agent_preflight.evaluate(
                 {
                     "cwd": str(repo),
@@ -977,10 +1036,9 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertIn("recovery", first_stop["reason"].casefold())
             second_stop = ledger_runtime.evaluate({"cwd": str(repo), "hook_event_name": "Stop", "session_id": session_id})
             self.assertIn("fenced", (second_stop.get("reason", "") + second_stop.get("systemMessage", "")).casefold())
-            fenced = dispatch_transaction.read_transaction_state(root / "ledger", session_id, batch["transaction_id"])
-            self.assertEqual(fenced["nodes"]["n01_one"]["state"], "fenced")
+            with self.assertRaises(dispatch_transaction.DispatchTransactionError):
+                dispatch_transaction.read_transaction_state(root / "ledger", session_id, batch["transaction_id"])
             _transaction_id, fenced_ref = dispatch_transaction.parse_spawn_reference(batch["dispatches"][0]["message"])
-            self.assertEqual(fenced["state"], "terminal")
             self.assertFalse(dispatch_transaction.bundle_path(root / "ledger", session_id, batch["transaction_id"], fenced_ref).exists())
 
             session_id = "txn-active-wait"
@@ -1028,11 +1086,10 @@ class DispatchTransactionTests(unittest.TestCase):
             row = ledger_runtime.ledger_for(payload).read_rows()[0]
             self.assertEqual(row["state"], "retired")
             self.assertEqual(row["retire_reason"], "host_restart")
-            transaction = dispatch_transaction.read_transaction_state(
-                root / "ledger", session_id, batch["transaction_id"]
-            )
-            self.assertEqual(transaction["state"], "terminal")
-            self.assertEqual(transaction["nodes"]["n01_active"]["state"], "fenced")
+            with self.assertRaises(dispatch_transaction.DispatchTransactionError):
+                dispatch_transaction.read_transaction_state(
+                    root / "ledger", session_id, batch["transaction_id"]
+                )
             self.assertEqual(
                 ledger_runtime.evaluate(
                     {"cwd": str(repo), "hook_event_name": "Stop", "session_id": session_id}
@@ -1052,6 +1109,87 @@ class DispatchTransactionTests(unittest.TestCase):
             )
             self.assertIn("rejected", late["systemMessage"])
             self.assertEqual(ledger_runtime.ledger_for(payload).read_rows()[0]["state"], "retired")
+
+    def test_compaction_preserves_active_owner_but_resume_reconciles_and_cleans_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-compact-recovery"
+            repo, prepared = self._prepared(
+                root, session_id, node("n01_active", "active.txt")
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            artifact = Path(str(batch["baseline_path"]))
+            ref = batch["dispatches"][0]
+            payload = {
+                "cwd": str(repo),
+                "hook_event_name": "PreToolUse",
+                "session_id": session_id,
+                "tool_input": ref,
+                "tool_name": "spawn_agent",
+                "tool_use_id": "spawn-compact-recovery",
+            }
+            agent_preflight.evaluate(payload)
+            owner = "/root/" + ref["task_name"]
+            ledger_runtime.evaluate(
+                {
+                    **payload,
+                    "hook_event_name": "PostToolUse",
+                    "tool_response": {"task_path": owner},
+                }
+            )
+
+            ledger_runtime.evaluate(
+                {
+                    "cwd": str(repo),
+                    "hook_event_name": "SessionStart",
+                    "session_id": session_id,
+                    "source": "compact",
+                }
+            )
+            self.assertEqual(ledger_runtime.ledger_for(payload).read_rows()[0]["state"], "owned")
+            self.assertEqual(
+                dispatch_transaction.read_transaction_state(
+                    root / "ledger", session_id, batch["transaction_id"]
+                )["state"],
+                "active",
+            )
+
+            for _ in range(2):
+                ledger_runtime.evaluate(
+                    {
+                        "cwd": str(repo),
+                        "hook_event_name": "SessionStart",
+                        "session_id": session_id,
+                        "source": "resume",
+                    }
+                )
+            row = ledger_runtime.ledger_for(payload).read_rows()[0]
+            self.assertEqual(row["state"], "retired")
+            self.assertEqual(row["retire_reason"], "host_restart")
+            self.assertFalse(artifact.exists())
+            self.assertFalse((root / "ledger" / f"{session_id}.dispatch-transactions.json").exists())
+
+    def test_restart_fences_an_undispatched_graph_and_removes_its_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_id = "txn-prepared-restart"
+            repo, prepared = self._prepared(
+                root, session_id, node("n01_pending", "pending.txt")
+            )
+            batch = self._transaction(root, repo, prepared, session_id)
+            artifact = Path(str(batch["baseline_path"]))
+
+            ledger_runtime.evaluate(
+                {
+                    "cwd": str(repo),
+                    "hook_event_name": "SessionStart",
+                    "session_id": session_id,
+                    "source": "startup",
+                }
+            )
+
+            self.assertFalse(artifact.exists())
+            self.assertFalse((root / "ledger" / f"{session_id}.dispatch-transactions.json").exists())
 
     def test_exact_abort_keeps_a_late_postflight_from_activating_a_fenced_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1088,11 +1226,10 @@ class DispatchTransactionTests(unittest.TestCase):
             self.assertIn("fenced", late["reason"])
             row = ledger_runtime.ledger_for(spawn_payload).read_rows()[0]
             self.assertEqual(row["state"], "exhausted")
-            settled = dispatch_transaction.read_transaction_state(
-                root / "ledger", session_id, batch["transaction_id"]
-            )
-            self.assertIsNone(settled["nodes"]["n01_one"]["call_id"])
-            self.assertIsNone(settled["nodes"]["n01_one"]["dispatch_ref"])
+            with self.assertRaises(dispatch_transaction.DispatchTransactionError):
+                dispatch_transaction.read_transaction_state(
+                    root / "ledger", session_id, batch["transaction_id"]
+                )
 
     def test_capacity_never_prunes_a_fenced_late_postflight_tombstone(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1301,10 +1438,10 @@ class DispatchTransactionTests(unittest.TestCase):
                 )
                 self.assertEqual(outcome["decision"], "block")
                 self.assertIn("CCO_TRANSACTION_ABORTED", outcome["reason"])
-                state = dispatch_transaction.read_transaction_state(
-                    case_root / "ledger", session_id, batch["transaction_id"]
-                )
-                self.assertEqual(state["nodes"]["n01_one"]["state"], "fenced")
+                with self.assertRaises(dispatch_transaction.DispatchTransactionError):
+                    dispatch_transaction.read_transaction_state(
+                        case_root / "ledger", session_id, batch["transaction_id"]
+                    )
 
     def test_stale_cleanup_removes_orphan_and_expired_transaction_bundles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,7 +1,7 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "1.2.2+codex.20260806030059",
-  "description": "Implicit role-aware Codex orchestration with network-free static routing, native Agent enforcement, compact cco.v7 lifecycle, and exact-state acceptance evidence.",
+  "version": "1.3.0+codex.20260807071106",
+  "description": "Implicit role-aware Codex orchestration with network-free static routing, native Agent enforcement, compact cco.v8 lifecycle, and exact-state acceptance evidence.",
   "author": {
     "name": "KirschQAQ",
     "url": "https://github.com/KirschBluteX"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Cost Orchestrator",
     "shortDescription": "Static native Agent routes with exact-state acceptance.",
-    "longDescription": "Codex Cost Orchestrator is an implicit control plane for Codex native Agents. It derives explorer, worker, and reviewer roles; mechanical, bounded, and guarded assurance; structural placement; local model/effort routes; and acceptance requirements while Primary keeps intent and final authority. The built-in network-free policy prefers Luna for mechanical work, Terra for bounded or guarded work and review, and never selects Sol without a current explicit user pin. Compact cco.v7 capsules, prepared scoped baselines, strict raw-spawn enforcement, continuation cursors, generation fencing, failure signatures, event-driven waiting, and acceptance-ID evidence operate without a second Agent runtime, Radar dependency, billing history, or runtime route cache.",
+    "longDescription": "Codex Cost Orchestrator is an implicit control plane for Codex native Agents. It derives explorer, worker, and reviewer roles; mechanical, bounded, and guarded assurance; structural placement; local model/effort routes; and acceptance requirements while Primary keeps intent and final authority. The built-in network-free policy prefers Luna for mechanical work, Terra for bounded or guarded work and review, and never selects Sol without a current explicit user pin. Compact cco.v8 capsules bind every child to one exact workspace root; prepared baselines, single-writer admission, strict raw-spawn enforcement, continuation cursors, generation fencing, event-driven waiting, and acceptance-ID evidence operate without a second Agent runtime, Radar dependency, billing history, or runtime route cache.",
     "developerName": "KirschQAQ",
     "category": "Productivity",
     "capabilities": [

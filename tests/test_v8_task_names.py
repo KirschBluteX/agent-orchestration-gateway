@@ -43,13 +43,14 @@ def dispatch(*, role: str = "worker", node: str = "n01_manifest", model: str = "
             "selected": {"effort": effort, "model": model},
         },
         "scopes": [{"kind": "exact", "path": "owned.txt"}],
+        "workspace_root": str(ROOT.resolve()),
     }
     if epoch is not None:
         spec["epoch"] = epoch
     return compile_dispatch(spec)
 
 
-class V7TaskNameTests(unittest.TestCase):
+class V8TaskNameTests(unittest.TestCase):
     def test_route_and_effort_are_visible_for_each_logical_role(self) -> None:
         self.assertEqual(dispatch()["task_name"], "worker_n01_manifest_luna_max_g01")
         self.assertEqual(

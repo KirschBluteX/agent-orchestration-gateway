@@ -72,6 +72,27 @@ class DirectoryStateTests(unittest.TestCase):
                         max_bytes=16,
                     )
 
+    def test_entry_budget_counts_directories_and_stops_during_walk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            current = root
+            for index in range(6):
+                current = current / f"d{index}"
+                current.mkdir()
+
+            with mock.patch(
+                "directory_state._inspect_entry",
+                wraps=__import__("directory_state")._inspect_entry,
+            ) as inspect_entry:
+                with self.assertRaisesRegex(DirectoryStateError, "entry.*budget"):
+                    capture_directory_state(
+                        root,
+                        scopes=[{"kind": "prefix", "path": "d0"}],
+                        capture_mode="full",
+                        max_entries=3,
+                    )
+            self.assertLessEqual(inspect_entry.call_count, 4)
+
     def test_repeated_scope_segment_cannot_skip_a_non_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
