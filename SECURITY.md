@@ -1,112 +1,75 @@
 # Security policy
 
-Codex Cost Orchestrator is a community project, not an official OpenAI product.
+## Report a vulnerability
 
-## Reporting
+Use GitHub's private vulnerability reporting for this repository. Include the CCO
+version, Codex version, operating system, reproduction, affected workspace type, and
+whether a Hook or native Agent was involved. Do not attach credentials, private source,
+full task transcripts, or Codex state databases to a public issue.
 
-Report suspected vulnerabilities through this repository's private GitHub security
-advisory flow. Do not put credentials, private task text, customer code, or unredacted
-Codex logs in a public issue.
+## Trust model
 
-## Boundary
+CCO is a local workflow guardrail, not an authentication system or OS security boundary.
+The user and Primary are trusted. Codex remains the only Agent runtime. Child task
+messages, artifact IDs, lifecycle state, workspace snapshots, and tombstones protect
+against accidental scope drift, duplicate ownership, stale continuation, and late
+results; they do not defend against a malicious Primary or process with the same local
+account permissions.
 
-CCO treats Primary as the trusted control plane. Capsules, hashes, hooks, prepared
-workspace state, and the task ledger are integrity/lifecycle guardrails. They are not
-encryption, authentication against a malicious Primary or local process, a durable
-scheduler, or an operating-system sandbox.
+Read leaves request a read-only sandbox. Workers receive one CCO write lease, but the
+host sandbox remains the enforcement authority. Primary must inspect the final delta.
 
-Codex native Agents are the only execution runtime. Both CCO profiles disable nested
-multi-Agent features. The read profile requests read-only execution, but CCO calls it
-OS-isolated only when runtime metadata confirms the effective sandbox.
+## Local state
 
-## Data and network behavior
+The default runtime root is the operating-system temporary directory under
+`codex-cost-orchestrator/v9`. It contains one immutable plan, at most one active wave
+baseline, one mutable lifecycle state per Codex task, and bounded owner tombstones.
+Wave artifacts are removed immediately after their physical dispatches settle.
 
-CCO makes no runtime network request. It may read:
+State may reveal repository paths, task objectives, model routes, changed paths, and
+acceptance evidence. It does not intentionally store source file contents, API keys,
+token usage, billing history, or network credentials. Apply normal local-account and
+temporary-directory protections.
 
-- the native capability catalogue exposed by Codex or its local CLI fallback;
-- hook payloads and authoritative local hook-trust status;
-- declared Git or non-Git workspace scopes and, for Git worktrees, Git control state;
-- global `~/.codex/cco.toml` and a trusted project's `.codex/cco.toml`;
-- its two installed Agent profiles.
+## Hooks
 
-It does not transmit CCO telemetry or collect credentials, billing, token usage,
-Radar data, or long-term route history. A temporary prepared artifact necessarily
-contains closed contracts, scopes, route bindings, and workspace fingerprints. In a
-non-Git directory, hashes are captured only after a path/type/size budget preflight;
-source contents are never retained. It does not copy workspace file contents or the
-full conversation.
+CCO ships five synchronous definitions with exact matchers. There is no global
+`PreToolUse: .*` Hook. PreToolUse validates only native spawn, continuation, message,
+and interrupt tools; PostToolUse records only spawn and continuation outcomes.
+SessionStart fences work at host `resume` or `clear` recovery boundaries, never during
+context compaction. Stop is an exceptional fallback for a Primary attempting to end
+while a native child turn is active. SubagentStop binds the native owner, cco.v9 result,
+cursor, wave, scopes, and workspace state, then prevents another Hook from continuing a
+terminal child.
 
-The optional `maintenance/repair_host_edges.py` command is not part of routing or any
-Hook. Its default mode reads only native thread metadata and bounded rollout evidence.
-Rollout readers cap each record at 4 MiB and total decompressed input at 256 MiB;
-host-edge proof additionally caps session metadata at 64 KiB and reads only a 1 MiB
-terminal tail from plain JSONL files. Invalid UTF-8 fails closed.
-An explicit `--repair` additionally requires exact parent/child IDs, creates a
-minimal rollback journal containing no conversation or source content, revalidates
-every requested completed CCO edge under a write transaction, and changes only
-matching `open` edges to `closed`. CCO never performs
-this host-state repair automatically.
+Review and trust Hook hashes in `/hooks` after every update. Doctor never changes trust.
 
-The default ledger is below the operating-system temporary directory at
-`codex-cost-orchestrator/ledger`; prepared artifacts and dispatch bundles use sibling
-directories. `CCO_LEDGER_DIR` may select another external location. Workspace paths
-and reparse-ancestor paths are rejected, including the sibling prepared-artifact and
-dispatch-bundle state roots.
+Opaque host collaboration payloads, including encrypted reasoning objects, must remain
+in their typed host field. CCO rejects attempts to copy them through plain message or
+follow-up text.
 
-Large graph artifacts are deleted once the graph transaction has no pending,
-dispatching, active, or continuable owner that can still reach them. Settled full
-dispatch bundles delete immediately; abandoned bundles and atomic-write residue share
-the seven-day stale bound. Small owner tombstones remain
-across turns to fence late results and raw continuations. On a Codex Desktop
-restart, the next SessionStart retires and fences active or dispatching children as
-`host_restart` interruptions before removing validated terminal residue. Cleanup
-revalidates state while holding the shared OS lock. Locked state is retried later;
-malformed state remains fail-closed for explicit recovery and is never deleted from
-a terminal-looking label alone.
+## Workspace protection
 
-## Hook behavior
+Git workspaces protect the canonical root, Git directory identities, HEAD, refs, config,
+hooks, info, index, typed scopes, ignored in-scope files, path spellings, hidden status
+entries, reparses, and submodule control state. Non-Git workspaces bind the exact root,
+reject reparses and special files, enforce entry/byte budgets before hashing, and never
+run `git init`.
 
-The plugin uses SessionStart, PreToolUse, PostToolUse, Stop, UserPromptSubmit, and
-SubagentStop. Ordinary raw spawn and managed raw continuation fail closed. The only
-unmanaged path is the exact `CCO_NATIVE_BYPASS v1` marker after current user
-authorization.
+Only one physical worker is admitted per workspace wave. A paused worker keeps the
+lease. Compatible read leaves may run beside a non-overlapping writer; their results
+permit only the known sibling writer scope and must show no read-scope delta.
 
-Protected collaboration values remain typed host data. PreToolUse rejects attempts
-to copy opaque values—including current `reasoning` objects carrying
-`encrypted_content`—into plain `send_message` or `followup_task` text.
+## Host maintenance
 
-Hooks run only when Codex reports their current hashes as enabled and trusted. Review
-them through `/hooks`. Bootstrap and doctor do not grant trust; doctor only reads the
-authoritative `hooks/list` result. A host-level failure to launch a hook may follow
-host policy, so Primary exact-state verification remains mandatory.
+Hooks never edit Codex's host database. The explicit host-edge repair tool is outside
+the Hook path, requires a proof-backed retired lifecycle result, writes a minimal
+permission-restricted rollback journal under the database transaction, and operates
+only on explicitly selected spawn edges. Journals contain task identifiers; protect and
+remove them according to local policy.
 
-Worker result paths must equal the real post-baseline delta inside that node's typed
-scopes, and a continuable worker retains the workspace write lease until it retires.
-Any worker result containing a graph delta outside that worker's node scopes is
-rejected. Every cco.v8 capsule binds the exact absolute workspace root used by its
-graph, transaction, and TaskLedger claim; host cwd cannot replace it. Git graphs
-fingerprint ignored files within bounded global budgets and explicitly include scoped
-`skip-worktree` and `assume-unchanged` entries.
-Non-Git workers capture the complete root with a default 20,000-entry / 1 GiB
-preflight; read-only roles capture declared scopes and must finish unchanged. These
-checks reduce accidental scope drift; they cannot prevent a process from writing after
-the check completes.
+## Unsupported claims
 
-Result-time workspace verification uses the canonical repository captured during
-graph preparation. A SubagentStop event's `cwd` is not authoritative because Codex
-may start the parent task above the repository. Cross-session cleanup preserves graph
-artifacts while a sibling remains pending, dispatching, or active, and capacity
-pruning never evicts a fenced transaction that still contains an active owner.
-
-For a reviewer of a known worker delta, the capsule may retain the worker's old
-baseline identity while `current_state`, the prepared artifact, and the ledger bind
-the freshly captured review state. The old SHA-256 value is not a retained source
-snapshot or independent proof of provenance; Primary remains responsible for the
-review contract and delta evidence.
-
-## Dependency and update practice
-
-- Review plugin and profile diffs before update.
-- Trust modified hooks again only after review.
-- Use bootstrap's byte-identity upgrade rules; it preserves unknown or modified files.
-- Start a new task after install, update, disable, or uninstall.
+CCO does not guarantee a specific cost reduction, measure the real bill for a task,
+encrypt local state, or make a weak model suitable for an open contract. Benchmark
+results must state their workload, versions, route policy, and token fields.

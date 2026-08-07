@@ -16,7 +16,7 @@ from state_lock import acquire, is_locked, lock_path  # noqa: E402
 
 
 class StateLockTests(unittest.TestCase):
-    def test_nested_acquisition_is_reentrant_and_shared_by_both_state_stores(self) -> None:
+    def test_nested_acquisition_is_reentrant_for_the_single_lifecycle_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with acquire(root, "session"):

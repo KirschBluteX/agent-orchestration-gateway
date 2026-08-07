@@ -1,42 +1,24 @@
 # Roadmap
 
-## 1.3 adoption
+## 2.0 adoption
 
-- Ship the cco.v8 workspace-root binding, restart reconciliation, single-writer
-  admission, and current Desktop capability compatibility.
-- Provide a short installation/demo flow and collect user-reported compatibility
-  evidence without adding telemetry or billing history.
+- Validate clean installation and Hook trust on current Windows and Linux Codex builds.
+- Dogfood Git and bounded non-Git plans across explorer, worker, reviewer, continuation,
+  route fallback, restart, and host-card recovery scenarios.
+- Publish reproducible benchmark runs with Primary, Luna, and Terra input/output/cache
+  token fields and raw workload manifests.
+- Add concise installation and demonstration media after clean-install feedback.
 
-- Added a development-only benchmark harness with a pinned, stratified FeatureBench
-  pilot, paired run plans, plan-bound result files, and per-model token evidence;
-  real execution remains gated on a reproducible Docker/WSL host.
-- Validate clean install, update, trust, first dispatch, and uninstall with Windows and
-  Linux users.
-- Publish a tagged release and short reproducible demonstration after repository CI is
-  green on the exact release commit.
-- Collect voluntary issue reports for false blocks, native route rejection, model
-  capability differences, and scope attribution; add no plugin telemetry.
-- Measure user-visible prepare-to-spawn latency and transaction recovery behavior with
-  reproducible local traces before adding another orchestration layer.
-- Track protected collaboration-content handling across Codex releases and remove the
-  compatibility guard only if the native string-tool boundary makes it unnecessary.
-- Publish workload-matched benchmark inputs and raw observations before making any
-  cost or quality claim.
+## Quality gates
 
-## Compatibility
+- Keep the hot skill below 450 words and normal routing network-free.
+- Keep native Codex Agents as the only Agent runtime.
+- Preserve exact workspace roots, one writer, fresh wave baselines, restart fencing,
+  bounded tombstones, and Primary final authority.
+- Prefer deleting shallow interfaces and redundant state over adding recovery layers.
+- Add behavior tests at the public plan/wave/lifecycle seams, not private call choreography.
 
-- Track Codex hook and native Agent contract changes against pinned release versions.
-- Add macOS only after a real installation, filesystem, profile, and hook-trust test;
-  do not infer support from Linux.
-- Keep unsupported models and exact user pins in Primary rather than guessing.
+## Deliberate non-goals
 
-## Possible later work
-
-- A small local configuration assistant that validates `cco.toml` without changing
-  trust or route policy.
-- Better native capability injection when Codex exposes a stable direct host API.
-- Opt-in benchmark export containing only user-approved aggregate observations.
-
-CCO will not add a second Agent runtime, runtime Radar dependency, billing ledger,
-automatic Sol escalation, or background polling unless the project's core scope is
-explicitly reconsidered.
+CCO will not add runtime Radar routing, billing history, token accounting, a second
+coordinator, background polling, automatic Sol escalation, or an MCP dependency.

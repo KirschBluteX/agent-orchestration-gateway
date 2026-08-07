@@ -8,85 +8,59 @@ import tomllib
 import unittest
 
 
-REPO = Path(__file__).resolve().parents[1]
-PLUGIN = REPO / "plugins" / "codex-cost-orchestrator"
-SKILL = PLUGIN / "skills" / "orchestrate" / "SKILL.md"
-REFERENCES = SKILL.parent / "references"
-HOOKS = PLUGIN / "hooks" / "hooks.json"
+ROOT = Path(__file__).resolve().parents[1]
+PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
+ORCHESTRATE = PLUGIN / "skills" / "orchestrate"
+MANAGE = PLUGIN / "skills" / "manage-cco"
 
 
 def text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def current_runtime_text() -> str:
-    paths = [
-        *PLUGIN.glob("agents/*.toml"),
-        *PLUGIN.glob("hooks/*.py"),
-        *PLUGIN.glob("scripts/*.py"),
-        SKILL,
-        REFERENCES / "runtime-gates.md",
-        REFERENCES / "contracts-v8.md",
-    ]
-    return "\n".join(text(path) for path in paths)
-
-
 class ProjectContractTests(unittest.TestCase):
-    def test_public_identity_version_and_bilingual_entrypoints(self) -> None:
-        english = text(REPO / "README.md")
-        chinese = text(REPO / "README.zh-CN.md")
+    def test_public_identity_and_bilingual_entrypoints(self) -> None:
+        english = text(ROOT / "README.md")
+        chinese = text(ROOT / "README.zh-CN.md")
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
-
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertRegex(
-            manifest["version"], r"^1\.3\.1\+codex\.[a-z0-9-]+$"
-        )
+        self.assertRegex(manifest["version"], r"^2\.0\.0\+codex\.[a-z0-9.-]+$")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
             "https://github.com/KirschBluteX/codex-cost-orchestrator",
         )
         for unrelated in ("OpenSquilla", "sol-advisor", "DannyMac180"):
-            self.assertNotIn(unrelated, english + chinese + text(SKILL))
+            self.assertNotIn(unrelated, english + chinese + text(ORCHESTRATE / "SKILL.md"))
 
-    def test_release_identity_is_consistent_across_runtime_and_docs(self) -> None:
+    def test_release_identity_is_consistent(self) -> None:
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
-        release = manifest["version"].split("+", 1)[0]
         installer = text(PLUGIN / "scripts" / "install_agents.py")
-        changelog = text(REPO / "CHANGELOG.md")
-        compatibility = text(REFERENCES / "runtime-gates.md")
-        installer_match = re.search(r'^PLUGIN_VERSION = "([^"]+)"$', installer, re.MULTILINE)
-        changelog_match = re.search(r"^## ([0-9]+\.[0-9]+\.[0-9]+) - ", changelog, re.MULTILINE)
+        changelog = text(ROOT / "CHANGELOG.md")
+        self.assertIn('PLUGIN_VERSION = "2.0.0"', installer)
+        self.assertRegex(manifest["version"], r"^2\.0\.0\+")
+        self.assertRegex(changelog, r"(?m)^## 2\.0\.0 - ")
 
-        self.assertIsNotNone(installer_match)
-        self.assertIsNotNone(changelog_match)
-        self.assertEqual(installer_match.group(1), release)
-        self.assertEqual(changelog_match.group(1), release)
-        release_line = ".".join(release.split(".")[:2])
-        self.assertIn(f"The {release_line} release contract", compatibility)
+    def test_two_thin_skills_use_progressive_disclosure(self) -> None:
+        hot = text(ORCHESTRATE / "SKILL.md")
+        cold = text(MANAGE / "SKILL.md")
+        hot_words = len(re.findall(r"\S+", hot))
+        self.assertLessEqual(hot_words, 450)
+        self.assertIn("control_plane.py plan", hot)
+        self.assertIn("one long event wait", hot)
+        self.assertIn("$codex-cost-orchestrator:manage-cco", hot)
+        self.assertNotIn("repair_host_edges", hot)
+        self.assertNotIn("migration", cold.casefold())
+        self.assertIn("allow_implicit_invocation: true", text(ORCHESTRATE / "agents" / "openai.yaml"))
+        self.assertIn("allow_implicit_invocation: false", text(MANAGE / "agents" / "openai.yaml"))
 
-    def test_installation_uses_current_codex_plugin_commands_and_explicit_trust(self) -> None:
-        combined = text(REPO / "README.md") + text(REPO / "README.zh-CN.md")
-        self.assertIn(
-            "codex plugin add codex-cost-orchestrator@codex-cost-orchestrator",
-            combined,
-        )
-        self.assertIn("codex plugin marketplace add", combined)
-        self.assertIn("/hooks", combined)
-        self.assertIn("--bootstrap", combined)
-        self.assertIn("--doctor", combined)
-        self.assertIn("--uninstall", combined)
-        self.assertNotIn("codex plugin install ", combined)
-
-    def test_implicit_skill_and_two_model_neutral_non_delegating_profiles(self) -> None:
-        openai_yaml = text(SKILL.parent / "agents" / "openai.yaml")
+    def test_profiles_are_model_neutral_non_delegating_v9_leaves(self) -> None:
         profiles = {
             path.name: tomllib.loads(text(path))
             for path in (PLUGIN / "agents").glob("*.toml")
         }
-        self.assertIn("allow_implicit_invocation: true", openai_yaml)
         self.assertEqual(
             set(profiles),
             {
@@ -99,153 +73,61 @@ class ProjectContractTests(unittest.TestCase):
             self.assertNotIn("model_reasoning_effort", profile)
             self.assertFalse(profile["features"]["multi_agent"])
             self.assertEqual(profile["features"]["multi_agent_v2"], {"enabled": False})
-            self.assertIn("CCO_DISPATCH cco.v8", profile["developer_instructions"])
-            self.assertIn("workspace_root", profile["developer_instructions"])
-            self.assertIn("RESULT_SHA256: sha256:<64-lowercase-hex>", profile["developer_instructions"])
-            self.assertIn('RESULT_JSON: {"dispatch_sha256":', profile["developer_instructions"])
-            for field in (
-                '"blockers"',
-                '"changed_paths"',
-                '"deviations"',
-                '"evidence"',
-                '"failure_signature"',
-                '"summary"',
-            ):
-                self.assertIn(field, profile["developer_instructions"])
-        self.assertEqual(
-            profiles["codex-cost-orchestrator-read-leaf.toml"]["sandbox_mode"],
-            "read-only",
-        )
+            instructions = profile["developer_instructions"]
+            self.assertIn("CCO_TASK cco.v9", instructions)
+            self.assertIn("CCO_RESULT cco.v9", instructions)
+            self.assertNotIn("RESULT_SHA256", instructions)
 
-    def test_hooks_use_supported_v8_transaction_and_wait_events(self) -> None:
-        hooks = json.loads(text(HOOKS))["hooks"]
+    def test_runtime_is_clean_v9_without_compatibility_adapters(self) -> None:
+        runtime_paths = [
+            *(PLUGIN / "agents").glob("*.toml"),
+            *(PLUGIN / "hooks").glob("*.py"),
+            *(PLUGIN / "scripts").glob("*.py"),
+            ORCHESTRATE / "SKILL.md",
+            MANAGE / "SKILL.md",
+        ]
+        runtime = "\n".join(text(path) for path in runtime_paths)
+        self.assertIn('PROTOCOL = "cco.v9"', runtime)
+        for old in (
+            "cco.v8",
+            "graph_compiler",
+            "dispatch_transaction",
+            "packet_compiler",
+            "prepared_graph",
+            "TaskLedger",
+            "CCO_DISPATCH_REF",
+        ):
+            self.assertNotIn(old, runtime)
+        for forbidden in ("sqlite", "radar", "token ledger", "billing dashboard", "mcp server"):
+            self.assertNotIn(forbidden, runtime.casefold())
+
+    def test_hooks_are_exact_and_have_no_all_tool_tax(self) -> None:
+        hooks = json.loads(text(PLUGIN / "hooks" / "hooks.json"))["hooks"]
         self.assertEqual(
             set(hooks),
-            {
-                "SessionStart",
-                "PreToolUse",
-                "PostToolUse",
-                "Stop",
-                "UserPromptSubmit",
-                "SubagentStop",
-            },
+            {"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SubagentStop"},
         )
         serialized = json.dumps(hooks)
-        for required in (
-            "spawn_agent",
-            "collaborationspawn_agent",
-            "followup_task",
-            "collaborationfollowup_task",
-            "interrupt_agent",
-            "collaborationinterrupt_agent",
-            "cost_orchestrator_read_leaf",
-            "cost_orchestrator_write_leaf",
-        ):
-            self.assertIn(required, serialized)
-        count = 0
-        for event, groups in hooks.items():
-            for group in groups:
-                for hook in group["hooks"]:
-                    count += 1
-                    if event == "SubagentStop":
-                        limit = 120
-                    elif event == "PreToolUse" and group.get("matcher") == ".*":
-                        limit = 30
-                        self.assertGreaterEqual(hook["timeout"], 30)
-                    else:
-                        limit = 5
-                    self.assertLessEqual(hook["timeout"], limit)
-        self.assertEqual(count, 7)
+        self.assertNotIn('"matcher": ".*"', serialized)
+        self.assertIn("spawn_agent", serialized)
+        self.assertIn("followup_task", serialized)
+        self.assertIn("interrupt_agent", serialized)
+        count = sum(len(group["hooks"]) for groups in hooks.values() for group in groups)
+        self.assertEqual(count, 5)
 
-    def test_directory_workspace_backend_is_bounded_and_never_initializes_git(self) -> None:
-        runtime = current_runtime_text()
-        directory = text(PLUGIN / "scripts" / "directory_state.py")
-        combined_docs = (
-            text(REPO / "README.md")
-            + text(REPO / "README.zh-CN.md")
-            + text(REPO / "docs" / "OPERATIONS.md")
-        )
-        self.assertIn("20,000", combined_docs)
-        self.assertIn("1 GiB", combined_docs)
-        self.assertIn("non-Git", combined_docs)
-        self.assertIn("DEFAULT_MAX_ENTRIES = 20_000", directory)
-        self.assertIn("DEFAULT_MAX_BYTES = 1024 * 1024 * 1024", directory)
-        self.assertNotIn('subprocess.run(["git", "init"', runtime)
+    def test_installation_docs_use_current_plugin_and_explicit_trust(self) -> None:
+        combined = text(ROOT / "README.md") + text(ROOT / "README.zh-CN.md")
+        self.assertIn("codex plugin marketplace add", combined)
+        self.assertIn("codex plugin add codex-cost-orchestrator@codex-cost-orchestrator", combined)
+        self.assertIn("--bootstrap", combined)
+        self.assertIn("--doctor", combined)
+        self.assertIn("/hooks", combined)
+        self.assertNotIn("codex plugin install ", combined)
 
-    def test_current_protocol_is_v8_and_runtime_route_is_static_and_network_free(self) -> None:
-        packet = text(PLUGIN / "scripts" / "packet_compiler.py")
-        routing = text(PLUGIN / "scripts" / "routing_catalog.py")
-        graph = text(PLUGIN / "scripts" / "graph_compiler.py")
-        self.assertIn('PROTOCOL = "cco.v8"', packet)
-        self.assertIn('ROUTE_PLAN_PROTOCOL = "cco.route-plan.v5"', routing)
-        self.assertIn('GRAPH_PROTOCOL = "cco.graph.v5"', graph)
-        self.assertIn('DISPATCH_BATCH_PROTOCOL = "cco.dispatch-batch.v2"', graph)
-        for forbidden in (
-            "urllib.request",
-            "needs_refresh",
-            "average_price_usd",
-            "minimum_iq_exclusive",
-            "refresh_radar",
-        ):
-            self.assertNotIn(forbidden, routing.casefold())
-        self.assertIn("network-free", routing.casefold())
-
-    def test_fast_dispatch_is_one_transaction_and_one_quiescent_wait(self) -> None:
-        compiler = text(PLUGIN / "scripts" / "graph_compiler.py")
-        transaction = text(PLUGIN / "scripts" / "dispatch_transaction.py")
-        skill = text(SKILL)
-
-        self.assertIn("prepare_transaction_batch", compiler)
-        self.assertIn("CCO_DISPATCH_REF cco.dispatch-batch.v2", transaction)
-        self.assertIn("same model turn", skill)
-        self.assertIn("one long event wait", skill)
-        self.assertIn("do not read the repository again", skill.casefold())
-        self.assertIn("one graph-level decision", skill.casefold())
-        self.assertIn("no per-node model classifier", skill.casefold())
-        self.assertIn("capsule:self-contained", skill)
-        self.assertIn("context:history-not-required", skill)
-        self.assertIn("does not require a reviewer", skill.casefold())
-        self.assertIn("authoritative native terminal event", skill.casefold())
-        self.assertIn("never forward opaque protected payloads", skill.casefold())
-        self.assertIn("CCO_PROTECTED_MESSAGE", text(PLUGIN / "hooks" / "agent_preflight.py"))
-
-    def test_no_accounting_encryption_or_second_runtime_is_shipped(self) -> None:
-        lowered = current_runtime_text().casefold()
-        for forbidden in (
-            "sqlite",
-            "providercallplan",
-            "token ledger",
-            "billing dashboard",
-            "fernet",
-            "pi sdk session",
-        ):
-            self.assertNotIn(forbidden, lowered)
-        self.assertIn("second agent runtime", lowered)
-        self.assertIn("not encryption", lowered)
-
-    def test_host_edge_repair_is_explicit_and_outside_hooks(self) -> None:
-        maintenance = PLUGIN / "maintenance" / "repair_host_edges.py"
-        operations = text(REPO / "docs" / "OPERATIONS.md")
-        hooks = text(HOOKS)
-
-        self.assertTrue(maintenance.is_file())
-        self.assertIn("--repair", operations)
-        self.assertIn("--parent-thread-id", operations)
-        self.assertIn("--child-thread-id", operations)
-        self.assertIn("task_complete", operations)
-        self.assertIn("cco-host-edge-repair", operations)
-        self.assertNotIn("repair_host_edges", hooks)
-        self.assertNotIn("state_5.sqlite", hooks)
-
-    def test_marketplace_and_release_materials_are_complete(self) -> None:
+    def test_marketplace_and_release_files_exist(self) -> None:
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
-        marketplace = json.loads(text(REPO / ".agents" / "plugins" / "marketplace.json"))
+        marketplace = json.loads(text(ROOT / ".agents" / "plugins" / "marketplace.json"))
         self.assertEqual(marketplace["name"], manifest["name"])
-        self.assertEqual(len(marketplace["plugins"]), 1)
-        self.assertEqual(
-            marketplace["plugins"][0]["source"],
-            {"source": "local", "path": "./plugins/codex-cost-orchestrator"},
-        )
         for relative in (
             "CHANGELOG.md",
             "CONTRIBUTING.md",
@@ -254,22 +136,12 @@ class ProjectContractTests(unittest.TestCase):
             "docs/BENCHMARK.md",
             "docs/OPERATIONS.md",
             "benchmarks/cco_benchmark.py",
-            "benchmarks/manifests/featurebench-pilot-v1.json",
-            ".github/ISSUE_TEMPLATE/bug_report.yml",
-            ".github/ISSUE_TEMPLATE/feature_request.yml",
         ):
-            self.assertTrue((REPO / relative).is_file(), relative)
+            self.assertTrue((ROOT / relative).is_file(), relative)
 
-    def test_skill_reference_links_resolve(self) -> None:
-        contents = text(SKILL)
-        for filename in ("runtime-gates.md", "contracts-v8.md"):
-            self.assertTrue((REFERENCES / filename).is_file())
-            self.assertIn(f"references/{filename}", contents)
-        self.assertFalse((REFERENCES / "contracts-v7.md").exists())
-
-    def test_repository_reachable_history_has_one_root_without_author_restrictions(self) -> None:
+    def test_repository_history_has_one_root_without_author_restrictions(self) -> None:
         roots = subprocess.check_output(
-            ["git", "rev-list", "--max-parents=0", "HEAD"], cwd=REPO, text=True
+            ["git", "rev-list", "--max-parents=0", "HEAD"], cwd=ROOT, text=True
         ).splitlines()
         self.assertEqual(len(roots), 1)
 

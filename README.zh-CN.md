@@ -2,133 +2,113 @@
 
 [English](README.md)
 
-[![CI](https://github.com/KirschBluteX/codex-cost-orchestrator/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/KirschBluteX/codex-cost-orchestrator/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Codex Cost Orchestrator（CCO）是面向 Codex 原生 Agent 的轻量本地控制面。
+Primary 保留目标理解、规划、集成和最终验收；已经闭合的工作则由 CCO 按明确范围、
+最新工作区基线和静态路由交给成本更低的原生 Agent。
 
-> 让 Codex 保留整体规划，把边界清晰的工作交给合适的原生 Agent。
+CCO 只使用 Codex 自身的 Agent runtime，不运行第二套协调器，不依赖在线路由服务，
+不保存计费历史，也不要求 MCP 服务器。
 
-Codex Cost Orchestrator（CCO）是一个面向 Codex 原生 Agent 的本地插件。它会判断任务
-是否适合拆分，准备清晰的工作包，选择本机支持的模型与思考强度，并在子任务完成后检查
-工作区，再由负责总体任务的主 Agent（下文称 **Primary**）集成结果。
+## 能做什么
 
-用户仍然像平时一样使用 Codex。对于简单的单步请求，CCO 不会增加额外流程；对于包含
-多个独立部分的较大任务，它可以帮助合理分工。
-
-## 你能得到什么
-
-- **实用的任务分派。** 重复、确定性的工作优先使用 Luna；需要更多判断或独立审查的工作
-  优先使用 Terra。
-- **使用同一套原生运行时。** Agent 的创建、执行、继续、终止和沙箱仍由 Codex 负责，
-  CCO 只增加策略与生命周期检查。
-- **职责清晰。** 每个分派任务都有明确的责任、范围、依赖和验收条件，减少重复或无关工作。
-- **审查衔接更快。** 独立 reviewer 可直接从任务本地状态获得已完成 worker 的基线、精确范围、变更路径与证据。
-- **整图只做一次本地决策。** 共享事实只需闭合一次，再由本地编译器统一路由当前就绪任务，
-  不会为每个子 Agent 单独发起模型分类请求。
-- **派遣后安静等待。** 子任务运行时，Primary 等待有意义的事件，不反复查询进度；只有原生
-  终态事件能够证明任务已经结束。
-- **重启后安全恢复。** Codex 桌面端重启会把活跃子 Agent 视为中断，fence 迟到结果，
-  不会让旧任务继续阻塞下一次任务。
-- **默认本地运行。** 路由使用静态本地策略，不依赖在线路由服务，也不收集计费或遥测历史。
-
-## 工作方式
+- 一次编译完整逻辑 DAG，再自动生成依赖已满足的执行波次。
+- 使用与原生职责一致的 `explorer`、`worker`、`reviewer`。
+- 确定性的机械任务优先 Luna；需要有限判断、保护或审查的任务优先 Terra。
+- 不会自动选择 Sol；用户可在当前任务中明确指定任意原生支持的模型与思考强度。
+- 在宿主真实 Agent 容量内选择最大无冲突 ready set。
+- 同一工作区只允许一个可写子 Agent，同时并行执行兼容的只读任务。
+- ready 数量超过容量时，可安全聚合相容的机械微任务。
+- 每个波次都绑定新的 Git 或有界非 Git 工作区状态。
+- 依靠原生终止事件唤醒 Primary，不轮询进度。
+- 暂停的 worker 保留写 lease；中断、重启和迟到结果会被 fencing。
 
 ```mermaid
 flowchart LR
-    U["你的需求"] --> P["Primary 闭合整体计划"]
-    P --> R["CCO 一次编译就绪工作图"]
-    R --> A["Codex 原生 Agent 执行"]
-    A --> E["原生终态事件返回证据"]
-    E --> V["Primary 集成并验收"]
+    U["用户目标"] --> P["Primary：意图与规划"]
+    P --> C["Plan 编译"]
+    C --> W["Ready 波次与静态路由"]
+    W --> A["Codex 原生 Agent"]
+    A --> L["单一生命周期状态"]
+    L --> G["工作区验证"]
+    G --> P
 ```
 
-CCO 使用三个角色：
+## 默认路由
 
-| 角色 | 用途 | 权限 |
-| --- | --- | --- |
-| `explorer` | 检查指定区域并返回证据 | 只读 |
-| `worker` | 实现边界闭合的修改 | 只能写入声明的范围 |
-| `reviewer` | 独立检查已经完成的状态 | 只读 |
+| 工作类型 | 自动顺序 |
+| --- | --- |
+| 机械型 explorer 或 worker | Luna，然后 Terra |
+| 有限判断型 explorer 或 worker | Terra，然后 Luna |
+| guarded 工作 | Terra |
+| reviewer | Terra |
 
-Primary 始终负责总体目标、结果集成和最终答复。如果任务不适合安全拆分，或分派的收益
-不足以抵消额外开销，就由 Primary 直接完成。
-
-同一工作区同时最多只有一个具备写权限的 worker。职责独立、范围不重叠的 explorer 与
-reviewer 仍可和该 worker 并行，既保留只读并发，也避免写入归属不清。
-
-## 默认模型路由
-
-CCO 会在每一行中选择本机支持的第一个路由。当前用户明确指定的模型或思考强度会覆盖
-这些默认值。
-
-| 任务类型 | 默认路由 | 后备路由 |
-| --- | --- | --- |
-| 常规、确定性的检查或实现 | Luna / `max` | Terra / `max` |
-| 仍需一定判断的有界任务 | Terra / `max` | Luna / `max` |
-| 风险敏感任务或独立审查 | Terra / `max` | 无 |
-
-CCO 不会自动选择 Sol 或 `ultra`。你可以在受信的本地配置中自定义路由；如果选择不受
-本机支持，任务会留在 Primary，不会被静默替换成未知模型。
-
-对于选中的模型，CCO 会优先使用 `max`；只有当前 Codex 宿主不提供更高强度时，才会依次
-尝试 `xhigh` 或 `high`。
-
-## 环境要求
-
-- 支持插件 hook 和原生 Agent 的 Codex CLI 或 Codex 桌面端
-- Python 3.11 或更高版本
-- Windows 或 Linux（当前未测试 macOS）
-- Git 可选；在 Git worktree 中可提供更精确的工作区变更检测
-
-当前发布契约已在 Codex 桌面端 `26.803.5235.0` 上验证；PATH 中的 Codex CLI `0.146.0`
-仅作为能力目录后备。使用其他宿主时，建议先运行 `--doctor` 检查兼容性。
+同一模型优先使用 `max`，其次是 `xhigh`、`high`。路由在创建波次时根据当前宿主
+能力解析。若原生 spawn 在创建线程前明确拒绝某个候选，只会使用已准备的下一个候选，
+不会静默继承 Primary 的模型。
 
 ## 安装
+
+要求：
+
+- Python 3.11+
+- 支持插件、Hooks 和原生 Agent 的当前 Codex
+- Windows 或 Linux
+
+克隆仓库并添加 marketplace：
 
 ```text
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
 cd codex-cost-orchestrator
-codex plugin marketplace add KirschBluteX/codex-cost-orchestrator --ref main
+codex plugin marketplace add .
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
 ```
 
-然后信任 hook 并验证安装：
-
-1. 在 Codex 中打开 `/hooks`。
-2. 检查并信任其中显示的全部 CCO hook。
-3. 运行：
+安装两个不固定模型的原生 Agent profile：
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
+python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <你的项目> --bootstrap
 ```
 
-检查结果应同时包含 `HOOKS READY` 和 `STATIC ROUTE READY`。安装或更新后请新建 Codex
-任务，使最新的 profile、skill 与 hook 生效。
-
-## 使用方式
-
-不需要特殊命令，也不需要手动写出 skill 名称。像平时一样描述你希望得到的结果：
+打开 `/hooks`，检查并信任 5 个 CCO Hook，然后新建一个 Codex 任务。最后运行：
 
 ```text
-重构认证模块，保持公开行为不变，并验证结果。
+python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <你的项目> --doctor
 ```
+
+只有在明确替换现有 CCO profile 时才添加 `--replace`。安装器不会覆盖其他 profile
+路径，也不会删除被用户修改过的文件。
+
+## 使用
+
+安装后 CCO 默认隐式启用，正常描述任务即可：
 
 ```text
-检查这个服务是否存在并发问题，实现安全修复，并运行相关检查。
+重构解析器，保持现有行为，并验证最终状态。
 ```
 
-CCO 只会分派那些边界清晰、适合独立执行的部分。最终你仍会从 Primary 收到一个整合后
-的结果。
-
-## 自定义路由（可选）
-
-配置优先级如下：
+也可以显式调用：
 
 ```text
-当前用户请求 → 受信项目配置 → 全局配置 → 内置默认值
+使用 $codex-cost-orchestrator:orchestrate 实现并验证这个改动。
 ```
 
-全局配置位于 `~/.codex/cco.toml`：
+需要固定路由时直接说明：
+
+```text
+本次任务的 worker 和 reviewer 使用 Terra/max。
+```
+
+Primary 只需一次性闭合目标、范围、依赖和验收 ID。之后的 ready 计算、路由、
+baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地完成。子 Agent
+名称会显示职责、逻辑节点、模型、思考强度与 generation，便于实时查看。
+
+安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
+`$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。
+
+## 配置
+
+全局策略位于 `~/.codex/cco.toml`。项目内 `.codex/cco.toml` 只有在其规范根目录已
+写入全局 `trusted_project_roots` 时才会生效。
 
 ```toml
 trusted_project_roots = ["C:/work/my-project"]
@@ -138,60 +118,31 @@ candidates = [
   { model = "gpt-5.6-luna", effort = "max" },
   { model = "gpt-5.6-terra", effort = "max" },
 ]
-
-[routes.reviewer.guarded]
-candidates = [
-  { model = "gpt-5.6-terra", effort = "max" },
-]
 ```
 
-受信项目可以在 `.codex/cco.toml` 中添加相同的 route 表。完整配置和故障恢复规则见
-[运维说明](docs/OPERATIONS.md)。
+自动策略不能包含 Sol；当前用户明确指定的模型优先级更高，可以选择 Sol 或其他原生
+支持模型。
 
-## 工作区与数据边界
+## 安全边界
 
-- 同时支持 Git 与非 Git 目录；CCO 不会自动执行 `git init`。
-- 每个分派 capsule 都绑定一个规范的绝对工作区根目录；子 Agent 不会从任务当前目录猜测仓库。
-- 分派写入会根据声明的范围进行检查；只读角色必须保持其范围不变。
-- Git 检查会在有界扫描预算内覆盖 ignored 文件，以及范围内的 `skip-worktree` / `assume-unchanged` 路径。
-- symlink、junction/reparse point、路径别名歧义、特殊文件和根目录替换会被安全拒绝。
-- 临时状态只保存合同、路由、元数据和 hash，不保存源码副本、完整对话、凭据、计费历史
-  或遥测数据。
-- Codex 桌面端重启时，活跃或正在派遣的子 Agent 会记录为 `host_restart` 中断，
-  不会伪装成成功完成；其 tombstone 会保留，用于拒绝迟到结果。
-- Codex 桌面端会单独维护原生 V2 任务卡片。若已有严格完成证据的子任务在重启后仍显示
-  “处理中”，请按[运维说明](docs/OPERATIONS.md)执行显式维护；CCO 不会从 Hook 自动修改该状态。
-- CCO 是工作流守卫，不是操作系统沙箱，也不能抵御恶意的本地进程。完整信任模型见
-  [安全说明](SECURITY.md)。
+CCO 是工作流护栏，不是操作系统安全边界。Primary 仍是可信控制面，并负责集成和最终
+验收。只读 leaf 请求 read-only sandbox；worker 只获得一个有界写 lease，且不得 stage。
 
-## 更新与卸载
+Git 工作区会保护仓库控制状态、typed scopes、范围内 ignored 内容、路径别名、submodule
+和隐藏 status 情况。非 Git 工作区不会执行 `git init`，默认上限为 20,000 个条目和 1 GiB。
 
-<details>
-<summary>显示命令</summary>
+CCO 不计算单次任务的真实账单，也不承诺固定节省比例。benchmark 工具可在受控对照中
+记录模型的 token 字段，参见 [docs/BENCHMARK.md](docs/BENCHMARK.md)。
+
+运维和恢复命令见 [docs/OPERATIONS.md](docs/OPERATIONS.md)，安全问题报告方式见
+[SECURITY.md](SECURITY.md)。
+
+## 开发验证
 
 ```text
-codex plugin marketplace upgrade codex-cost-orchestrator
-codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
-codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
+python -m unittest discover -s tests
+python -m ruff check .
+python .github/scripts/validate_plugin.py
 ```
 
-```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --uninstall
-codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
-codex plugin marketplace remove codex-cost-orchestrator
-```
-
-安装器会保留已修改或来源未知的用户文件，供手动检查。
-
-</details>
-
-## 了解更多
-
-- [运维与兼容性](docs/OPERATIONS.md)
-- [安全模型](SECURITY.md)
-- [基准测试方法](docs/BENCHMARK.md)
-- [版本记录](CHANGELOG.md)
-- [开发路线](ROADMAP.md)
-- [参与贡献](CONTRIBUTING.md)
+本项目使用 [MIT License](LICENSE)。

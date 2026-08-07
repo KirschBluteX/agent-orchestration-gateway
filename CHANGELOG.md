@@ -2,6 +2,39 @@
 
 The project follows semantic versioning.
 
+## 2.0.0 - 2026-08-07
+
+- Replaced caller-authored graph/lifecycle details with a compact plan brief and a
+  single `plan → next → native Agent → result` control-plane interface.
+- Split immutable logical Plan artifacts from fresh execution Wave artifacts; one
+  atomic lifecycle state now advances dependencies, logical aggregate members,
+  continuations, route fallback, restart fencing, and late-result tombstones.
+- Removed short dispatch references and Hook message expansion. Wave output contains
+  complete compact native inputs, while exact Hooks only validate prepared work.
+- Removed the global all-tool PreToolUse matcher and reduced the runtime to five exact
+  Hook definitions with no UserPromptSubmit path.
+- Preserved maximum non-conflicting ready selection, one writer, compatible read
+  concurrency, mechanical aggregation, static Luna/Terra routing, user pins, fresh
+  Git/non-Git workspace verification, and Primary final authority.
+- Replaced self-hashed result envelopes with a locally parsed result bound to dispatch
+  identity and continuation cursor.
+- Split the 382-word implicit `orchestrate` hot skill from the on-demand `manage-cco`
+  installation, doctor, configuration, and recovery skill.
+- Removed compatibility adapters, duplicated transaction/ledger state, historical
+  profile migration tables, and the old protocol implementation and private tests.
+- Simplified clean profile installation with atomic replacement, rollback, exact
+  uninstall ownership, current Hook trust inspection, and static-route doctor checks.
+- Aligned Stop and SubagentStop handling with the current Codex Hook contract: first
+  Stop events guard active work, compaction never fences children, and terminal child
+  results prevent accidental continuation by another Hook.
+- Replaced exponential ready-set search with an exact polynomial selector specialized
+  to CCO's one-writer/compatible-reader conflict model.
+- Moved expensive workspace verification outside the lifecycle lock, bound prepared
+  continuation messages exactly, revalidated snapshot content, and shared Git metadata
+  reads during plan and Wave compilation.
+- Added current-task-only explicit cleanup that refuses active or paused child work and
+  leaves no background retention process.
+
 ## 1.3.1 - 2026-08-07
 
 - Extended the workspace write lease through `continuable` worker ownership and

@@ -23,11 +23,11 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from host_paths import HostPathError, host_path, is_within  # noqa: E402
-from packet_compiler import (  # noqa: E402
-    CapsuleError,
+from control_plane import (  # noqa: E402
+    ControlPlane,
+    ControlPlaneError,
     RESULT_HEADER,
-    parse_result_message,
-    validate_result_for_dispatch,
+    parse_result,
 )
 from rollout_io import (  # noqa: E402
     RolloutError,
@@ -35,7 +35,6 @@ from rollout_io import (  # noqa: E402
     is_rollout_path,
     iter_tail_records,
 )
-from task_ledger import LedgerBusy, LedgerConflict, TaskLedger  # noqa: E402
 
 
 PROTOCOL = "cco.host-edge-repair.v1"
@@ -57,12 +56,12 @@ class HostEdgeRepairError(RuntimeError):
     """Raised when host state cannot be audited safely."""
 
 
-def _default_ledger_root() -> Path:
-    configured = os.environ.get("CCO_LEDGER_DIR")
+def _default_state_root() -> Path:
+    configured = os.environ.get("CCO_STATE_DIR")
     return (
         Path(configured).expanduser()
         if configured
-        else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "ledger"
+        else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "v9"
     )
 
 
@@ -206,64 +205,34 @@ def _rollout_proof(path: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
     if not result_messages:
         raise HostEdgeRepairError("agent rollout has no assistant CCO_RESULT")
     try:
-        parsed = parse_result_message(result_messages[-1])
-    except CapsuleError as error:
+        parsed = parse_result(result_messages[-1])
+    except ControlPlaneError as error:
         raise HostEdgeRepairError("agent rollout CCO_RESULT is invalid") from error
     return first, parsed
 
 
-def _validate_ledger_result(
+def _validate_lifecycle_result(
     *,
     agent_path: str,
     agent_role: str,
     parent_thread_id: str,
-    ledger_root: Path,
+    state_root: Path,
     result: Mapping[str, Any],
 ) -> None:
-    if not (ledger_root / f"{parent_thread_id}.json").is_file():
-        raise HostEdgeRepairError("CCO task ledger is unavailable")
     try:
-        rows = TaskLedger(ledger_root, parent_thread_id).read_rows()
-    except (LedgerBusy, LedgerConflict, OSError, ValueError) as error:
-        raise HostEdgeRepairError("CCO task ledger is unavailable") from error
-    matches = [
-        row
-        for row in rows
-        if row.get("owner") == agent_path
-        and row.get("input_sha256") == result.get("dispatch_sha256")
-    ]
-    if len(matches) != 1:
-        raise HostEdgeRepairError("CCO task ledger has no exact terminal owner")
-    row = matches[0]
+        proof = ControlPlane(parent_thread_id, root=state_root).terminal_proof(
+            agent_path,
+            result,
+        )
+    except (ControlPlaneError, OSError, ValueError) as error:
+        raise HostEdgeRepairError("CCO lifecycle has no exact terminal owner") from error
     expected_role = (
         "cost_orchestrator_write_leaf"
-        if row.get("role") == "worker"
+        if proof.get("role") == "worker"
         else "cost_orchestrator_read_leaf"
     )
     if agent_role != expected_role:
-        raise HostEdgeRepairError("CCO task ledger role does not match the host edge")
-    try:
-        normalized = validate_result_for_dispatch(
-            result,
-            role=str(row.get("role")),
-            acceptance_ids=row.get("acceptance_ids"),
-        )
-    except (CapsuleError, ValueError) as error:
-        raise HostEdgeRepairError("CCO_RESULT does not match its ledger contract") from error
-    if (
-        normalized["status"] != "complete"
-        or normalized["disposition"] not in {"retire", "accept"}
-        or normalized["payload"]["blockers"]
-        or normalized["payload"]["deviations"]
-        or row.get("state") != "retired"
-        or row.get("review_seed")
-        != {
-            "disposition": normalized["disposition"],
-            "payload": normalized["payload"],
-            "status": normalized["status"],
-        }
-    ):
-        raise HostEdgeRepairError("CCO child is not proof-backed terminal work")
+        raise HostEdgeRepairError("CCO lifecycle role does not match the host edge")
 
 
 def _session_source(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -280,7 +249,7 @@ def _session_source(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
 def _validate_terminal_edge(
     row: sqlite3.Row,
     *,
-    ledger_root: Path,
+    state_root: Path,
     sessions_root: Path,
 ) -> dict[str, Any]:
     parent = str(row["parent_thread_id"])
@@ -328,11 +297,11 @@ def _validate_terminal_edge(
             or source.get("agent_role") != agent_role
         ):
             raise HostEdgeRepairError("agent session metadata does not match the spawn edge")
-        _validate_ledger_result(
+        _validate_lifecycle_result(
             agent_path=agent_path,
             agent_role=agent_role,
             parent_thread_id=parent,
-            ledger_root=ledger_root,
+            state_root=state_root,
             result=cco_result,
         )
     except HostEdgeRepairError as error:
@@ -340,7 +309,7 @@ def _validate_terminal_edge(
         return result
     result.update(
         {
-            "evidence": "CCO_RESULT+TaskLedger+event_msg/task_complete",
+            "evidence": "CCO_RESULT+Lifecycle+event_msg/task_complete",
             "verdict": "repairable",
         }
     )
@@ -387,7 +356,7 @@ def _edge_rows(
 def audit_edges(
     *,
     codex_home: Path,
-    ledger_root: Path,
+    state_root: Path,
     parent_thread_id: str | None,
     child_thread_ids: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -397,7 +366,7 @@ def audit_edges(
         raise HostEdgeRepairError("Codex home is unavailable") from error
     if _is_reparse(home):
         raise HostEdgeRepairError("Codex home cannot be a reparse point")
-    ledger = _resolved_plain_directory(ledger_root, label="CCO ledger root")
+    state = _resolved_plain_directory(state_root, label="CCO state root")
     database = _discover_state_db(home)
     sessions_root = (home / "sessions").resolve(strict=True)
     uri = database.as_uri() + "?mode=ro"
@@ -410,7 +379,7 @@ def audit_edges(
             child_thread_ids=child_thread_ids,
         )
     edges = [
-        _validate_terminal_edge(row, ledger_root=ledger, sessions_root=sessions_root)
+        _validate_terminal_edge(row, state_root=state, sessions_root=sessions_root)
         for row in rows
     ]
     return {
@@ -418,7 +387,7 @@ def audit_edges(
         "edges": edges,
         "examined": len(edges),
         "mode": "check",
-        "ledger_root": str(ledger),
+        "state_root": str(state),
         "protocol": PROTOCOL,
         "repairable": sum(edge["verdict"] == "repairable" for edge in edges),
         "repaired": 0,
@@ -519,7 +488,7 @@ def _prune_rollback_journals(backup: Path) -> None:
 def repair_edges(
     *,
     codex_home: Path,
-    ledger_root: Path,
+    state_root: Path,
     parent_thread_id: str | None,
     child_thread_ids: list[str] | None,
 ) -> dict[str, Any]:
@@ -530,7 +499,7 @@ def repair_edges(
     requested = set(child_thread_ids)
     result = audit_edges(
         codex_home=codex_home,
-        ledger_root=ledger_root,
+        state_root=state_root,
         parent_thread_id=parent_thread_id,
         child_thread_ids=child_thread_ids,
     )
@@ -550,7 +519,7 @@ def repair_edges(
         )
 
     home = host_path(codex_home).resolve(strict=True)
-    ledger = Path(str(result["ledger_root"]))
+    state = Path(str(result["state_root"]))
     database = Path(result["state_db"])
     backup: Path | None = None
     repaired = 0
@@ -564,7 +533,7 @@ def repair_edges(
             fresh_edges = [
                 _validate_terminal_edge(
                     row,
-                    ledger_root=ledger,
+                    state_root=state,
                     sessions_root=sessions_root,
                 )
                 for row in _edge_rows(
@@ -633,10 +602,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     parser.add_argument(
-        "--ledger-root",
+        "--state-root",
+        dest="state_root",
         type=Path,
-        default=_default_ledger_root(),
-        help="CCO task-ledger directory used to prove terminal ownership",
+        default=_default_state_root(),
+        help="CCO v9 state directory used to prove terminal ownership",
     )
     parser.add_argument("--parent-thread-id")
     parser.add_argument(
@@ -662,14 +632,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.repair:
             result = repair_edges(
                 codex_home=args.codex_home,
-                ledger_root=args.ledger_root,
+                state_root=args.state_root,
                 parent_thread_id=args.parent_thread_id,
                 child_thread_ids=args.child_thread_ids,
             )
         else:
             result = audit_edges(
                 codex_home=args.codex_home,
-                ledger_root=args.ledger_root,
+                state_root=args.state_root,
                 parent_thread_id=args.parent_thread_id,
                 child_thread_ids=args.child_thread_ids,
             )

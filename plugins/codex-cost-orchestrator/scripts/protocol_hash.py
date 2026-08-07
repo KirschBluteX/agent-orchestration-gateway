@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Small canonical JSON and repository-scope helpers for CCO v8.
-
-The v8 dispatch capsule owns protocol identity.  This module intentionally does
-not mirror capsule, contract, acceptance, route, or lifecycle schemas.
-"""
+"""Canonical JSON and repository-scope helpers for compact cco.v9 messages."""
 
 from __future__ import annotations
 

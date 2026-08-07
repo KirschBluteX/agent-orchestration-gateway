@@ -1,59 +1,46 @@
 {
-  "description": "Global CCO dispatch, task-ledger lifecycle, and bounded result-envelope guardrails.",
+  "description": "Exact cco.v9 native Agent lifecycle and workspace guardrails.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
             "timeout": 5,
             "async": false,
-            "statusMessage": "Loading CCO dispatch policy"
+            "statusMessage": "Recovering CCO state"
           }
         ]
       }
     ],
     "PreToolUse": [
       {
-        "matcher": ".*",
+        "matcher": "^(Agent|spawn_agent|collaborationspawn_agent|send_message|followup_task|collaborationsend_message|collaborationfollowup_task|interrupt_agent|interruptAgent|collaborationinterrupt_agent)$",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/agent_preflight.py\"",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
             "timeout": 30,
             "async": false,
-            "statusMessage": "Checking CCO transaction gate"
-          }
-        ]
-      },
-      {
-        "matcher": "^(interrupt_agent|interruptAgent|collaborationinterrupt_agent)$",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "timeout": 5,
-            "async": false,
-            "statusMessage": "Retiring CCO owner before interrupt"
+            "statusMessage": "Checking CCO dispatch"
           }
         ]
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Agent|spawn_agent|collaborationspawn_agent|send_message|followup_task|collaborationsend_message|collaborationfollowup_task)$",
+        "matcher": "^(Agent|spawn_agent|collaborationspawn_agent|followup_task|collaborationfollowup_task)$",
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
             "timeout": 5,
             "async": false,
-            "statusMessage": "Recording CCO native owner"
+            "statusMessage": "Recording CCO owner"
           }
         ]
       }
@@ -63,25 +50,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
             "timeout": 5,
             "async": false,
-            "statusMessage": "Protecting CCO native wait"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/ledger_runtime.py\"",
-            "timeout": 5,
-            "async": false,
-            "statusMessage": "Loading CCO dispatch context"
+            "statusMessage": "Checking active CCO work"
           }
         ]
       }
@@ -92,11 +65,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/subagent_stop.py\"",
-            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/subagent_stop.py\"",
+            "command": "python3 -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
+            "commandWindows": "python -B \"${PLUGIN_ROOT}/hooks/cco_hook.py\"",
             "timeout": 120,
             "async": false,
-            "statusMessage": "Checking CCO result and workspace"
+            "statusMessage": "Verifying CCO result"
           }
         ]
       }

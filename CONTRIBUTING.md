@@ -18,6 +18,7 @@ python -X utf8 -B -m unittest discover -s tests -v
 python -m ruff check plugins tests .github/scripts
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skills/orchestrate
+python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skills/manage-cco
 git diff --check
 ```
 

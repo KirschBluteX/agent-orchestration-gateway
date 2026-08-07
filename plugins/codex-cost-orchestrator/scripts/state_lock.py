@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Small cross-platform, OS-backed session lock shared by CCO state stores.
-
-The lock file is persistent, but ownership is held by the operating system.  A
-crashed process therefore releases the lock without a racy mtime-based stale
-delete.  The in-process guard makes nested ledger/transaction operations
-re-entrant while still serializing independent hook processes.
-"""
+"""One re-entrant cross-process lock for each cco.v9 lifecycle state."""
 
 from __future__ import annotations
 
@@ -29,7 +23,7 @@ _HELD: dict[str, tuple[int, int]] = {}
 
 
 def lock_path(root: Path, session_id: str) -> Path:
-    """Return the one lock path shared by the task and dispatch ledgers."""
+    """Return the one lock path shared by a task's lifecycle operations."""
 
     return Path(root) / f".{session_id}.cco-state.lock"
 

@@ -52,10 +52,9 @@ jobs:
         run: python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 
       - name: Run skill validator
-        run: >-
-          python
-          .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py
-          plugins/codex-cost-orchestrator/skills/orchestrate
+        run: |
+          python .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py plugins/codex-cost-orchestrator/skills/orchestrate
+          python .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py plugins/codex-cost-orchestrator/skills/manage-cco
 
       - name: Check patch whitespace
         run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD

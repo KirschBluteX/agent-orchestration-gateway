@@ -1,0 +1,6 @@
+interface:
+  display_name: "Manage CCO"
+  short_description: "Install, diagnose, configure, or recover CCO safely."
+  default_prompt: "Use $manage-cco to diagnose and recover this CCO installation."
+policy:
+  allow_implicit_invocation: false

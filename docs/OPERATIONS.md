@@ -1,257 +1,166 @@
-# Operations and compatibility
+# CCO operations
 
-## Supported surface
+Normal tasks use the thin `orchestrate` skill. This document covers installation,
+configuration, lifecycle recovery, and explicit host maintenance.
 
-| Dimension | Current support |
-| --- | --- |
-| Host | Codex CLI/Desktop with plugins, hooks, and native Agents |
-| Tested Codex contract | Desktop build 26.803.5235.0; CLI 0.146.0 catalogue fallback |
-| Operating system | Windows and Linux |
-| macOS | Not currently tested or claimed |
-| Python | 3.11+; CI exercises 3.11 and 3.14 |
-| IDE or other surfaces | Not claimed unless they load the same plugin/hook contract |
-| Authentication | Inherited from Codex; never read or stored by CCO |
-| Network | No CCO runtime network request |
+## Install or update
 
-## Install lifecycle
+From the repository root:
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --bootstrap
+codex plugin marketplace add .
+codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
+python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --bootstrap
 ```
 
-Open `/hooks`, inspect all seven current CCO hooks, and trust their hashes. Then run:
+Add `--replace` only when intentionally replacing the two exact CCO profile files.
+The installer stages both profiles before replacement and rolls back a partial write.
+It does not overwrite another filename or remove modified content.
+
+Open `/hooks`, review and trust these five definitions:
+
+1. SessionStart
+2. exact PreToolUse for native spawn, continuation, message, and interrupt tools
+3. exact PostToolUse for spawn and continuation
+4. Stop fallback
+5. SubagentStop for the two CCO leaf profiles
+
+Session recovery runs only for `resume` or `clear`; context compaction does not fence
+live child work. A terminal CCO result returns `continue:false` so another matching Hook
+cannot accidentally run the completed child again.
+
+Start a new Codex task, then run:
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --doctor
+python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
 ```
 
-Doctor is read-only. It verifies Python, shipped files, exact installed profile bytes,
-active project shadows, authoritative Codex hook discovery/trust, the native model
-catalogue, and one representative static route. A ready installation prints `HOOKS
-READY` and `STATIC ROUTE READY`.
+Doctor is read-only. It verifies Python, exact profiles, manifest identity, Hook
+discovery/trust, and at least one native static route.
 
-Bootstrap performs an atomic two-profile transaction. It replaces only known
-published bytes, removes only known legacy bytes, rolls back on failure, and preserves
-unknown/user-modified files. Check and uninstall use the same ownership rules:
+## Normal control-plane flow
+
+`control_plane.py` reads the current task from `CODEX_THREAD_ID`. Do not pass another
+task's ID.
 
 ```text
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --check
-python plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace . --uninstall
+python -B <PLUGIN_ROOT>/scripts/control_plane.py plan --repo <PROJECT>
+python -B <PLUGIN_ROOT>/scripts/control_plane.py next --capacity <N>
 ```
 
-Start a new task after any plugin, profile, or hook change.
+`plan` reads one brief from stdin. External scopes use `file` or `tree`. The only
+required node fields are `id`, `role`, `objective`, `acceptance`, and `scopes`.
 
-## Static route behavior
+```json
+{
+  "goal": "Update and verify the parser",
+  "acceptance": {
+    "A01": "The parser accepts the new form",
+    "A02": "Existing forms remain valid"
+  },
+  "nodes": [
+    {
+      "id": "parser_change",
+      "role": "worker",
+      "objective": "Implement the closed parser change",
+      "acceptance": ["A01", "A02"],
+      "scopes": [{"kind": "tree", "path": "src/parser"}]
+    }
+  ]
+}
+```
 
-| Role / assurance | Automatic order |
-| --- | --- |
-| explorer/worker mechanical | Luna, Terra |
-| explorer/worker bounded | Terra, Luna |
-| explorer/worker guarded | Terra |
-| reviewer | Terra |
+Omitted `decision` means bounded judgment. Set `decision` to `mechanical` only when
+all allowed choices are acceptance-equivalent. `verification=semantic|manual` or a
+non-empty `risks` list raises the route to guarded.
 
-Effort adapts through `max`, `xhigh`, `high`. Sol and `ultra` are never automatic.
-Current user pins override project/global policy. Unsupported exact pins and invalid
-higher-priority policy remain in Primary without substitution.
+`next` returns complete native inputs. Dispatch them unchanged, then enter one long
+`wait_agent`. Call `next` again only after the current wave settles. It advances
+logical dependencies from lifecycle evidence; Primary never supplies completed nodes.
 
-Both CCO leaf profiles are model-neutral. The compiler sends the selected model and
-effort explicitly on native spawn, so Luna does not require a dedicated profile. The
-graph compiler accepts host capability metadata to avoid a CLI round trip. If it
-is absent, CCO reads the PATH Codex bundled catalogue once for that preparation. It
-does not contact a model or network service. Desktop catalogues may mark eligible
-models with `visibility: "list"`; hidden, disabled, and unknown visibility values are
-ignored. The actual native spawn response remains the final capability evidence.
-
-## Fast dispatch sequence
-
-1. Close the complete graph from facts already present in the user request and known
-   repository policy. If one material fact is missing, use one narrow explorer.
-2. Put shared facts in graph `defaults` and invoke `graph_compiler.py` once. A ready
-   batch admits at most one write worker; non-overlapping read-only nodes may share
-   the batch.
-   A terminal worker can be handed to a reviewer with `review_source`; the compiler
-   reuses its ledger baseline, acceptance IDs, scopes, changed paths, and evidence.
-3. Issue every ready short spawn reference in the same Primary model turn. No other
-   tool is allowed while the transaction still has pending references.
-4. Call `wait_agent` once and enter one long event wait. Do not poll or send progress-only requests. Child
-   completion, blocking input, or a user message wakes Primary.
-
-Only a native terminal event proves normal completion, failure, or interruption. A
-Codex Desktop restart is the explicit host interruption boundary: the next
-`SessionStart` retires and fences the previous session's active or dispatching
-children with `host_restart`. An opaque or unreadable progress payload and an
-unchanged workspace prove nothing about Agent state. Do not copy protected payloads
-including `reasoning` objects with `encrypted_content` into `send_message` or
-`followup_task`; keep the owner active and wait. The 30-minute
-protection timeout is a recovery wakeup, not a forced Agent interruption or implicit
-completion.
-
-A confirmed pre-thread rejection advances only that node to its precompiled fallback.
-Active siblings continue. Graph identity, workspace, or transaction corruption is a
-graph-level failure and fences the undispatched remainder.
-
-## Hooks and local state
-
-| Event | Purpose |
-| --- | --- |
-| SessionStart | Treat Desktop restart as `host_restart` interruption for active/dispatching children; inject the reminder, remove terminal prior sessions, and prune stale state |
-| PreToolUse all tools | Exit cheaply when no transaction marker exists; otherwise use a 30-second bound to gate pending work, verify a bounded workspace, and expand one exact short spawn reference |
-| PreToolUse continuation | Require exact next cursor and reject opaque protected payload forwarding |
-| PreToolUse interrupt | Retire/fence before native interruption |
-| PostToolUse | Activate one owner, settle continuation, or release rejected spawn |
-| Stop | Concisely require `wait_agent` or perform one bounded pending-batch recovery without exposing transaction internals |
-| UserPromptSubmit | Restore compact active/pending transaction context after user input |
-| SubagentStop | Map native UUID to owner; validate result, evidence, role, scope, and exact delta; retire once without a formatting-only second response |
-
-Large terminal artifacts and settled dispatch bundles delete immediately. A
-continuable worker keeps both its workspace write lease and reachable graph artifact
-until it retires. On a Codex
-Desktop restart, `SessionStart` retires active/dispatching children as
-`host_restart`, records a guarded floor, and keeps owner tombstones so late results
-remain fenced. It then removes validated terminal ledgers and their workspace
-artifacts from prior sessions. Valid orphan state and bundles use bounded stale
-cleanup; expired `.cco-transaction-*` crash residue is reclaimed. Every cleanup
-decision is rechecked under the shared OS lock. Locked state is retried later, while
-malformed state remains fail-closed for explicit recovery. This keeps fencing across
-multiple turns without adding an optional SessionEnd hook that the current desktop
-browser cannot expose for trust review.
-
-Cross-session cleanup checks the matching dispatch-transaction file before deleting
-a terminal TaskLedger or its graph artifact. A pending, dispatching, or active sibling
-keeps that artifact available. Capacity pruning likewise excludes any fenced
-transaction that still contains an active node.
-
-The state root defaults to the OS temporary directory under
-`codex-cost-orchestrator`. `CCO_LEDGER_DIR` may choose another external absolute
-location. Do not manually delete state belonging to an active task; a Desktop
-restart performs the safe `host_restart` retirement at `SessionStart`.
-
-`compact` is not a host restart: it preserves confirmed active owners. On
-`startup`, `resume`, or `clear` (and on older hosts without a reliable source), CCO
-uses restart reconciliation and fences active/dispatching children. This prevents
-normal context compaction from killing valid work while still clearing stale Desktop
-state after a real restart.
-
-Every cco.v8 graph and capsule binds one canonical absolute `workspace_root`. The
-artifact, transaction, TaskLedger claim, continuation, and result verification must
-all use that same root; host cwd is never substituted.
-
-## Git workspaces
-
-Git status and control-state checks remain repository-wide. Content fingerprints are
-scope-bounded, while ignored files are captured globally within configured file/byte
-budgets so a new out-of-scope ignored write is still attributable. Scoped
-`skip-worktree` and `assume-unchanged` entries are fingerprinted explicitly. Budget
-overflow fails closed rather than silently weakening workspace verification.
-
-## Non-Git directory workspaces
-
-CCO does not run `git init`. If the exact target root is not a Git worktree, the
-prepared-workspace adapter uses directory mode:
-
-- explorer and reviewer snapshots cover only their declared scopes and accept no
-  change;
-- worker snapshots cover the complete root, while only its declared scope may change;
-- path/type/size preflight is limited to 20,000 entries and 1 GiB by default and runs
-  before any file content is read; the workspace-scanning PreToolUse hook allows 30
-  seconds while its ordinary no-transaction path remains a lightweight fast exit;
-- symlinks, junctions/reparse points, special files, case-insensitive aliases, root
-  replacement, and capture-time changes fail closed;
-- snapshots contain paths, types, sizes, bounded metadata, and SHA-256 values, never
-  source copies; large artifacts are deleted with the graph lifecycle.
-
-An over-budget workspace returns the prepared batch to Primary. It is never silently
-filtered, including for `node_modules` or other large dependency trees. If a ready
-batch contains any worker, the shared directory baseline covers the complete root;
-CCO does not keep read-only siblings by weakening that batch to a partial baseline.
-
-Python 3.14 reads Codex `.jsonl.zst` rollouts with the standard library. Python
-3.11–3.13 need the optional `zstandard` package only when inspecting compressed
-rollouts; ordinary routing and execution do not require it. Rollout inspection caps
-each binary record at 4 MiB and total decompressed data at 256 MiB. Host-edge repair
-also caps the first session metadata at 64 KiB and terminal evidence at a 1 MiB tail;
-plain JSONL tails are read from the end instead of scanning the full history.
-
-## Reviewer delta baseline
-
-A fresh reviewer normally uses the state captured at review preparation as both its
-comparison and workspace-verification baseline. To review a known worker delta,
-Primary may pass that worker's previously verified baseline as `review_baseline`.
-The compiler then places the old identity in the reviewer capsule and places the
-freshly captured review state in `current_state`; the artifact, ledger, and read-only
-workspace checks remain bound to the fresh state.
-
-`review_baseline` is a SHA-256 state identity, not an archived source snapshot.
-Primary must still provide the closed contract, anchors, and evidence needed to
-inspect the delta. It is reviewer-only and cannot weaken current-state verification.
-
-For the normal terminal-worker path, prefer node `review_source` with the worker's
-`node` and `contract_rev`. The compiler resolves one exact current-task ledger row,
-validates its bounded result seed, and derives `review_baseline`, exact scopes,
-acceptance facts, source evidence, reviewer role, and `fork_turns: none`. Primary still
-supplies the new reviewer node, epoch, and closed semantic contract. Manually supplied
-derived fields must match the ledger or preparation fails closed.
-
-## Failure behavior
-
-- Profile missing/shadowed/modified or hook untrusted: no delegation; run doctor.
-- Codex Desktop restart: retire and fence active/dispatching children as
-  `host_restart`; inspect the actual workspace before starting a newer generation.
-- Node route unavailable: only that node returns to Primary.
-- Confirmed pre-thread rejection: use the next precompiled fallback only.
-- Interrupted pending dispatch: one exact recovery; a second abandonment fences only
-  nodes that never became active.
-- Managed malformed capsule, wrong owner/cursor, or raw follow-up: block before delivery.
-- A `continuable` worker keeps the workspace write lease; a second write worker or a
-  result containing another node's delta is rejected.
-- Invalid or stale SubagentStop result: retire and fence once, show Primary a concise
-  status, and do not trigger another child response merely to repair formatting.
-- SubagentStop workspace verification uses the prepare-time repository bound in the
-  task claim; the event's `cwd` may be a repository parent and is not authoritative.
-- Result path/evidence/workspace mismatch: retire and fence; Primary inspects the
-  actual state before replanning.
-- Incomplete, blocked, or deviation: record one failure signature and force a guarded
-  newer generation.
-- Luna quality failure: Terra guarded. Terra quality failure: Primary replans.
-- Sol: current explicit user pin only; never automatic escalation.
-
-## Troubleshooting
-
-Run `--doctor` first. If hooks are not ready, use `/hooks`; do not use the dangerous
-trust-bypass flag for normal operation. For a shadow, inspect `.codex/agents` and
-`config.toml` declarations in the current repository and configured Codex home. For a
-modified profile, compare and decide manually. For route failure, inspect the native
-catalogue or supply a supported current-user pin.
-
-### Completed V2 children still show as processing
-
-Codex Desktop persists native V2 spawn edges separately from CCO's ledger. A rollout
-can end with `event_msg/task_complete` while its host edge remains `open`; after a
-restart, the Agent is not running, but the task card may still say processing. CCO's
-SessionStart retirement prevents stale waiting and late-result acceptance, but the
-Hook API cannot relabel that host-owned card.
-
-The optional maintenance CLI is outside every Hook and is read-only by default. First
-close active child work, then inspect proof-backed stale CCO edges:
+## Lifecycle operations
 
 ```text
-python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --ledger-root <CCO_LEDGER_DIR> --check
+python -B <PLUGIN_ROOT>/scripts/control_plane.py status
+python -B <PLUGIN_ROOT>/scripts/control_plane.py continue --dispatch <sha256:id>
+python -B <PLUGIN_ROOT>/scripts/control_plane.py abandon --node <node_id>
+python -B <PLUGIN_ROOT>/scripts/control_plane.py retry --node <node_id>
+python -B <PLUGIN_ROOT>/scripts/control_plane.py restart
+python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
 ```
 
-Repair only the exact parent and children you reviewed. Repeat `--child-thread-id`
-for each selected child:
+- `continue` reads a non-empty JSON evidence delta from stdin and returns one exact
+  `followup_task` input. Dispatch it unchanged.
+- `abandon` fences paused work and releases its write lease.
+- `retry` creates a guarded newer generation for a fenced logical node.
+- `restart` fences starting, running, and paused native turns. Inspect the workspace
+  before retrying.
+- `cleanup` deletes only the current task's inactive state and artifacts. It refuses
+  active or paused child work; retain state until host-card maintenance is unnecessary.
+
+State transitions are `waiting → ready → starting → running → retired`, with
+`running → paused → starting` for continuation and `starting/running/paused → fenced`
+for interruption. A paused writer keeps the sole workspace write lease.
+
+Wave artifacts contain the fresh baseline and are deleted as soon as every physical
+dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,
+and bounded tombstones remain available for recovery and host proof.
+
+## Static route policy
+
+Global configuration: `~/.codex/cco.toml`.
+
+Project configuration: `<PROJECT>/.codex/cco.toml`, loaded only when the canonical
+project root is present in global `trusted_project_roots`.
+
+```toml
+trusted_project_roots = ["C:/work/project"]
+
+[routes.explorer.mechanical]
+candidates = [
+  { model = "gpt-5.6-luna", effort = "max" },
+  { model = "gpt-5.6-terra", effort = "max" },
+]
+```
+
+Automatic policy may use `max`, `xhigh`, or `high`, cannot select Sol, and cannot use
+Luna for guarded or reviewer work. A current explicit user pin can select any native
+supported pair and has no silent fallback when fully fixed.
+
+## Workspace rules
+
+Git plans bind the canonical worktree root and protect Git control state, index, refs,
+typed scopes, path aliases, ignored in-scope files, submodules, and hidden status
+entries. A worker result must report the exact verified delta in its logical scopes.
+
+Non-Git plans bind the exact directory root and never initialize Git. A write wave
+captures the complete root; read-only waves capture declared scopes. Defaults are
+20,000 total entries and 1 GiB.
+
+## Host task-card maintenance
+
+Codex Desktop owns task cards separately from CCO. CCO Hooks never modify the host
+database. If a proof-backed terminal child remains displayed as processing, audit it:
 
 ```text
-python plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --ledger-root <CCO_LEDGER_DIR> --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID> --repair
+python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --state-root <CCO_STATE_DIR> --check
 ```
 
-Repair is allowed only when the host row, CCO role, canonical Agent path, first
-`session_meta`, parent/child identities, and final `task_complete` event all agree.
-Before writing, the tool creates a minimal rollback journal (parent/child IDs and
-prior status only) below `~/.codex/backups/cco-host-edge-repair/`, acquires a database
-write transaction, and revalidates every requested child. Any missing, changed,
-duplicated, non-CCO, or unproven child fails the entire command. The journal is
-permission-restricted where the host allows it, and only the newest three journals
-for a state database are retained. Restart Codex Desktop afterward so its task list
-reloads the corrected edge state. Do not use this command for a genuinely active
-Agent or as an automatic SessionStart action.
+Repair only explicitly named edges after inspecting the audit and backup:
+
+```text
+python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --state-root <CCO_STATE_DIR> --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID> --repair
+```
+
+The tool requires matching native session metadata, `task_complete`, a valid cco.v9
+result, and a matching retired lifecycle dispatch. Paused, blocked, stale, malformed,
+or hash-mismatched work is not repairable.
+
+## Remove profiles
+
+```text
+python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --uninstall
+codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
+```
+
+Uninstall removes only files that exactly match the current templates.
