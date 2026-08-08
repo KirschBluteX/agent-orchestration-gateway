@@ -47,8 +47,9 @@ def open_rollout(path: Path) -> Iterator[BinaryIO]:
             ) from error
         try:
             with path.open("rb") as source:
-                with zstandard.ZstdDecompressor().stream_reader(source) as stream:
-                    yield stream
+                with zstandard.ZstdDecompressor().stream_reader(source) as raw:
+                    with io.BufferedReader(raw) as stream:
+                        yield stream
         except (OSError, zstandard.ZstdError) as error:
             raise RolloutError("compressed rollout is unavailable or invalid") from error
         return
