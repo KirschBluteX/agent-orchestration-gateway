@@ -300,6 +300,15 @@ def _validate_result(
     usage = value.get("usage")
     if not isinstance(usage, Mapping) or usage.get("protocol") != USAGE_PROTOCOL:
         raise BenchmarkError(f"result {expected.get('run_id')} has invalid usage")
+    root_thread_id = value.get("root_thread_id")
+    if (
+        not isinstance(root_thread_id, str)
+        or THREAD_ID.fullmatch(root_thread_id) is None
+        or usage.get("root_thread_id") != root_thread_id
+    ):
+        raise BenchmarkError(
+            f"result {expected.get('run_id')} has no unique root thread binding"
+        )
     if usage.get("unexpected_models") != []:
         raise BenchmarkError(f"result {expected.get('run_id')} used an unexpected model")
     models = usage.get("models")
@@ -325,6 +334,7 @@ def _validate_result(
         "arm_id": expected["arm_id"],
         "arm_mode": expected["arm_mode"],
         "repetition": expected["repetition"],
+        "root_thread_id": root_thread_id,
         "run_id": expected["run_id"],
         "task_id": expected["task_id"],
         "tokens": checked_families,
@@ -366,6 +376,7 @@ def summarize(plan: Mapping[str, Any], results_dir: Path) -> dict[str, Any]:
     except OSError as error:
         raise BenchmarkError("results directory is unavailable") from error
     observed: dict[str, dict[str, Any]] = {}
+    observed_threads: dict[str, str] = {}
     for path in result_paths:
         value = _load_json(path, label=f"result {path.name}")
         run_id = value.get("run_id")
@@ -373,7 +384,14 @@ def summarize(plan: Mapping[str, Any], results_dir: Path) -> dict[str, Any]:
             raise BenchmarkError(f"result {path.name} is not in the plan")
         if run_id in observed:
             raise BenchmarkError(f"duplicate result for run {run_id}")
-        observed[run_id] = _validate_result(value, expected=expected[run_id])
+        checked = _validate_result(value, expected=expected[run_id])
+        root_thread_id = checked["root_thread_id"]
+        prior_run = observed_threads.setdefault(root_thread_id, run_id)
+        if prior_run != run_id:
+            raise BenchmarkError(
+                f"root thread {root_thread_id} is reused by {prior_run} and {run_id}"
+            )
+        observed[run_id] = checked
 
     arms: dict[str, dict[str, Any]] = {}
     for arm_id, mode in sorted(arm_modes.items()):
@@ -406,23 +424,51 @@ def summarize(plan: Mapping[str, Any], results_dir: Path) -> dict[str, Any]:
                 "total": sum(wall_times[arm_id]),
             }
 
-    paired = {"cco_static_wins": 0, "pairs": 0, "primary_only_wins": 0, "ties": 0}
+    paired = {
+        "by_pair": {},
+        "cco_static_wins": 0,
+        "pairs": 0,
+        "primary_only_wins": 0,
+        "ties": 0,
+    }
     grouped: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
     for result in observed.values():
         key = (result["task_id"], result["repetition"])
-        grouped.setdefault(key, {})[result["arm_mode"]] = result
-    for pair in grouped.values():
-        if set(pair) != {"primary_only", "cco_static"}:
-            continue
-        paired["pairs"] += 1
-        primary_pass = pair["primary_only"]["verdict"] == "pass"
-        cco_pass = pair["cco_static"]["verdict"] == "pass"
-        if cco_pass and not primary_pass:
-            paired["cco_static_wins"] += 1
-        elif primary_pass and not cco_pass:
-            paired["primary_only_wins"] += 1
-        else:
-            paired["ties"] += 1
+        arm_id = result["arm_id"]
+        pair = grouped.setdefault(key, {})
+        if arm_id in pair:
+            raise BenchmarkError(
+                f"duplicate result cell for {key[0]} repetition {key[1]} arm {arm_id}"
+            )
+        pair[arm_id] = result
+    primary_arms = sorted(
+        arm_id for arm_id, mode in arm_modes.items() if mode == "primary_only"
+    )
+    cco_arms = sorted(arm_id for arm_id, mode in arm_modes.items() if mode == "cco_static")
+    for primary_arm in primary_arms:
+        for cco_arm in cco_arms:
+            pair_id = f"{primary_arm}__vs__{cco_arm}"
+            stats = {
+                "cco_static_wins": 0,
+                "pairs": 0,
+                "primary_only_wins": 0,
+                "ties": 0,
+            }
+            for cell in grouped.values():
+                if primary_arm not in cell or cco_arm not in cell:
+                    continue
+                stats["pairs"] += 1
+                primary_pass = cell[primary_arm]["verdict"] == "pass"
+                cco_pass = cell[cco_arm]["verdict"] == "pass"
+                if cco_pass and not primary_pass:
+                    stats["cco_static_wins"] += 1
+                elif primary_pass and not cco_pass:
+                    stats["primary_only_wins"] += 1
+                else:
+                    stats["ties"] += 1
+            paired["by_pair"][pair_id] = stats
+            for field in ("cco_static_wins", "pairs", "primary_only_wins", "ties"):
+                paired[field] += stats[field]
 
     missing = sorted(set(expected) - set(observed))
     return {
@@ -462,6 +508,7 @@ def record_result(
         "manifest_sha256": expected["manifest_sha256"],
         "protocol": RESULT_PROTOCOL,
         "repetition": expected["repetition"],
+        "root_thread_id": usage.get("root_thread_id"),
         "run_id": run_id,
         "task_id": expected["task_id"],
         "usage": usage,
@@ -656,11 +703,26 @@ def _add_usage(target: dict[str, int], delta: Mapping[str, int]) -> None:
 
 
 def collect_usage(paths: list[Path]) -> dict[str, Any]:
+    canonical_paths: list[Path] = []
+    seen_paths: set[str] = set()
+    for path in paths:
+        try:
+            resolved = path.expanduser().resolve(strict=True)
+        except OSError as error:
+            raise BenchmarkError(f"rollout is unavailable: {path}") from error
+        identity = os.path.normcase(str(resolved))
+        if identity in seen_paths:
+            raise BenchmarkError(f"duplicate rollout path: {resolved}")
+        if not resolved.is_file() or not is_rollout_path(resolved):
+            raise BenchmarkError(f"rollout has an unsupported path: {resolved}")
+        seen_paths.add(identity)
+        canonical_paths.append(resolved)
+
     families = {family: _empty_usage() for family in ("sol", "terra", "luna")}
     models: dict[str, dict[str, int]] = {}
     unexpected_models: set[str] = set()
 
-    for path in paths:
+    for path in canonical_paths:
         current_model: str | None = None
         current_effort: str | None = None
         previous_total: dict[str, int] | None = None
@@ -721,7 +783,7 @@ def collect_usage(paths: list[Path]) -> dict[str, Any]:
         "families": families,
         "models": dict(sorted(models.items())),
         "protocol": USAGE_PROTOCOL,
-        "rollouts": len(paths),
+        "rollouts": len(canonical_paths),
         "unexpected_models": sorted(unexpected_models),
     }
 

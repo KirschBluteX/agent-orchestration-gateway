@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 from typing import Any, Iterator, Mapping
 import unicodedata
 
@@ -62,16 +63,14 @@ LOGICAL_STATES = frozenset(
         "starting",
         "running",
         "paused",
-        "interrupting",
         "retired",
         "fenced",
     }
 )
 DISPATCH_STATES = frozenset(
-    {"starting", "running", "paused", "interrupting", "retired", "fenced", "rejected"}
+    {"starting", "running", "paused", "retired", "fenced", "rejected"}
 )
-WRITER_LEASE_STATES = frozenset({"starting", "running", "paused", "interrupting"})
-ACTIVE_STATES = frozenset({"starting", "running", "paused", "interrupting"})
+ACTIVE_STATES = frozenset({"running", "paused"})
 NODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 ACCEPTANCE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -82,11 +81,29 @@ MAX_INPUT_BYTES = 1024 * 1024
 MAX_AGGREGATE_MEMBERS = 4
 MAX_TOMBSTONES = 256
 MAX_TRANSIENT_RETRIES = 3
+NATIVE_CLAIM_TTL_MILLISECONDS = 120_000
+NATIVE_FAILURE_KINDS = frozenset(
+    {"network", "other", "rate_limit", "route_rejected", "service", "timeout"}
+)
+ROUTE_REJECTION_CODES = frozenset(
+    {
+        "invalid_model",
+        "model_not_found",
+        "model_not_supported",
+        "model_unsupported",
+        "unknown_model",
+        "unsupported_model",
+    }
+)
 EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 
 
 class ControlPlaneError(RuntimeError):
     """A cco.v9 contract or lifecycle transition is invalid."""
+
+
+class ControlPlaneUnavailable(ControlPlaneError):
+    """CCO state infrastructure is temporarily unavailable; do not fence work."""
 
 
 def _text(value: object, label: str, *, limit: int = 8_192) -> str:
@@ -177,7 +194,7 @@ def _load_object(path: Path, label: str) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
     except OSError as error:
-        raise ControlPlaneError(f"{label} is unavailable") from error
+        raise ControlPlaneUnavailable(f"{label} is unavailable") from error
     if len(raw) > 32 * 1024 * 1024:
         raise ControlPlaneError(f"{label} is too large")
     try:
@@ -772,39 +789,45 @@ def parse_result(value: object) -> dict[str, Any]:
     }
 
 
-def _native_rejected(value: object) -> bool:
-    if isinstance(value, str):
-        lowered = value.casefold()
-        return any(token in lowered for token in ("unknown model", "unknown agent", "not supported", "unsupported", "rejected"))
-    if isinstance(value, Mapping):
-        if value.get("isError") is True or value.get("is_error") is True:
-            return True
-        return any(_native_rejected(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_native_rejected(item) for item in value)
-    return False
+def _native_failure_payload(value: object) -> object | None:
+    """Return only structured native failure fields, never arbitrary result text."""
+
+    if not isinstance(value, Mapping):
+        return None
+    failed = (
+        value.get("isError") is True
+        or value.get("is_error") is True
+        or value.get("success") is False
+        or value.get("ok") is False
+        or str(value.get("status", "")).casefold() in {"error", "failed", "failure"}
+    )
+    error = value.get("error")
+    if error is not None and error is not False and error != "":
+        return error
+    if failed:
+        return {
+            key: value[key]
+            for key in ("code", "message", "reason", "status")
+            if key in value
+        }
+    return None
 
 
-def _native_failed(value: object) -> bool:
-    if isinstance(value, Mapping):
-        if (
-            value.get("isError") is True
-            or value.get("is_error") is True
-            or value.get("success") is False
-            or value.get("ok") is False
-            or str(value.get("status", "")).casefold() in {"error", "failed", "failure"}
-        ):
-            return True
-        error = value.get("error")
-        if error is not None and error is not False and error != "":
-            return True
-        return any(_native_failed(item) for item in value.values())
-    if isinstance(value, list):
-        return any(_native_failed(item) for item in value)
-    if isinstance(value, str):
-        lowered = value.strip().casefold()
-        return lowered.startswith(("error:", "failed:", "failure:"))
-    return False
+def _native_result_kind(value: object) -> str:
+    """Classify a PostToolUse response as success, route rejection, or failure."""
+
+    failure = _native_failure_payload(value)
+    if failure is None:
+        return "success"
+    if isinstance(failure, Mapping):
+        markers = {
+            re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
+            for key in ("code", "kind", "reason", "status", "type")
+            if isinstance((raw := failure.get(key)), str)
+        }
+        if markers & ROUTE_REJECTION_CODES:
+            return "route_rejected"
+    return "failure"
 
 
 def _task_paths(value: object, *, key: str = "") -> set[str]:
@@ -842,20 +865,88 @@ def _sibling_writer_scopes(
         if item["wave_id"] == dispatch["wave_id"]
         and item["role"] == "worker"
         and item["dispatch_id"] != dispatch["dispatch_id"]
-        and item["state"] in {"starting", "running", "paused", "interrupting", "retired"}
+        and item["state"] in {"starting", "running", "paused", "retired"}
         for scope in item["scopes"]
     ]
+
+
+def _now_milliseconds() -> int:
+    return int(time.time() * 1000)
+
+
+def _native_claim_active(dispatch: Mapping[str, Any], *, now: int | None = None) -> bool:
+    deadline = dispatch.get("claim_expires_at")
+    return (
+        dispatch.get("state") == "starting"
+        and (
+            isinstance(dispatch.get("tool_use_id"), str)
+            or (
+                isinstance(deadline, int)
+                and not isinstance(deadline, bool)
+                and deadline > (_now_milliseconds() if now is None else now)
+            )
+        )
+    )
+
+
+def _native_settlement_overdue(
+    dispatch: Mapping[str, Any], *, now: int | None = None
+) -> bool:
+    deadline = dispatch.get("claim_expires_at")
+    return (
+        dispatch.get("state") == "starting"
+        and isinstance(dispatch.get("tool_use_id"), str)
+        and isinstance(deadline, int)
+        and not isinstance(deadline, bool)
+        and deadline <= (_now_milliseconds() if now is None else now)
+    )
+
+
+def _writer_lease_active(dispatch: Mapping[str, Any], *, now: int | None = None) -> bool:
+    if dispatch.get("role") != "worker":
+        return False
+    if dispatch.get("state") in {"running", "paused"}:
+        return True
+    if dispatch.get("state") == "starting" and dispatch.get("tool_kind") == "continuation":
+        return True
+    return _native_claim_active(dispatch, now=now)
+
+
+def _reader_active(dispatch: Mapping[str, Any], *, now: int | None = None) -> bool:
+    return dispatch.get("role") != "worker" and (
+        dispatch.get("state") == "running" or _native_claim_active(dispatch, now=now)
+    )
+
+
+def _scopes_overlap(
+    left: list[Mapping[str, str]],
+    right: list[Mapping[str, str]],
+) -> bool:
+    return any(
+        repository_scopes_overlap(left_scope, right_scope)
+        for left_scope in left
+        for right_scope in right
+    )
 
 
 class ControlPlane:
     """One deep interface for cco.v9 plan, wave, and lifecycle behavior."""
 
-    def __init__(self, session_id: str, *, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        root: Path | None = None,
+        lock_timeout: float = 10.0,
+    ) -> None:
         if SESSION_RE.fullmatch(session_id) is None:
             raise ControlPlaneError("session identity is invalid")
+        if lock_timeout <= 0:
+            raise ControlPlaneError("lock timeout must be positive")
         self.session_id = session_id
         self.root = Path(os.path.abspath((root or _state_root()).expanduser()))
         self.state_path = self.root / f"{session_id}.json"
+        self.lock_timeout = float(lock_timeout)
 
     @staticmethod
     def _validate_lifecycle_state(
@@ -899,21 +990,53 @@ class ControlPlane:
         """Serialize lease-affecting state changes for one canonical workspace."""
 
         workspace = self._workspace_hint() if workspace_root is None else workspace_root
-        with acquire(self.root, _workspace_lock_identity(workspace)):
-            with acquire(self.root, self.session_id):
+        deadline = time.monotonic() + self.lock_timeout
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        with acquire(
+            self.root,
+            _workspace_lock_identity(workspace),
+            timeout=remaining(),
+        ):
+            with acquire(self.root, self.session_id, timeout=remaining()):
                 yield
 
-    def _assert_writer_available(
+    @staticmethod
+    def _reconcile_expired_claims(state: dict[str, Any], *, now: int | None = None) -> bool:
+        changed = False
+        current = _now_milliseconds() if now is None else now
+        for dispatch in state["dispatches"].values():
+            if dispatch.get("state") != "starting" or _native_claim_active(
+                dispatch, now=current
+            ):
+                continue
+            dispatch["tool_use_id"] = None
+            dispatch["claim_expires_at"] = None
+            if dispatch.get("tool_kind") == "continuation":
+                dispatch["state"] = "paused"
+                for member in dispatch["members"]:
+                    state["logical"][member]["state"] = "paused"
+            changed = True
+        return changed
+
+    def _assert_cross_task_compatible(
         self,
         workspace_root: object,
         *,
+        role: str,
+        scopes: list[Mapping[str, str]],
         current_dispatch: str | None = None,
     ) -> None:
         target = _workspace_key(workspace_root)
         try:
             paths = sorted(self.root.glob("*.json"), key=lambda item: item.name)
         except OSError as error:
-            raise ControlPlaneError("lifecycle state directory is unavailable") from error
+            raise ControlPlaneUnavailable(
+                "lifecycle state directory is unavailable"
+            ) from error
+        now = _now_milliseconds()
         for path in paths:
             try:
                 state = self._validate_lifecycle_state(
@@ -926,16 +1049,31 @@ class ControlPlane:
             if _workspace_key(state["workspace_root"]) != target:
                 continue
             for dispatch in state["dispatches"].values():
-                if (
-                    dispatch.get("role") == "worker"
-                    and dispatch.get("state") in WRITER_LEASE_STATES
-                    and not (
-                        state["session_id"] == self.session_id
-                        and dispatch.get("dispatch_id") == current_dispatch
-                    )
-                ):
+                if state["session_id"] == self.session_id and dispatch.get(
+                    "dispatch_id"
+                ) == current_dispatch:
+                    continue
+                if role == "worker" and _writer_lease_active(dispatch, now=now):
                     raise ControlPlaneError(
                         "workspace writer lease is already held by "
+                        f"{state['session_id']}:{dispatch['dispatch_id']}"
+                    )
+                if (
+                    role == "worker"
+                    and _reader_active(dispatch, now=now)
+                    and _scopes_overlap(scopes, dispatch["scopes"])
+                ):
+                    raise ControlPlaneError(
+                        "workspace has an overlapping reader held by "
+                        f"{state['session_id']}:{dispatch['dispatch_id']}"
+                    )
+                if (
+                    role != "worker"
+                    and _writer_lease_active(dispatch, now=now)
+                    and _scopes_overlap(scopes, dispatch["scopes"])
+                ):
+                    raise ControlPlaneError(
+                        "workspace writer overlaps this reader: "
                         f"{state['session_id']}:{dispatch['dispatch_id']}"
                     )
 
@@ -1032,7 +1170,7 @@ class ControlPlane:
         plan_id = _digest(b"cco.plan.v1\0", unsigned)
         plan = {**unsigned, "plan_id": plan_id}
         plan_path = self._artifact_path("plan", plan_id)
-        with acquire(self.root, self.session_id):
+        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
             if self.state_path.exists():
                 self._read_state()
                 raise ControlPlaneError(
@@ -1107,8 +1245,14 @@ class ControlPlane:
     def _overall_state(state: Mapping[str, Any], plan: Mapping[str, Any]) -> str:
         logical = state["logical"]
         states = [item["state"] for item in logical.values()]
-        if any(item in ACTIVE_STATES for item in states):
+        if any(
+            _native_claim_active(dispatch)
+            or dispatch.get("state") in ACTIVE_STATES
+            for dispatch in state["dispatches"].values()
+        ):
             return "active"
+        if any(item in {"ready", "starting"} for item in states):
+            return "ready"
         if any(item in {"fenced", "waiting"} for item in states):
             return "blocked"
         if all(item == "retired" for item in states):
@@ -1203,6 +1347,9 @@ class ControlPlane:
         }
         return {
             "assurance": unit["assurance"],
+            "claim_expires_at": (
+                _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+            ),
             "cursor": 0,
             "dispatch_id": dispatch_id,
             "generation": generation,
@@ -1245,6 +1392,7 @@ class ControlPlane:
         catalog = load_native_catalog() if native_catalog is None else native_catalog
         with self._coordinated():
             state = self._read_state()
+            reconciled = self._reconcile_expired_claims(state)
             plan = self._read_plan(state)
             if state["active_wave_id"] is not None:
                 pending = [
@@ -1255,14 +1403,30 @@ class ControlPlane:
                     and item["tool_use_id"] is None
                 ]
                 if pending:
+                    for dispatch in pending:
+                        self._assert_cross_task_compatible(
+                            state["workspace_root"],
+                            role=dispatch["role"],
+                            scopes=dispatch["scopes"],
+                            current_dispatch=dispatch["dispatch_id"],
+                        )
+                    deadline = _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+                    for dispatch in pending:
+                        dispatch["claim_expires_at"] = deadline
+                    self._write_state(state)
                     return self._public_batch(state, sorted(pending, key=lambda item: item["task_name"]))
                 active = [
                     item
                     for item in state["dispatches"].values()
                     if item["wave_id"] == state["active_wave_id"]
-                    and item["state"] in ACTIVE_STATES
+                    and (
+                        item["state"] in ACTIVE_STATES
+                        or _native_claim_active(item)
+                    )
                 ]
                 if active:
+                    if reconciled:
+                        self._write_state(state)
                     return self._public_batch(state, [])
                 state["active_wave_id"] = None
                 self._refresh_ready(state, plan)
@@ -1309,19 +1473,11 @@ class ControlPlane:
                 downstream=downstream,
             )
             selected = _select_units(units, capacity)
-            if any(unit["role"] == "worker" for unit in selected):
-                self._assert_writer_available(plan["workspace_root"])
             wave_scopes = {
                 (scope["kind"], scope["path"]): dict(scope)
                 for unit in selected
                 for scope in unit["scopes"]
             }
-            baseline = capture_workspace(
-                Path(plan["workspace_root"]),
-                scopes=[wave_scopes[key] for key in sorted(wave_scopes)],
-                writable=any(unit["role"] == "worker" for unit in selected),
-            )
-            state["wave_sequence"] += 1
             artifact_units = []
             for unit in selected:
                 artifact_units.append(
@@ -1339,9 +1495,53 @@ class ControlPlane:
                         "scopes": deepcopy(unit["scopes"]),
                     }
                 )
+            self._write_state(state)
+            expected_revision = state["revision"]
+            workspace_root = plan["workspace_root"]
+            plan_id = plan["plan_id"]
+            blocked = [
+                {"node": node, "reason": route_errors[node]}
+                for node in sorted(route_errors)
+            ]
+
+        baseline = capture_workspace(
+            Path(workspace_root),
+            scopes=[wave_scopes[key] for key in sorted(wave_scopes)],
+            writable=any(unit["role"] == "worker" for unit in selected),
+        )
+
+        with self._coordinated(workspace_root):
+            state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
+                raise ControlPlaneError(
+                    "lifecycle changed while preparing the wave; retry next"
+                )
+            if (
+                state["revision"] != expected_revision
+                or state["active_wave_id"] is not None
+                or any(
+                    state["logical"][member]["state"] != "ready"
+                    for unit in selected
+                    for member in unit["members"]
+                )
+            ):
+                raise ControlPlaneError(
+                    "lifecycle changed while preparing the wave; retry next"
+                )
+            plan = self._read_plan(state)
+            if plan["plan_id"] != plan_id or plan["workspace_root"] != workspace_root:
+                raise ControlPlaneError("plan changed while preparing the wave")
+            for unit in selected:
+                self._assert_cross_task_compatible(
+                    workspace_root,
+                    role=unit["role"],
+                    scopes=unit["scopes"],
+                )
+            state["wave_sequence"] += 1
             wave_identity = {
                 "baseline_id": baseline["state_id"],
-                "plan_id": plan["plan_id"],
+                "plan_id": plan_id,
                 "protocol": WAVE_PROTOCOL,
                 "sequence": state["wave_sequence"],
                 "units": artifact_units,
@@ -1366,11 +1566,8 @@ class ControlPlane:
             state["active_wave_id"] = wave_id
             self._write_state(state)
             result = self._public_batch(state, created)
-            if route_errors:
-                result["blocked"] = [
-                    {"node": node, "reason": route_errors[node]}
-                    for node in sorted(route_errors)
-                ]
+            if blocked:
+                result["blocked"] = blocked
             return result
 
     def _find_dispatch(self, state: Mapping[str, Any], dispatch_id: str) -> dict[str, Any]:
@@ -1444,7 +1641,11 @@ class ControlPlane:
                     raise ControlPlaneError(
                         f"spawn {key} does not match the prepared wave"
                     )
-            if dispatch["tool_use_id"] not in {None, tool_use_id}:
+            if (
+                _native_claim_active(dispatch)
+                and dispatch["tool_use_id"] is not None
+                and dispatch["tool_use_id"] != tool_use_id
+            ):
                 raise ControlPlaneError("dispatch already has an in-flight spawn")
             wave = self._read_wave(state)
             self._validate_dispatch_wave(dispatch, wave)
@@ -1457,13 +1658,16 @@ class ControlPlane:
 
         with self._coordinated():
             state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
             dispatch, wave, allowed = claim(state)
             workspace_root = Path(dispatch["workspace_root"])
-            if dispatch["role"] == "worker":
-                self._assert_writer_available(
-                    workspace_root,
-                    current_dispatch=dispatch["dispatch_id"],
-                )
+            self._assert_cross_task_compatible(
+                workspace_root,
+                role=dispatch["role"],
+                scopes=dispatch["scopes"],
+                current_dispatch=dispatch["dispatch_id"],
+            )
             baseline = deepcopy(wave["baseline"])
             owner_scopes = deepcopy(dispatch["scopes"])
         try:
@@ -1478,8 +1682,13 @@ class ControlPlane:
             raise ControlPlaneError(str(error)) from error
         with self._coordinated():
             state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
             dispatch, _wave, _allowed = claim(state)
             dispatch["tool_use_id"] = tool_use_id
+            dispatch["claim_expires_at"] = (
+                _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+            )
             self._write_state(state)
 
     def preflight_continuation(self, payload: Mapping[str, Any]) -> None:
@@ -1493,7 +1702,10 @@ class ControlPlane:
 
         def claim(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
             dispatch = self._find_dispatch(state, body["dispatch_id"])
-            if dispatch["state"] != "starting" or dispatch["tool_kind"] != "continuation":
+            if (
+                dispatch["state"] not in {"paused", "starting"}
+                or dispatch["tool_kind"] != "continuation"
+            ):
                 raise ControlPlaneError("continuation is not ready")
             if (
                 tool_input.get("target") != dispatch["owner"]
@@ -1502,7 +1714,11 @@ class ControlPlane:
                 raise ControlPlaneError("continuation does not match its prepared input")
             if body.get("cursor") != dispatch["pending_cursor"]:
                 raise ControlPlaneError("continuation cursor is stale")
-            if dispatch["tool_use_id"] not in {None, tool_use_id}:
+            if (
+                _native_claim_active(dispatch)
+                and dispatch["tool_use_id"] is not None
+                and dispatch["tool_use_id"] != tool_use_id
+            ):
                 raise ControlPlaneError("continuation is already in flight")
             wave = self._read_wave(state)
             self._validate_dispatch_wave(dispatch, wave)
@@ -1520,13 +1736,16 @@ class ControlPlane:
 
         with self._coordinated():
             state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
             dispatch, wave, allowed = claim(state)
             workspace_root = Path(dispatch["workspace_root"])
-            if dispatch["role"] == "worker":
-                self._assert_writer_available(
-                    workspace_root,
-                    current_dispatch=dispatch["dispatch_id"],
-                )
+            self._assert_cross_task_compatible(
+                workspace_root,
+                role=dispatch["role"],
+                scopes=dispatch["scopes"],
+                current_dispatch=dispatch["dispatch_id"],
+            )
             baseline = deepcopy(wave["baseline"])
             owner_scopes = deepcopy(dispatch["scopes"])
         try:
@@ -1541,8 +1760,16 @@ class ControlPlane:
             raise ControlPlaneError(str(error)) from error
         with self._coordinated():
             state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
             dispatch, _wave, _allowed = claim(state)
+            dispatch["state"] = "starting"
             dispatch["tool_use_id"] = tool_use_id
+            dispatch["claim_expires_at"] = (
+                _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+            )
+            for member in dispatch["members"]:
+                state["logical"][member]["state"] = "starting"
             self._write_state(state)
 
     def _append_tombstone(self, state: dict[str, Any], dispatch: Mapping[str, Any], reason: str) -> None:
@@ -1611,41 +1838,84 @@ class ControlPlane:
             route_cursor=next_cursor,
         )
 
+    def _reject_route_locked(
+        self,
+        state: dict[str, Any],
+        dispatch: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        dispatch["tool_use_id"] = None
+        dispatch["claim_expires_at"] = None
+        if dispatch["tool_kind"] == "continuation":
+            dispatch["state"] = "paused"
+            for member in dispatch["members"]:
+                state["logical"][member]["state"] = "paused"
+            return None
+        dispatch["state"] = "rejected"
+        self._append_tombstone(state, dispatch, "native_route_rejected")
+        plan = self._read_plan(state)
+        fallback = self._fallback_dispatch(state, plan, dispatch)
+        if fallback is None:
+            self._fence_members(state, dispatch, "route_exhausted")
+        else:
+            state["dispatches"][fallback["dispatch_id"]] = fallback
+            for member in fallback["members"]:
+                state["logical"][member]["dispatch_id"] = fallback["dispatch_id"]
+                state["logical"][member]["state"] = "starting"
+        self._settle_wave(state)
+        return fallback
+
     def postflight_tool(self, payload: Mapping[str, Any]) -> None:
         tool_use_id = payload.get("tool_use_id")
         if not isinstance(tool_use_id, str):
             raise ControlPlaneError("native tool result has no call identity")
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, Mapping):
+            raise ControlPlaneError("native tool result has no input identity")
+        message = tool_input.get("message")
+        if isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
+            dispatch_id = parse_task_message(message)["dispatch_id"]
+        elif isinstance(message, str) and message.startswith(CONTINUE_HEADER + "\n"):
+            dispatch_id = parse_continue_message(message)["dispatch_id"]
+        else:
+            raise ControlPlaneError("native tool result is not CCO-owned")
         with self._coordinated():
             state = self._read_state()
-            matches = [item for item in state["dispatches"].values() if item.get("tool_use_id") == tool_use_id]
-            if len(matches) != 1:
-                raise ControlPlaneError("native tool result has no unique dispatch")
-            dispatch = matches[0]
+            dispatch = self._find_dispatch(state, dispatch_id)
+            if dispatch["state"] == "retired":
+                return
+            if dispatch["state"] in {"fenced", "rejected"}:
+                return
+            expected = dispatch.get("native")
+            if not isinstance(expected, Mapping) or any(
+                tool_input.get(key) != expected.get(key) for key in expected
+            ):
+                raise ControlPlaneError("native tool result input is stale")
+            if isinstance(dispatch.get("tool_use_id"), str) and dispatch[
+                "tool_use_id"
+            ] != tool_use_id:
+                raise ControlPlaneError("native tool result call identity is stale")
             response = payload.get("tool_response")
-            if _native_rejected(response):
+            outcome = _native_result_kind(response)
+            if outcome == "route_rejected":
+                self._reject_route_locked(state, dispatch)
+                self._write_state(state)
+                return
+            if outcome == "failure":
                 dispatch["tool_use_id"] = None
+                dispatch["claim_expires_at"] = None
                 if dispatch["tool_kind"] == "continuation":
-                    dispatch["pending_cursor"] = None
                     dispatch["state"] = "paused"
                     for member in dispatch["members"]:
                         state["logical"][member]["state"] = "paused"
-                    self._write_state(state)
-                    return
-                dispatch["state"] = "rejected"
-                self._append_tombstone(state, dispatch, "native_route_rejected")
-                plan = self._read_plan(state)
-                fallback = self._fallback_dispatch(state, plan, dispatch)
-                if fallback is None:
-                    self._fence_members(state, dispatch, "route_exhausted")
-                else:
-                    state["dispatches"][fallback["dispatch_id"]] = fallback
-                    for member in fallback["members"]:
-                        state["logical"][member]["dispatch_id"] = fallback["dispatch_id"]
-                        state["logical"][member]["state"] = "starting"
-                self._settle_wave(state)
                 self._write_state(state)
                 return
-            if dispatch["tool_kind"] == "spawn":
+            self._assert_cross_task_compatible(
+                dispatch["workspace_root"],
+                role=dispatch["role"],
+                scopes=dispatch["scopes"],
+                current_dispatch=dispatch["dispatch_id"],
+            )
+            if dispatch["state"] == "starting" and dispatch["tool_kind"] == "spawn":
                 owners = _task_paths(response)
                 if len(owners) > 1:
                     self._fence_members(state, dispatch, "native_owner_ambiguous")
@@ -1665,6 +1935,7 @@ class ControlPlane:
                 dispatch["pending_cursor"] = None
             dispatch["state"] = "running"
             dispatch["tool_use_id"] = None
+            dispatch["claim_expires_at"] = None
             for member in dispatch["members"]:
                 state["logical"][member]["state"] = "running"
             self._write_state(state)
@@ -1677,11 +1948,14 @@ class ControlPlane:
             dispatch = self._find_dispatch(state, dispatch_id)
             if dispatch["state"] != "paused" or not isinstance(dispatch.get("owner"), str):
                 raise ControlPlaneError("dispatch is not continuable")
-            if dispatch["role"] == "worker":
-                self._assert_writer_available(
-                    dispatch["workspace_root"],
-                    current_dispatch=dispatch["dispatch_id"],
-                )
+            if dispatch.get("pending_cursor") is not None:
+                raise ControlPlaneError("dispatch already has a prepared continuation")
+            self._assert_cross_task_compatible(
+                dispatch["workspace_root"],
+                role=dispatch["role"],
+                scopes=dispatch["scopes"],
+                current_dispatch=dispatch["dispatch_id"],
+            )
             cursor = dispatch["cursor"] + 1
             try:
                 message = _render_continue(dispatch, evidence_delta, cursor)
@@ -1689,11 +1963,9 @@ class ControlPlane:
                 raise ControlPlaneError(str(error)) from error
             dispatch["native"] = {"message": message, "target": dispatch["owner"]}
             dispatch["pending_cursor"] = cursor
-            dispatch["state"] = "starting"
             dispatch["tool_kind"] = "continuation"
             dispatch["tool_use_id"] = None
-            for member in dispatch["members"]:
-                state["logical"][member]["state"] = "starting"
+            dispatch["claim_expires_at"] = None
             self._write_state(state)
             return {
                 "dispatch_id": dispatch_id,
@@ -1705,7 +1977,7 @@ class ControlPlane:
     def owner_is_managed(self, owner: str) -> bool:
         if not self.state_path.exists():
             return False
-        with acquire(self.root, self.session_id):
+        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
             state = self._read_state()
             return any(item.get("owner") == owner for item in state["dispatches"].values())
 
@@ -1729,50 +2001,43 @@ class ControlPlane:
             ]
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt target has no unique active dispatch")
-            dispatch = matches[0]
-            dispatch["interrupt_previous"] = {
-                "state": dispatch["state"],
-                "tool_kind": dispatch["tool_kind"],
-            }
-            dispatch["state"] = "interrupting"
-            dispatch["tool_kind"] = "interrupt"
-            dispatch["tool_use_id"] = tool_use_id
-            for member in dispatch["members"]:
-                state["logical"][member]["state"] = "interrupting"
-            self._write_state(state)
 
     def postflight_interrupt(self, payload: Mapping[str, Any]) -> None:
         tool_use_id = payload.get("tool_use_id")
         if not isinstance(tool_use_id, str):
             raise ControlPlaneError("interrupt result has no call identity")
+        tool_input = payload.get("tool_input")
+        owner = tool_input.get("target") if isinstance(tool_input, Mapping) else None
+        if not isinstance(owner, str):
+            raise ControlPlaneError("interrupt result has no target identity")
+        response = payload.get("tool_response")
+        previous_status = (
+            response.get("previous_status") if isinstance(response, Mapping) else None
+        )
+        if previous_status is None:
+            raise ControlPlaneError("interrupt result has no previous native status")
         with self._coordinated():
             state = self._read_state()
             matches = [
                 item
                 for item in state["dispatches"].values()
-                if item.get("tool_use_id") == tool_use_id
-                and item.get("tool_kind") == "interrupt"
-                and item.get("state") == "interrupting"
+                if item.get("owner") == owner
             ]
+            if not matches:
+                return
             if len(matches) != 1:
-                raise ControlPlaneError("interrupt result has no unique pending dispatch")
+                raise ControlPlaneError("interrupt result has no unique managed dispatch")
             dispatch = matches[0]
-            previous = dispatch.pop("interrupt_previous", None)
-            if not isinstance(previous, Mapping) or previous.get("state") not in {
-                "running",
-                "paused",
-            }:
-                raise ControlPlaneError("interrupt previous state is invalid")
-            dispatch["tool_use_id"] = None
-            if _native_failed(payload.get("tool_response")):
-                dispatch["state"] = previous["state"]
-                dispatch["tool_kind"] = previous.get("tool_kind", "spawn")
-                for member in dispatch["members"]:
-                    state["logical"][member]["state"] = previous["state"]
-            else:
+            if dispatch["state"] in {"retired", "fenced", "rejected"}:
+                return
+            if (
+                isinstance(previous_status, str)
+                and previous_status in {"pending_init", "running"}
+                and dispatch["state"] in {"running", "paused"}
+            ):
                 self._fence_members(state, dispatch, "interrupted")
                 self._settle_wave(state)
-            self._write_state(state)
+                self._write_state(state)
 
     def record_result(self, owner: str, raw_result: object) -> dict[str, Any]:
         result = parse_result(raw_result)
@@ -1787,7 +2052,12 @@ class ControlPlane:
             list[dict[str, str]],
         ]:
             dispatch = self._find_dispatch(state, result["dispatch_id"])
-            if dispatch["state"] != "running":
+            if dispatch["state"] not in {"running", "starting"}:
+                raise ControlPlaneError("result owner is stale or fenced")
+            if dispatch["state"] == "starting" and dispatch.get("tool_kind") not in {
+                "spawn",
+                "continuation",
+            }:
                 raise ControlPlaneError("result owner is stale or fenced")
             if dispatch.get("owner") is None:
                 if not _owner_matches_task(owner, dispatch.get("task_name")):
@@ -1795,7 +2065,13 @@ class ControlPlane:
                 dispatch["owner"] = owner
             elif dispatch.get("owner") != owner:
                 raise ControlPlaneError("result owner is stale or fenced")
-            if result["cursor"] != dispatch["cursor"]:
+            expected_cursor = (
+                dispatch.get("pending_cursor")
+                if dispatch["state"] == "starting"
+                and dispatch.get("tool_kind") == "continuation"
+                else dispatch["cursor"]
+            )
+            if result["cursor"] != expected_cursor:
                 raise ControlPlaneError("result cursor is stale")
             if result["outcome"] == "accept" and dispatch["role"] != "reviewer":
                 raise ControlPlaneError("only a reviewer may claim acceptance")
@@ -1867,6 +2143,11 @@ class ControlPlane:
         with self._coordinated():
             state = self._read_state()
             dispatch, plan, nodes, _wave, _allowed = claim(state)
+            if dispatch.get("pending_cursor") is not None:
+                dispatch["cursor"] = dispatch["pending_cursor"]
+                dispatch["pending_cursor"] = None
+            dispatch["tool_use_id"] = None
+            dispatch["claim_expires_at"] = None
             dispatch["result"] = result
             if result["outcome"] == "pause":
                 dispatch["state"] = "paused"
@@ -1912,35 +2193,48 @@ class ControlPlane:
                 "verification": verification,
             }
 
-    def register_transient_failure(self, owner: str, signature: str) -> int | None:
-        """Keep one native owner live for at most three strong transient failures."""
+    def settle_native_failure(self, dispatch_id: str, kind: str) -> dict[str, Any]:
+        """Settle one Primary-observed typed native failure without parsing prose."""
 
-        if signature not in {
-            "native_network_failure",
-            "native_rate_limit",
-            "native_service_unavailable",
-            "native_timeout",
-        }:
-            raise ControlPlaneError("transient failure signature is invalid")
+        if kind not in NATIVE_FAILURE_KINDS:
+            raise ControlPlaneError("native failure kind is invalid")
         with self._coordinated():
             state = self._read_state()
-            matches = [
-                item
-                for item in state["dispatches"].values()
-                if item["state"] == "running"
-                and (
-                    item.get("owner") == owner
-                    or (
-                        item.get("owner") is None
-                        and _owner_matches_task(owner, item.get("task_name"))
-                    )
-                )
-            ]
-            if len(matches) != 1:
-                raise ControlPlaneError("transient failure owner has no active dispatch")
-            dispatch = matches[0]
-            if dispatch.get("owner") is None:
-                dispatch["owner"] = owner
+            dispatch = self._find_dispatch(state, dispatch_id)
+            if dispatch["state"] == "paused":
+                raise ControlPlaneError("native failure has no unsettled native call")
+            if dispatch["state"] not in {"starting", "running"}:
+                raise ControlPlaneError("native failure dispatch is not active")
+            if dispatch["state"] == "starting" and not isinstance(
+                dispatch.get("tool_use_id"), str
+            ):
+                raise ControlPlaneError("native failure has no unsettled native call")
+            if kind == "route_rejected":
+                if dispatch["state"] != "starting" or dispatch["tool_kind"] != "spawn":
+                    raise ControlPlaneError("only a prepared spawn route can be rejected")
+                fallback = self._reject_route_locked(state, dispatch)
+                self._write_state(state)
+                if fallback is None:
+                    return {
+                        "action": "fenced",
+                        "dispatch_id": dispatch_id,
+                        "protocol": "cco.native-failure.v1",
+                    }
+                return {
+                    "action": "fallback_route",
+                    "dispatch_id": fallback["dispatch_id"],
+                    "native": deepcopy(fallback["native"]),
+                    "protocol": "cco.native-failure.v1",
+                }
+            if kind == "other":
+                self._fence_members(state, dispatch, "native_call_failed")
+                self._settle_wave(state)
+                self._write_state(state)
+                return {
+                    "action": "fenced",
+                    "dispatch_id": dispatch_id,
+                    "protocol": "cco.native-failure.v1",
+                }
             attempts = dispatch.get("transient_retries", 0)
             if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
                 raise ControlPlaneError("transient retry counter is invalid")
@@ -1948,12 +2242,54 @@ class ControlPlane:
                 self._fence_members(state, dispatch, "transient_retry_exhausted")
                 self._settle_wave(state)
                 self._write_state(state)
-                return None
+                return {
+                    "action": "fenced",
+                    "dispatch_id": dispatch_id,
+                    "protocol": "cco.native-failure.v1",
+                }
             attempts += 1
             dispatch["transient_retries"] = attempts
-            dispatch["last_transient_failure"] = signature
+            dispatch["last_transient_failure"] = f"native_{kind}"
+            dispatch["tool_use_id"] = None
+            dispatch["claim_expires_at"] = None
+            if dispatch["state"] == "starting" and dispatch["tool_kind"] == "spawn":
+                dispatch["claim_expires_at"] = (
+                    _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+                )
+                self._write_state(state)
+                return {
+                    "action": "retry_same_call",
+                    "attempt": attempts,
+                    "dispatch_id": dispatch_id,
+                    "native": deepcopy(dispatch["native"]),
+                    "protocol": "cco.native-failure.v1",
+                }
+            if not isinstance(dispatch.get("owner"), str):
+                raise ControlPlaneError("native failure dispatch has no continuation owner")
+            if dispatch.get("pending_cursor") is None:
+                cursor = dispatch["cursor"] + 1
+                dispatch["native"] = {
+                    "message": _render_continue(
+                        dispatch,
+                        {"native_failure": kind, "retry": attempts},
+                        cursor,
+                    ),
+                    "target": dispatch["owner"],
+                }
+                dispatch["pending_cursor"] = cursor
+            dispatch["state"] = "paused"
+            dispatch["tool_kind"] = "continuation"
+            for member in dispatch["members"]:
+                state["logical"][member]["state"] = "paused"
             self._write_state(state)
-            return attempts
+            return {
+                "action": "continue_same_owner",
+                "attempt": attempts,
+                "dispatch_id": dispatch_id,
+                "message": dispatch["native"]["message"],
+                "protocol": "cco.native-failure.v1",
+                "target": dispatch["owner"],
+            }
 
     def fence_invalid_result(self, owner: str, reason: str = "invalid_result") -> None:
         with self._coordinated():
@@ -1961,7 +2297,7 @@ class ControlPlane:
             matches = [
                 item
                 for item in state["dispatches"].values()
-                if item["state"] in ACTIVE_STATES
+                if item["state"] in {"starting", "running", "paused"}
                 and (
                     item.get("owner") == owner
                     or (
@@ -1984,7 +2320,7 @@ class ControlPlane:
             state = self._read_state()
             count = 0
             for dispatch in state["dispatches"].values():
-                if dispatch["state"] in ACTIVE_STATES:
+                if dispatch["state"] in ACTIVE_STATES or _native_claim_active(dispatch):
                     self._fence_members(state, dispatch, "host_restart")
                     count += 1
             self._settle_wave(state)
@@ -2026,8 +2362,10 @@ class ControlPlane:
             self._write_state(state)
 
     def status(self) -> dict[str, Any]:
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
             plan = self._read_plan(state)
             counts = {name: 0 for name in sorted(LOGICAL_STATES)}
             for item in state["logical"].values():
@@ -2050,6 +2388,17 @@ class ControlPlane:
                 state["dispatches"].values(),
                 key=lambda item: item["dispatch_id"],
             ):
+                if _native_settlement_overdue(dispatch):
+                    attention.append(
+                        {
+                            "dispatch_id": dispatch["dispatch_id"],
+                            "nodes": list(dispatch["members"]),
+                            "owner": dispatch.get("owner"),
+                            "reason": "native_settlement_required",
+                            "state": "starting",
+                            "task_name": dispatch["task_name"],
+                        }
+                    )
                 if dispatch["state"] == "running" and dispatch.get("owner") is None:
                     attention.append(
                         {
@@ -2077,13 +2426,15 @@ class ControlPlane:
         coordination = (
             self._coordinated()
             if self.state_path.exists()
-            else acquire(self.root, self.session_id)
+            else acquire(self.root, self.session_id, timeout=self.lock_timeout)
         )
         with coordination:
             if self.state_path.exists():
                 state = self._read_state()
+                if self._reconcile_expired_claims(state):
+                    self._write_state(state)
                 if any(
-                    item["state"] in ACTIVE_STATES
+                    item["state"] in ACTIVE_STATES or _native_claim_active(item)
                     for item in state["dispatches"].values()
                 ):
                     raise ControlPlaneError(
@@ -2105,7 +2456,7 @@ class ControlPlane:
     def terminal_proof(self, owner: str, result: Mapping[str, Any]) -> dict[str, Any]:
         """Return a proof-backed retired dispatch for explicit host maintenance."""
 
-        with acquire(self.root, self.session_id):
+        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
             state = self._read_state()
             dispatch = self._find_dispatch(state, str(result.get("dispatch_id")))
             if (
@@ -2127,10 +2478,12 @@ class ControlPlane:
     def stop_reason(self) -> str | None:
         if not self.state_path.exists():
             return None
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
             if any(
-                item["state"] in {"starting", "running", "interrupting"}
+                item["state"] in ACTIVE_STATES or _native_claim_active(item)
                 for item in state["dispatches"].values()
             ):
                 return "CCO child work is still active; wait for its native terminal event."
@@ -2176,6 +2529,9 @@ def parser() -> argparse.ArgumentParser:
     abandon.add_argument("--node", required=True)
     retry = sub.add_parser("retry")
     retry.add_argument("--node", required=True)
+    native_failure = sub.add_parser("native-failure")
+    native_failure.add_argument("--dispatch", required=True)
+    native_failure.add_argument("--kind", choices=sorted(NATIVE_FAILURE_KINDS), required=True)
     sub.add_parser("status")
     sub.add_parser("restart")
     sub.add_parser("cleanup")
@@ -2199,6 +2555,8 @@ def main() -> int:
         elif args.command == "retry":
             control.retry(args.node)
             result = control.status()
+        elif args.command == "native-failure":
+            result = control.settle_native_failure(args.dispatch, args.kind)
         elif args.command == "restart":
             result = {"interrupted": control.restart(), "protocol": "cco.restart.v1"}
         elif args.command == "cleanup":

@@ -26,10 +26,11 @@ from routing_catalog import (
     load_route_policy,
     resolve_route_plan,
 )
+from workspace_guard import WorkspaceGuardError, discover_workspace
 
 
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "2.0.1"
+PLUGIN_VERSION = "2.0.2"
 PROFILES = {
     "read": ("codex-cost-orchestrator-read-leaf.toml", "cost_orchestrator_read_leaf"),
     "write": ("codex-cost-orchestrator-write-leaf.toml", "cost_orchestrator_write_leaf"),
@@ -43,6 +44,17 @@ EXPECTED_HOOKS = Counter(
         "subagentStop": 1,
     }
 )
+
+
+def compressed_rollout_supported() -> bool:
+    try:
+        from compression import zstd as _zstd  # noqa: F401
+    except ImportError:
+        try:
+            import zstandard as _zstandard  # noqa: F401
+        except ImportError:
+            return False
+    return True
 
 
 class InstallError(RuntimeError):
@@ -316,6 +328,15 @@ def doctor(
     errors: list[str] = []
     if sys.version_info < (3, 11):
         errors.append("Python 3.11 or newer is required")
+    if not compressed_rollout_supported():
+        errors.append(
+            "compressed rollout support is unavailable; install zstandard>=0.23,<1"
+        )
+    try:
+        _backend, canonical_workspace = discover_workspace(workspace)
+    except (OSError, WorkspaceGuardError) as error:
+        errors.append(f"workspace root is unavailable: {error}")
+        canonical_workspace = workspace
     plugin_root = Path(__file__).resolve().parents[1]
     manifest = plugin_root / ".codex-plugin" / "plugin.json"
     hooks = plugin_root / "hooks" / "hooks.json"
@@ -333,7 +354,7 @@ def doctor(
     if check(target) != 0:
         errors.append("installed CCO profiles are not ready")
     try:
-        inventory = (hook_loader or load_hook_inventory)(workspace)
+        inventory = (hook_loader or load_hook_inventory)(canonical_workspace)
         discovered = [
             item
             for item in inventory.get("hooks", [])
@@ -356,7 +377,7 @@ def doctor(
         errors.append(f"CCO Hook trust could not be verified: {error}")
     try:
         catalog = (native_loader or load_native_catalog)()
-        policy = (policy_loader or load_route_policy)(workspace)["policy"]
+        policy = (policy_loader or load_route_policy)(canonical_workspace)["policy"]
         plan = resolve_route_plan(
             [
                 {

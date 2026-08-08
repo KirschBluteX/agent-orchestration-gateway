@@ -18,6 +18,7 @@ entries in `/hooks`, then start a new Codex task.
 ```text
 python -B scripts/control_plane.py status
 python -B scripts/control_plane.py continue --dispatch <sha256:id>
+python -B scripts/control_plane.py native-failure --dispatch <sha256:id> --kind <kind>
 python -B scripts/control_plane.py abandon --node <node_id>
 python -B scripts/control_plane.py retry --node <node_id>
 python -B scripts/control_plane.py restart
@@ -25,9 +26,11 @@ python -B scripts/control_plane.py cleanup
 ```
 
 `continue` reads one non-empty JSON evidence delta from stdin. Dispatch its output with
-`followup_task` unchanged. `status` identifies paused, fenced, and owner-pending work.
-A Desktop restart fences every starting, running, paused, or interrupting native turn;
-inspect the workspace before `retry`.
+`followup_task` unchanged. `native-failure` accepts `rate_limit`, `network`, `timeout`,
+`service`, `route_rejected`, or `other`; use it only for a typed host error and dispatch
+the returned native input unchanged. `status` identifies paused, fenced, and
+owner-pending work. A Desktop restart fences every active prepared claim, running turn,
+or paused turn; inspect the workspace before `retry`.
 
 `cleanup` is current-task-only and refuses active or paused child work. Run it only
 after host-card maintenance is no longer needed.

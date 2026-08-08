@@ -10,9 +10,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "plugins" / "codex-cost-orchestrator" / "hooks"
+SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
 sys.path.insert(0, str(HOOKS))
+sys.path.insert(0, str(SCRIPTS))
 
 import cco_hook  # noqa: E402
+from state_lock import StateLockBusy  # noqa: E402
 
 
 class V9HookTests(unittest.TestCase):
@@ -163,44 +166,61 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(calls, [("/root/worker_n01", "CCO_RESULT cco.v9\n{}")])
         self.assertEqual(outcome, {"continue": False})
 
-    def test_transient_native_failure_retries_same_owner_three_times(self) -> None:
-        attempts = iter((1, 2, 3, None))
-
+    def test_arbitrary_assistant_error_text_is_not_treated_as_typed_native_failure(self) -> None:
+        calls: list[tuple[str, object]] = []
         class Control:
             @staticmethod
-            def register_transient_failure(_owner: str, signature: str) -> int | None:
-                self.assertEqual(signature, "native_rate_limit")
-                return next(attempts)
+            def record_result(owner: str, result: object) -> None:
+                calls.append((owner, result))
+                raise ValueError("not a CCO result")
+
+            @staticmethod
+            def fence_invalid_result(_owner: str) -> None:
+                return None
 
         with (
             patch.object(cco_hook, "_control", return_value=Control()),
             patch.object(cco_hook, "_owner", return_value="/root/worker_n01"),
         ):
-            outcomes = [
-                cco_hook.evaluate(
-                    {
-                        "hook_event_name": "SubagentStop",
-                        "last_assistant_message": (
-                            "Agent errored: exceeded retry limit, last status: "
-                            "429 Too Many Requests"
-                        ),
-                    }
-                )
-                for _ in range(4)
-            ]
+            outcome = cco_hook.evaluate(
+                {
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "429 timeout while discussing a test fixture",
+                }
+            )
 
         self.assertEqual(
-            [item.get("decision") for item in outcomes],
-            ["block", "block", "block", None],
+            calls,
+            [("/root/worker_n01", "429 timeout while discussing a test fixture")],
         )
-        self.assertEqual(
-            [item.get("continue") for item in outcomes],
-            [None, None, None, False],
-        )
-        self.assertIn("same CCO owner", outcomes[0]["reason"])
-        self.assertIn("three transient retries", outcomes[-1]["systemMessage"])
+        self.assertEqual(outcome["continue"], False)
+        self.assertIn("rejected and fenced", outcome["systemMessage"])
 
-    def test_interrupt_is_prepared_then_settled_by_post_tool_use(self) -> None:
+    def test_subagent_stop_lock_contention_retries_without_fencing_result(self) -> None:
+        class Control:
+            @staticmethod
+            def record_result(_owner: str, _result: object) -> None:
+                raise StateLockBusy("busy")
+
+            @staticmethod
+            def fence_invalid_result(_owner: str) -> None:
+                raise AssertionError("infrastructure contention must not fence a child")
+
+        with (
+            patch.object(cco_hook, "_control", return_value=Control()),
+            patch.object(cco_hook, "_owner", return_value="/root/worker_n01"),
+        ):
+            outcome = cco_hook.evaluate(
+                {
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "CCO_RESULT cco.v9\n{}",
+                }
+            )
+
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("same result", outcome["reason"])
+
+    def test_interrupt_is_validated_then_settled_by_post_tool_use(self) -> None:
         calls: list[tuple[str, object]] = []
 
         class Control:

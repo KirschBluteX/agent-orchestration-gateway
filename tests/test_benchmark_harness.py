@@ -414,6 +414,16 @@ class BenchmarkHarnessTests(unittest.TestCase):
             }
 
         manifest = self._manifest()
+        arms = manifest["arms"]
+        assert isinstance(arms, list)
+        arms.append(
+            {
+                "id": "cco-static-alt",
+                "mode": "cco_static",
+                "primary_model": "gpt-5.6-sol",
+                "primary_effort": "max",
+            }
+        )
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             manifest_path = root / "manifest.json"
@@ -438,11 +448,17 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertEqual(planned.returncode, 0, planned.stderr)
             plan_path.write_text(planned.stdout, encoding="utf-8")
             plan = json.loads(planned.stdout)
-            verdicts = {"primary-sol-max": "fail", "cco-static": "pass"}
-            for run in plan["runs"]:
-                is_cco = run["arm_id"] == "cco-static"
+            verdicts = {
+                "primary-sol-max": "fail",
+                "cco-static": "pass",
+                "cco-static-alt": "pass",
+            }
+            for index, run in enumerate(plan["runs"], start=1):
+                is_cco = run["arm_mode"] == "cco_static"
+                root_thread_id = f"00000000-0000-4000-8000-{index:012d}"
                 usage = {
                     "protocol": "cco.benchmark-usage.v1",
+                    "root_thread_id": root_thread_id,
                     "rollouts": 2 if is_cco else 1,
                     "unexpected_models": [],
                     "models": {
@@ -469,6 +485,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     "manifest_sha256": run["manifest_sha256"],
                     "task_id": run["task_id"],
                     "arm_id": run["arm_id"],
+                    "root_thread_id": root_thread_id,
                     "repetition": run["repetition"],
                     "verdict": verdicts[run["arm_id"]],
                     "wall_time_seconds": 120 if is_cco else 90,
@@ -498,10 +515,18 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         summary = json.loads(completed.stdout)
         self.assertEqual(summary["protocol"], "cco.benchmark-summary.v1")
-        self.assertEqual(summary["expected_runs"], 2)
-        self.assertEqual(summary["recorded_runs"], 2)
+        self.assertEqual(summary["expected_runs"], 3)
+        self.assertEqual(summary["recorded_runs"], 3)
         self.assertEqual(summary["missing_run_ids"], [])
-        self.assertEqual(summary["paired"], {"cco_static_wins": 1, "pairs": 1, "primary_only_wins": 0, "ties": 0})
+        self.assertEqual(summary["paired"]["cco_static_wins"], 2)
+        self.assertEqual(summary["paired"]["pairs"], 2)
+        self.assertEqual(
+            set(summary["paired"]["by_pair"]),
+            {
+                "primary-sol-max__vs__cco-static",
+                "primary-sol-max__vs__cco-static-alt",
+            },
+        )
         self.assertEqual(
             summary["arms"]["cco-static"]["tokens"]["terra"]["input_tokens"],
             50,
@@ -703,6 +728,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         }
         usage = {
             "protocol": "cco.benchmark-usage.v1",
+            "root_thread_id": "11111111-1111-4111-8111-111111111111",
             "rollouts": 1,
             "unexpected_models": [],
             "models": {"gpt-5.6-sol/max": sol},
@@ -778,6 +804,30 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(result["run_id"], run["run_id"])
         self.assertEqual(result["task_id"], run["task_id"])
         self.assertEqual(result["verdict"], "pass")
+
+    def test_usage_rejects_duplicate_rollout_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            rollout = Path(temp) / "rollout.jsonl"
+            rollout.write_text("", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.cco_benchmark",
+                    "usage",
+                    "--rollout",
+                    str(rollout),
+                    "--rollout",
+                    str(rollout),
+                ],
+                cwd=REPO,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("duplicate rollout", completed.stderr)
 
     def test_preflight_returns_structured_blockers_without_starting_a_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

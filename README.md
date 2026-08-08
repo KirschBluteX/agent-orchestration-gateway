@@ -20,14 +20,14 @@ routing service, record billing data, or require an MCP server.
   supported model and reasoning effort.
 - Maximizes non-conflicting work up to the host's observed Agent capacity.
 - Allows one writable child across all Codex tasks sharing a canonical workspace while
-  parallelizing compatible read work.
+  parallelizing only non-overlapping read work.
 - Aggregates compatible mechanical microtasks when ready work exceeds native capacity.
 - Binds every wave to one fresh Git or bounded non-Git workspace state.
 - Waits for native terminal events instead of polling progress.
-- Preserves paused and interrupting writer leases; reviewer rejection blocks downstream
-  work; confirmed interruption and restart fence stale results.
-- Retries the same native owner at most three times for strongly identified 429,
-  network, timeout, or temporary service failures.
+- Preserves prepared native claims and paused writer leases; reviewer rejection blocks
+  downstream work; confirmed active interruption and restart fence stale results.
+- Settles Primary-observed typed 429, network, timeout, or temporary service failures
+  with at most three exact same-owner retries; arbitrary assistant prose never retries.
 
 ```mermaid
 flowchart LR
@@ -58,7 +58,7 @@ the Primary model.
 
 Requirements:
 
-- Python 3.11+
+- Python 3.11+ (`zstandard` is required before Python 3.14)
 - A current Codex installation with plugins, Hooks, and native Agents
 - Windows or Linux
 
@@ -67,6 +67,7 @@ Clone the repository and add its marketplace:
 ```text
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
 cd codex-cost-orchestrator
+python -m pip install -r requirements.txt
 codex plugin marketplace add .
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
 ```
@@ -117,6 +118,12 @@ counts plus actionable paused, fenced, or owner-pending dispatch identities. A s
 response that omits the owner remains pending until trusted SubagentStop rollout evidence
 binds it; missing response metadata alone is not treated as worker failure.
 
+Codex currently exposes no tool-failure Hook. If a native spawn, continuation, or
+running Agent reports a typed failure, CCO settles that exact dispatch through
+`native-failure`. An unclaimed reservation expires defensively; once PreToolUse claims
+a call, its lease remains fail-closed until typed settlement, a terminal result, or host
+restart recovery. It never infers retries from child prose.
+
 Use `$codex-cost-orchestrator:manage-cco` for installation, doctor, configuration,
 paused work, restart recovery, retry, abandonment, or cleanup. Normal tasks do not load
 those instructions.
@@ -162,7 +169,7 @@ Operational commands and recovery procedures are in
 ```text
 python -m unittest discover -s tests
 python -m ruff check .
-python .github/scripts/validate_plugin.py
+python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 
 Licensed under the [MIT License](LICENSE).

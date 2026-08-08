@@ -17,14 +17,15 @@ if str(SCRIPTS) not in sys.path:
 
 from control_plane import (  # noqa: E402
     CONTINUE_HEADER,
-    RESULT_HEADER,
     TASK_HEADER,
     TASK_PATH_RE,
     ControlPlane,
     ControlPlaneError,
+    ControlPlaneUnavailable,
 )
 from host_paths import HostPathError, host_path, is_within  # noqa: E402
 from rollout_io import RolloutError, first_record, is_rollout_path  # noqa: E402
+from state_lock import StateLockBusy  # noqa: E402
 
 
 SPAWN_TOOLS = frozenset({"Agent", "spawn_agent", "collaborationspawn_agent"})
@@ -51,32 +52,19 @@ MAX_PROTECTED_NODES = 10_000
 MAX_PROTECTED_BYTES = 1024 * 1024
 
 
-def _transient_signature(value: object) -> str | None:
-    if not isinstance(value, str) or value.startswith(RESULT_HEADER + "\n"):
-        return None
-    lowered = value.casefold()
-    if re.search(r"(?:\b429\b|too many requests|rate[ _-]?limit)", lowered):
-        return "native_rate_limit"
-    if re.search(
-        r"(?:\b(?:502|503|504)\b|service unavailable|temporarily unavailable|overloaded)",
-        lowered,
-    ):
-        return "native_service_unavailable"
-    if re.search(r"(?:timed? out|timeout)", lowered):
-        return "native_timeout"
-    if re.search(
-        r"(?:network error|connection (?:reset|refused|aborted|closed)|dns failure)",
-        lowered,
-    ):
-        return "native_network_failure"
-    return None
-
-
 def _control(payload: Mapping[str, Any]) -> ControlPlane:
     session_id = payload.get("session_id")
     if not isinstance(session_id, str):
         raise ControlPlaneError("hook event has no session identity")
-    return ControlPlane(session_id)
+    event = payload.get("hook_event_name")
+    lock_timeout = {
+        "PostToolUse": 3.0,
+        "PreToolUse": 20.0,
+        "SessionStart": 3.0,
+        "Stop": 3.0,
+        "SubagentStop": 90.0,
+    }.get(event, 3.0)
+    return ControlPlane(session_id, lock_timeout=lock_timeout)
 
 
 def _block(error: Exception | str) -> dict[str, str]:
@@ -85,6 +73,20 @@ def _block(error: Exception | str) -> dict[str, str]:
 
 def _event_error(event: object, error: Exception) -> dict[str, Any]:
     message = f"CCO: {error}"
+    if isinstance(error, (ControlPlaneUnavailable, StateLockBusy, OSError)):
+        if event == "SubagentStop":
+            return {
+                "decision": "block",
+                "reason": (
+                    "CCO state is temporarily busy; return the exact same result "
+                    "(the same CCO_RESULT) without doing more work."
+                ),
+            }
+        if event == "Stop":
+            return {
+                "decision": "block",
+                "reason": "CCO state is temporarily busy; wait for the lifecycle event.",
+            }
     if event == "SubagentStop":
         return {"continue": False, "systemMessage": message}
     if event == "SessionStart":
@@ -312,39 +314,15 @@ def evaluate(value: object) -> dict[str, Any]:
                     )
                 }
             message = value.get("last_assistant_message")
-            transient = _transient_signature(message)
-            if transient is not None:
-                try:
-                    attempt = control.register_transient_failure(owner, transient)
-                except Exception:
-                    control.fence_invalid_result(owner)
-                    return {
-                        "continue": False,
-                        "systemMessage": (
-                            "CCO could not bind the transient failure to one active owner; "
-                            "Primary must inspect the actual state."
-                        ),
-                    }
-                if attempt is not None:
-                    return {
-                        "decision": "block",
-                        "reason": (
-                            f"Transient native failure; retrying the same CCO owner "
-                            f"({attempt}/3). Continue from the last safe point under "
-                            "the original contract; do not restart or widen scope."
-                        ),
-                    }
-                return {
-                    "continue": False,
-                    "systemMessage": (
-                        "CCO fenced the child after three transient retries; "
-                        "Primary must inspect the actual state."
-                    ),
-                }
             try:
                 control.record_result(owner, message)
+            except (ControlPlaneUnavailable, StateLockBusy, OSError) as error:
+                return _event_error(event, error)
             except Exception:
-                control.fence_invalid_result(owner)
+                try:
+                    control.fence_invalid_result(owner)
+                except (ControlPlaneUnavailable, StateLockBusy, OSError) as error:
+                    return _event_error(event, error)
                 return {
                     "continue": False,
                     "systemMessage": (

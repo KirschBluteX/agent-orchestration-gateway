@@ -10,6 +10,7 @@ From the repository root:
 ```text
 codex plugin marketplace add .
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
+python -m pip install -r requirements.txt
 python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --bootstrap
 ```
 
@@ -21,7 +22,7 @@ Open `/hooks`, review and trust these five definitions:
 
 1. SessionStart
 2. exact PreToolUse for native spawn, continuation, message, and interrupt tools
-3. exact PostToolUse for spawn, continuation, and interrupt settlement
+3. exact success-only PostToolUse for spawn, continuation, and interrupt settlement
 4. Stop fallback
 5. SubagentStop for the two CCO leaf profiles
 
@@ -85,6 +86,7 @@ logical dependencies from lifecycle evidence; Primary never supplies completed n
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py status
 python -B <PLUGIN_ROOT>/scripts/control_plane.py continue --dispatch <sha256:id>
+python -B <PLUGIN_ROOT>/scripts/control_plane.py native-failure --dispatch <sha256:id> --kind <kind>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py abandon --node <node_id>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py retry --node <node_id>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py restart
@@ -93,9 +95,13 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
 
 - `continue` reads a non-empty JSON evidence delta from stdin and returns one exact
   `followup_task` input. Dispatch it unchanged.
+- `native-failure` settles one Primary-observed typed host failure. Supported kinds are
+  `rate_limit`, `network`, `timeout`, `service`, `route_rejected`, and `other`. Dispatch
+  any returned retry or fallback input unchanged; transient failures permit at most
+  three exact retries of the same native owner.
 - `abandon` fences paused work and releases its write lease.
 - `retry` creates a guarded newer generation for a fenced logical node.
-- `restart` fences starting, running, paused, and interrupting native turns. Inspect the
+- `restart` fences active prepared claims, running turns, and paused turns. Inspect the
   workspace before retrying.
 - `cleanup` deletes only the current task's inactive state and artifacts. It refuses
   active or paused child work; retain state until host-card maintenance is unnecessary.
@@ -103,16 +109,21 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
   owner-pending dispatches.
 
 State transitions are `waiting → ready → starting → running → retired`, with
-`running → paused → starting` for continuation and
-`running/paused → interrupting → fenced` for confirmed interruption. Native interrupt
-failure restores the prior state. Paused and interrupting writers keep the sole
-canonical-workspace lease across every Codex task. A reviewer dependency is satisfied
-only by `outcome=accept`.
+`running → paused → starting` for continuation. Interrupt PreToolUse is validation-only;
+the dispatch is fenced only when the successful native result says its previous status
+was active. A terminal result may therefore win the interrupt race. Prepared claims,
+running writers, and paused writers keep the sole canonical-workspace lease across every
+Codex task. Overlapping readers and writers are mutually excluded across tasks. A reviewer
+dependency is satisfied only by `outcome=accept`.
 
-SubagentStop may continue the same native owner up to three times only for strongly
-identified 429, network, timeout, or temporary service failures. All other invalid
-results fence immediately. A successful spawn response without a canonical owner stays
-running as owner-pending; trusted UUID/rollout evidence may bind it when the result stops.
+Current Codex emits PostToolUse only after a successful native tool call and does not emit
+SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
+minutes and is rearmed only after admission is checked again. Once PreToolUse records a
+native call identity, its lease stays fail-closed; overdue `status` output reports
+`native_settlement_required`. Use `native-failure` as soon as Primary observes a typed host
+error; never infer a retry from arbitrary assistant prose. A successful spawn response
+without a canonical owner stays running as owner-pending; trusted UUID/rollout evidence may
+bind it when the result stops.
 
 Wave artifacts contain the fresh baseline and are deleted as soon as every physical
 dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,

@@ -16,7 +16,7 @@ class StateLockBusy(RuntimeError):
     """The session state lock could not be acquired before its short deadline."""
 
 
-_DEFAULT_WAIT_SECONDS = 0.25
+_DEFAULT_WAIT_SECONDS = 5.0
 _LOCAL_GUARD = threading.RLock()
 _LOCAL_LOCKS: dict[str, threading.RLock] = {}
 _HELD: dict[str, tuple[int, int]] = {}

@@ -8,14 +8,16 @@ task content, credentials, or unredacted Codex logs.
 Requirements:
 
 - Python 3.11 or newer;
+- dependencies from `requirements.txt` (needed for compressed rollouts before Python 3.14);
 - Git;
 - Codex CLI only for live native-catalog and end-to-end checks.
 
 Run before opening a pull request:
 
 ```text
+python -m pip install -r requirements.txt
 python -X utf8 -B -m unittest discover -s tests -v
-python -m ruff check plugins tests .github/scripts
+python -m ruff check plugins tests benchmarks .github/scripts
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skills/orchestrate
 python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skills/manage-cco

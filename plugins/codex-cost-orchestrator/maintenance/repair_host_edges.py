@@ -485,6 +485,14 @@ def _prune_rollback_journals(backup: Path) -> None:
         stale.unlink(missing_ok=True)
 
 
+def _post_commit_warnings(backup: Path) -> list[str]:
+    try:
+        _prune_rollback_journals(backup)
+    except OSError:
+        return ["repair committed, but old rollback journals could not be pruned"]
+    return []
+
+
 def repair_edges(
     *,
     codex_home: Path,
@@ -590,9 +598,9 @@ def repair_edges(
             raise
     if backup is None:
         raise HostEdgeRepairError("host-edge rollback journal was not created")
-    _prune_rollback_journals(backup)
     result["backup"] = str(backup)
     result["repaired"] = repaired
+    result["warnings"] = _post_commit_warnings(backup)
     return result
 
 
@@ -656,6 +664,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if result["backup"] is not None:
             print(f"BACKUP: {result['backup']}")
+        for warning in result.get("warnings", []):
+            print(f"WARNING: {warning}", file=sys.stderr)
         for edge in result["edges"]:
             detail = edge["evidence"] or edge["reason"]
             print(f"{edge['verdict'].upper()}: {edge['child_thread_id']} {detail}")

@@ -16,12 +16,12 @@ CCO 只使用 Codex 自身的 Agent runtime，不运行第二套协调器，不�
 - 确定性的机械任务优先 Luna；需要有限判断、保护或审查的任务优先 Terra。
 - 不会自动选择 Sol；用户可在当前任务中明确指定任意原生支持的模型与思考强度。
 - 在宿主真实 Agent 容量内选择最大无冲突 ready set。
-- 所有 Codex 任务共享同一规范工作区时，只允许一个可写子 Agent；兼容的只读任务仍可并行。
+- 所有 Codex 任务共享同一规范工作区时，只允许一个可写子 Agent；只有范围不重叠的只读任务可并行。
 - ready 数量超过容量时，可安全聚合相容的机械微任务。
 - 每个波次都绑定新的 Git 或有界非 Git 工作区状态。
 - 依靠原生终止事件唤醒 Primary，不轮询进度。
-- 暂停和正在中断的 worker 都保留写 lease；reviewer 未接受时不会放行下游；只有确认成功的中断、重启和迟到结果才会被 fencing。
-- 对明确识别的 429、网络、超时或临时服务错误，同一个原生 Agent 最多自动重试三次。
+- 已准备的原生调用和暂停的 worker 都保留写 lease；reviewer 未接受时不会放行下游；只有确认原先处于活动状态的中断、重启和迟到结果才会被 fencing。
+- Primary 观察到 typed 429、网络、超时或临时服务错误时，同一个原生 Agent 最多精确重试三次；不会扫描普通 assistant 文本来猜测错误。
 
 ```mermaid
 flowchart LR
@@ -51,7 +51,7 @@ flowchart LR
 
 要求：
 
-- Python 3.11+
+- Python 3.11+（Python 3.14 之前还需要 `zstandard`）
 - 支持插件、Hooks 和原生 Agent 的当前 Codex
 - Windows 或 Linux
 
@@ -60,6 +60,7 @@ flowchart LR
 ```text
 git clone https://github.com/KirschBluteX/codex-cost-orchestrator.git
 cd codex-cost-orchestrator
+python -m pip install -r requirements.txt
 codex plugin marketplace add .
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
 ```
@@ -107,6 +108,11 @@ baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地�
 还会直接列出暂停、fenced 或等待 owner 绑定的 dispatch。spawn 即时返回缺少 owner
 不会再被当成 worker 失败；SubagentStop 会用受信 rollout 证据完成迟绑定。
 
+Codex 当前没有工具失败 Hook。如果原生 spawn、continuation 或运行中的 Agent 返回 typed failure，
+CCO 会通过 `native-failure` 精确结算对应 dispatch。尚未进入 PreToolUse 的 reservation 会有界过期；
+一旦原生调用已被 claim，lease 会 fail-closed 保留到 typed settlement、终止结果或宿主重启恢复。
+CCO 不会根据子 Agent 的普通文本猜测并重试。
+
 安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
 `$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。
 
@@ -147,7 +153,7 @@ CCO 不计算单次任务的真实账单，也不承诺固定节省比例。benc
 ```text
 python -m unittest discover -s tests
 python -m ruff check .
-python .github/scripts/validate_plugin.py
+python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 ```
 
 本项目使用 [MIT License](LICENSE)。

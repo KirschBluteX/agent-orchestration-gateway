@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -130,6 +131,37 @@ class InstallerTests(unittest.TestCase):
                 ),
                 1,
             )
+
+    def test_doctor_uses_canonical_repository_root_for_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            child = repo / "nested" / "work"
+            child.mkdir(parents=True)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            target = root / "agents"
+            install(target)
+            observed: list[Path] = []
+
+            def hooks(workspace: Path) -> dict[str, object]:
+                observed.append(workspace)
+                return hook_inventory()
+
+            def policy(workspace: Path) -> dict[str, object]:
+                observed.append(workspace)
+                return install_agents.load_route_policy(workspace)
+
+            self.assertEqual(
+                doctor(
+                    target,
+                    workspace=child,
+                    native_loader=native_catalog,
+                    hook_loader=hooks,
+                    policy_loader=policy,
+                ),
+                0,
+            )
+            self.assertEqual(observed, [repo.resolve(), repo.resolve()])
             self.assertEqual(
                 doctor(
                     target,

@@ -26,7 +26,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertRegex(manifest["version"], r"^2\.0\.1\+codex\.[a-z0-9.-]+$")
+        self.assertRegex(manifest["version"], r"^2\.0\.2\+codex\.[a-z0-9.-]+$")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -39,9 +39,9 @@ class ProjectContractTests(unittest.TestCase):
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
         installer = text(PLUGIN / "scripts" / "install_agents.py")
         changelog = text(ROOT / "CHANGELOG.md")
-        self.assertIn('PLUGIN_VERSION = "2.0.1"', installer)
-        self.assertRegex(manifest["version"], r"^2\.0\.1\+")
-        self.assertRegex(changelog, r"(?m)^## 2\.0\.1 - ")
+        self.assertIn('PLUGIN_VERSION = "2.0.2"', installer)
+        self.assertRegex(manifest["version"], r"^2\.0\.2\+")
+        self.assertRegex(changelog, r"(?m)^## 2\.0\.2 - ")
 
     def test_two_thin_skills_use_progressive_disclosure(self) -> None:
         hot = text(ORCHESTRATE / "SKILL.md")
@@ -138,6 +138,18 @@ class ProjectContractTests(unittest.TestCase):
             "benchmarks/cco_benchmark.py",
         ):
             self.assertTrue((ROOT / relative).is_file(), relative)
+
+    def test_development_and_ci_commands_cover_the_published_tooling(self) -> None:
+        english = text(ROOT / "README.md")
+        workflow = text(ROOT / ".github" / "workflows" / "ci.yml")
+        requirements = text(ROOT / "requirements.txt")
+        self.assertIn(
+            "python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator",
+            english,
+        )
+        self.assertIn("ruff check plugins tests benchmarks .github/scripts", workflow)
+        self.assertIn("zstandard", requirements.casefold())
+        self.assertIn("-r requirements.txt", workflow)
 
     def test_repository_history_has_one_root_without_author_restrictions(self) -> None:
         roots = subprocess.check_output(

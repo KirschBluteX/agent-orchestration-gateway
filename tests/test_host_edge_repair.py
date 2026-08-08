@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +16,11 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(MAINTENANCE))
 
 from control_plane import RESULT_HEADER, ControlPlane, parse_result, parse_task_message  # noqa: E402
-from repair_host_edges import HostEdgeRepairError, _validate_lifecycle_result  # noqa: E402
+from repair_host_edges import (  # noqa: E402
+    HostEdgeRepairError,
+    _post_commit_warnings,
+    _validate_lifecycle_result,
+)
 
 
 CATALOG = {
@@ -81,7 +86,11 @@ class HostEdgeRepairTests(unittest.TestCase):
         control.preflight_spawn({"tool_input": native, "tool_use_id": "call"})
         owner = "/root/" + native["task_name"]
         control.postflight_tool(
-            {"tool_response": {"agent_path": owner}, "tool_use_id": "call"}
+            {
+                "tool_input": native,
+                "tool_response": {"agent_path": owner},
+                "tool_use_id": "call",
+            }
         )
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         return control, dispatch_id, owner
@@ -113,6 +122,18 @@ class HostEdgeRepairTests(unittest.TestCase):
                 state_root=self.state,
                 result=parse_result(raw),
             )
+
+    def test_post_commit_prune_failure_is_reported_without_undoing_repair(self) -> None:
+        backup = self.root / "backup.sqlite"
+        with patch(
+            "repair_host_edges._prune_rollback_journals",
+            side_effect=OSError("locked"),
+        ):
+            warnings = _post_commit_warnings(backup)
+        self.assertEqual(
+            warnings,
+            ["repair committed, but old rollback journals could not be pruned"],
+        )
 
 
 if __name__ == "__main__":

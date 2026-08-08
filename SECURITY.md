@@ -35,13 +35,17 @@ temporary-directory protections.
 
 CCO ships five synchronous definitions with exact matchers. There is no global
 `PreToolUse: .*` Hook. PreToolUse validates only native spawn, continuation, message,
-and interrupt tools; PostToolUse settles spawn, continuation, and interrupt outcomes.
+and interrupt tools; success-only PostToolUse settles spawn, continuation, and interrupt
+outcomes.
 SessionStart fences work at host `resume` or `clear` recovery boundaries, never during
 context compaction. Stop is an exceptional fallback for a Primary attempting to end
 while a native child turn is active. SubagentStop binds the native owner, cco.v9 result,
-cursor, wave, scopes, and workspace state. It may continue the same owner at most three
-times for strongly identified transient native failures; terminal work and exhausted or
-non-retryable failures do not continue.
+cursor, wave, scopes, and workspace state. It never interprets arbitrary child prose as
+a retryable failure. Primary-observed typed native failures use explicit lifecycle
+settlement, with at most three exact same-owner retries for transient kinds. Prepared
+reservations expire defensively, but a PreToolUse-claimed call retains its lease until
+typed settlement, a terminal result, or restart recovery because Codex has no native
+tool-failure Hook.
 
 Review and trust Hook hashes in `/hooks` after every update. Doctor never changes trust.
 
@@ -58,8 +62,9 @@ reject reparses and special files, enforce entry/byte budgets before hashing, an
 run `git init`.
 
 Only one physical worker is admitted across all Codex tasks sharing a canonical
-workspace. Starting, running, paused, and interrupting workers keep the lease.
-Compatible read leaves may run beside a non-overlapping writer; their results
+workspace. Active prepared claims, running workers, and paused workers keep the lease.
+Cross-task readers are also excluded from overlapping active writers. Compatible read
+leaves may run beside a non-overlapping writer; their results
 permit only the known sibling writer scope and must show no read-scope delta.
 
 ## Host maintenance

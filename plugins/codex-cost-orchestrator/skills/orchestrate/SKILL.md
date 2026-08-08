@@ -9,9 +9,9 @@ description: >-
 # Orchestrate with CCO
 
 Keep unresolved product, architecture, integration, and acceptance choices in Primary.
-Put only closed child work in one plan. A node needs an objective, role (`explorer`,
-`worker`, or `reviewer`), typed scopes (`file` or `tree`), owned acceptance IDs, and
-optional dependencies. Omit `decision` for bounded judgment; set it to `mechanical`
+Put only closed child work in one plan. Each node declares an objective, role
+(`explorer`, `worker`, or `reviewer`), typed scopes, acceptance IDs, and dependencies.
+Omit `decision` for bounded judgment; set it to `mechanical`
 only when every permitted choice is acceptance-equivalent. Declare only actual risks
 or semantic/manual verification. A complete single task may be delegated when isolating
 it from long conversation history is useful.
@@ -24,8 +24,8 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py next --capacity <N>
 ```
 
 Do not pass or invent a session ID; the CLI uses the current `CODEX_THREAD_ID`.
-`next` derives dependency readiness, exact maximum non-conflicting work, safe mechanical
-aggregation, fresh workspace state, and current native routes. It returns complete
+`next` derives ready non-conflicting work, safe aggregation, fresh workspace state, and
+current native routes. It returns complete
 `spawn_agent` inputs, not references that a Hook must expand. Dispatch every returned
 input without recapturing state or rewriting its message. Use the named read profile for
 explorer/reviewer and write profile for worker exactly as returned.
@@ -39,7 +39,12 @@ After dispatch, call `wait_agent` once for one long event wait. Do not poll, dup
 child, perform overlapping Primary work, or forward protected collaboration payloads.
 Wake for a native terminal event, blocking input, or user input. A paused worker keeps
 the sole cross-task workspace lease until explicit continuation or abandonment.
-Strong 429/network/timeout/service failures retry the same owner at most three times.
+For a typed native failure, run `native-failure` for that dispatch and send its returned
+retry or fallback unchanged. Transient kinds retry the same owner at most three times.
+Map only typed host status: unsupported/unknown model to
+`route_rejected`, 429 to `rate_limit`, transport to `network`, deadline to `timeout`,
+temporary 5xx to `service`, and non-retryable failure to `other`. Never infer a failure
+or retry from arbitrary assistant prose.
 
 Treat every child result as a claim. Hooks bind it to the dispatch, cursor, exact wave
 baseline, scopes, logical acceptance IDs, and native owner. Call `next` after a wave

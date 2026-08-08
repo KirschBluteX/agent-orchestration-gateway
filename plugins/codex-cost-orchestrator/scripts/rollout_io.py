@@ -25,7 +25,7 @@ def is_rollout_path(path: Path) -> bool:
 
 @contextmanager
 def open_rollout(path: Path) -> Iterator[BinaryIO]:
-    """Open one supported rollout without introducing a mandatory dependency."""
+    """Open one rollout through the stdlib or the declared pre-3.14 dependency."""
 
     if path.name.endswith(".jsonl"):
         try:
@@ -38,12 +38,12 @@ def open_rollout(path: Path) -> Iterator[BinaryIO]:
         raise RolloutError("rollout has an unsupported suffix")
     try:
         from compression import zstd
-    except ImportError:  # Python 3.11-3.13 may provide the optional zstandard wheel.
+    except ImportError:  # Python 3.11-3.13 use the declared zstandard wheel.
         try:
             import zstandard
         except ImportError as error:
             raise RolloutError(
-                "compressed rollout requires Python 3.14+ or the optional zstandard package"
+                "compressed rollout requires Python 3.14+ or the zstandard package"
             ) from error
         try:
             with path.open("rb") as source:

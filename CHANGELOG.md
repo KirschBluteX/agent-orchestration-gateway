@@ -2,6 +2,28 @@
 
 The project follows semantic versioning.
 
+## 2.0.2 - 2026-08-08
+
+- Removed the lifecycle dependency on failure-side PostToolUse and SubagentStop events.
+  Unclaimed reservations now expire safely, claimed calls remain fail-closed, terminal
+  results can settle a missing postflight directly, and Primary-observed typed failures
+  use one explicit, duplicate-safe settlement path with at most three exact same-owner
+  transient retries.
+- Made interrupt preflight validation-only. A terminal result wins the race, postflight
+  is idempotent for terminal work, and fencing requires a successful native response
+  whose typed previous status was active.
+- Extended canonical-workspace coordination to reject every cross-task overlapping
+  reader/writer pair while retaining non-overlapping read concurrency and the global
+  single-writer rule.
+- Moved baseline capture and result workspace verification outside lifecycle locks,
+  added Hook-context lock budgets, and made lock/I/O contention retryable instead of
+  fencing a valid child result.
+- Tightened native result classification, corrected ready-plus-waiting DAG status,
+  declared pre-3.14 Zstandard support, and made Doctor use the canonical workspace root.
+- Fixed benchmark pairing for repeated modes, duplicate rollout/root-thread reuse, and
+  made post-commit rollback-journal cleanup warnings accurately report an already
+  committed host-edge repair.
+
 ## 2.0.1 - 2026-08-08
 
 - Enforced one active writer across different Codex tasks for the same canonical

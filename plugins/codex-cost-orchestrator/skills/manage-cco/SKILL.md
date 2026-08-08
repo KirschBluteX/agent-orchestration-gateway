@@ -24,6 +24,8 @@ Use the control-plane CLI for lifecycle work. It reads the current task identity
 - `status`: show compact logical state counts.
 - `continue --dispatch <id>`: read a non-empty evidence delta from stdin and return one
   exact `followup_task` input for the same native owner.
+- `native-failure --dispatch <id> --kind <kind>`: settle a typed native call or sampling
+  failure and return the exact retry/fallback action, if any.
 - `abandon --node <id>`: fence paused work and release its lease.
 - `retry --node <id>`: create a guarded newer generation for fenced work.
 - `restart`: explicitly apply the same interruption fencing as SessionStart.
