@@ -980,14 +980,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "summarize":
             plan = _load_json(args.plan, label="plan")
-            print(
-                json.dumps(
-                    summarize(plan, args.results_dir),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
-            return 0
+            summary = summarize(plan, args.results_dir)
+            print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+            return 4 if summary["missing_run_ids"] else 0
         if args.command == "record":
             plan = _load_json(args.plan, label="plan")
             usage = _load_json(args.usage, label="usage")

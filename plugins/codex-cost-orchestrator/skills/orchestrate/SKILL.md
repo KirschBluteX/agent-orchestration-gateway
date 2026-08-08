@@ -1,8 +1,7 @@
 ---
 name: orchestrate
 description: >-
-  Default local router for medium or large Codex analysis, implementation, repair,
-  refactoring, and acceptance. Use implicitly to send closed work to native Agents
+  Local router for substantial Codex work. Use implicitly to send closed work to native Agents
   through static Luna/Terra routes while Primary keeps intent and final authority.
 ---
 
@@ -24,8 +23,8 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py next --capacity <N>
 ```
 
 Do not pass or invent a session ID; the CLI uses the current `CODEX_THREAD_ID`.
-`next` derives ready non-conflicting work, safe aggregation, fresh workspace state, and
-current native routes. It returns complete
+`next` derives ready non-conflicting work, safe aggregation, workspace state, and routes. It returns
+complete
 `spawn_agent` inputs, not references that a Hook must expand. Dispatch every returned
 input without recapturing state or rewriting its message. Use the named read profile for
 explorer/reviewer and write profile for worker exactly as returned.
@@ -39,15 +38,17 @@ After dispatch, call `wait_agent` once for one long event wait. Do not poll, dup
 child, perform overlapping Primary work, or forward protected collaboration payloads.
 Wake for a native terminal event, blocking input, or user input. A paused worker keeps
 the sole cross-task workspace lease until explicit continuation or abandonment.
-For a typed native failure, run `native-failure` for that dispatch and send its returned
-retry or fallback unchanged. Transient kinds retry the same owner at most three times.
+For a typed native failure, run `native-failure` for that dispatch. If it returns a
+non-null `tool_name`, invoke that tool with only the returned `tool_input`; never pass
+the outer action metadata to the native tool. Transient kinds retry the same owner at
+most three times.
 Map only typed host status: unsupported/unknown model to
 `route_rejected`, 429 to `rate_limit`, transport to `network`, deadline to `timeout`,
 temporary 5xx to `service`, and non-retryable failure to `other`. Never infer a failure
 or retry from arbitrary assistant prose.
 
-Treat every child result as a claim. Hooks bind it to the dispatch, cursor, exact wave
-baseline, scopes, logical acceptance IDs, and native owner. Call `next` after a wave
+Treat every child result as a claim. Hooks bind its dispatch, cursor, wave baseline,
+scopes, acceptance IDs, and owner. Call `next` after a wave
 settles; Primary never supplies completed nodes. Primary inspects the actual delta and
 owns final acceptance. Use an independent reviewer only for semantic/manual evidence,
 risk, deviation, Primary-owned implementation, or an explicit user request.

@@ -25,10 +25,11 @@ python -B scripts/control_plane.py restart
 python -B scripts/control_plane.py cleanup
 ```
 
-`continue` reads one non-empty JSON evidence delta from stdin. Dispatch its output with
-`followup_task` unchanged. `native-failure` accepts `rate_limit`, `network`, `timeout`,
-`service`, `route_rejected`, or `other`; use it only for a typed host error and dispatch
-the returned native input unchanged. `status` identifies paused, fenced, and
+`continue` reads one non-empty JSON evidence delta from stdin. Its result contains
+`action`, `tool_name`, and `tool_input`; invoke `tool_name` with only `tool_input`.
+`native-failure` accepts `rate_limit`, `network`, `timeout`, `service`, `route_rejected`,
+or `other`; use it only for a typed host error and follow the same envelope rule. A null
+`tool_name` means no native call. `status` identifies paused, fenced, and
 owner-pending work. A Desktop restart fences every active prepared claim, running turn,
 or paused turn; inspect the workspace before `retry`.
 

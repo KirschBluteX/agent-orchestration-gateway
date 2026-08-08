@@ -538,6 +538,53 @@ class BenchmarkHarnessTests(unittest.TestCase):
             40,
         )
 
+    def test_summary_cli_fails_closed_when_a_planned_result_is_missing(self) -> None:
+        manifest = self._manifest()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest_path = root / "manifest.json"
+            plan_path = root / "plan.json"
+            results = root / "results"
+            results.mkdir()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            planned = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.cco_benchmark",
+                    "plan",
+                    "--manifest",
+                    str(manifest_path),
+                ],
+                cwd=REPO,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(planned.returncode, 0, planned.stderr)
+            plan_path.write_text(planned.stdout, encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.cco_benchmark",
+                    "summarize",
+                    "--plan",
+                    str(plan_path),
+                    "--results-dir",
+                    str(results),
+                ],
+                cwd=REPO,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertNotEqual(completed.returncode, 0)
+        summary = json.loads(completed.stdout)
+        self.assertEqual(summary["recorded_runs"], 0)
+        self.assertEqual(len(summary["missing_run_ids"]), 2)
+
     def test_published_pilot_is_pinned_stratified_and_has_twelve_runs(self) -> None:
         completed = subprocess.run(
             [

@@ -111,7 +111,8 @@ baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地�
 Codex 当前没有工具失败 Hook。如果原生 spawn、continuation 或运行中的 Agent 返回 typed failure，
 CCO 会通过 `native-failure` 精确结算对应 dispatch。尚未进入 PreToolUse 的 reservation 会有界过期；
 一旦原生调用已被 claim，lease 会 fail-closed 保留到 typed settlement、终止结果或宿主重启恢复。
-CCO 不会根据子 Agent 的普通文本猜测并重试。
+准入 claim 会在工作区校验前持久化，并在原生调用前再次验证，reservation 过期不会形成跨任务读写竞态；
+若宿主已报告 owner 为 interrupted，显式 interrupt 重试也能完成结算。CCO 不会根据子 Agent 的普通文本猜测并重试。
 
 安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
 `$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。

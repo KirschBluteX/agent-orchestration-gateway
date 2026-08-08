@@ -78,9 +78,11 @@ python -m benchmarks.cco_benchmark summarize \
   --results-dir benchmarks/results/featurebench-pilot-v1
 ```
 
-Missing, mismatched, unexpected-model, or overwritten results fail closed. Cost is
-reported only when the host exposes a trustworthy usage value; otherwise the report
-must not infer a currency amount.
+Missing, mismatched, unexpected-model, or overwritten results fail closed. `summarize`
+still prints the machine-readable missing IDs but exits non-zero when any planned result
+is absent, so automation cannot publish an incomplete study. Cost is reported only when
+the host exposes a trustworthy usage value; otherwise the report must not infer a
+currency amount.
 
 ## Comparison discipline
 

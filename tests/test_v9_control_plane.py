@@ -413,6 +413,156 @@ class V9ControlPlaneTests(unittest.TestCase):
             1,
         )
 
+    def test_legacy_interrupting_state_is_fenced_without_poisoning_other_workspaces(self) -> None:
+        legacy = self.control("legacy-interrupting")
+        legacy.create_plan(
+            self.repo,
+            self.brief([self.node("legacy", "A01", "a.txt")]),
+        )
+        legacy.next_wave(capacity=1, native_catalog=catalog("gpt-5.6-terra"))
+        state = json.loads(legacy.state_path.read_text(encoding="utf-8"))
+        dispatch = next(iter(state["dispatches"].values()))
+        dispatch["state"] = "interrupting"
+        state["logical"]["legacy"]["state"] = "interrupting"
+        legacy.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        other_repo = self.root / "other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "a.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        unrelated = self.control("unrelated-workspace")
+        unrelated.create_plan(
+            other_repo,
+            self.brief([self.node("other", "A01", "a.txt")]),
+        )
+
+        batch = unrelated.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )
+        self.assertEqual(len(batch["dispatches"]), 1)
+        self.assertEqual(legacy.restart(), 0)
+        migrated = json.loads(legacy.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(next(iter(migrated["dispatches"].values()))["state"], "fenced")
+        self.assertEqual(migrated["logical"]["legacy"]["state"], "fenced")
+
+    def test_paused_reader_claim_blocks_writer_during_continuation_verification(self) -> None:
+        reader = self.control("continuation-reader")
+        writer = self.control("continuation-racing-writer")
+        reader.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        writer.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = reader.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        dispatch_id, owner = self.start_dispatch(reader, native)
+        reader.record_result(
+            owner,
+            result_text(
+                dispatch_id,
+                status="blocked",
+                outcome="pause",
+                blockers=["need evidence"],
+                failure_signature="missing_evidence",
+            ),
+        )
+        prepared = reader.prepare_continuation(dispatch_id, {"fact": "known"})
+        continuation = prepared.get("tool_input", prepared)
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        original_verify = control_plane_module.verify_workspace
+
+        def delayed_verify(*args: object, **kwargs: object) -> object:
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("continuation verification barrier timed out")
+            return original_verify(*args, **kwargs)
+
+        def run_continuation() -> None:
+            try:
+                reader.preflight_continuation(
+                    {"tool_input": continuation, "tool_use_id": "continuation-race"}
+                )
+            except BaseException as error:  # captured for the parent test thread
+                errors.append(error)
+
+        with patch.object(control_plane_module, "verify_workspace", side_effect=delayed_verify):
+            thread = threading.Thread(target=run_continuation)
+            thread.start()
+            self.assertTrue(entered.wait(5))
+            try:
+                with self.assertRaisesRegex(ControlPlaneError, "overlapping reader"):
+                    writer.next_wave(
+                        capacity=1,
+                        native_catalog=catalog("gpt-5.6-terra"),
+                    )
+            finally:
+                release.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_spawn_claim_survives_reservation_expiry_during_verification(self) -> None:
+        first = self.control("expiring-spawn")
+        second = self.control("spawn-racing-writer")
+        brief = self.brief([self.node("writer", "A01", "a.txt")])
+        first.create_plan(self.repo, brief)
+        second.create_plan(self.repo, brief)
+        now = [100.0]
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+        original_verify = control_plane_module.verify_workspace
+
+        def delayed_verify(*args: object, **kwargs: object) -> object:
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("spawn verification barrier timed out")
+            return original_verify(*args, **kwargs)
+
+        with patch.object(control_plane_module.time, "time", side_effect=lambda: now[0]):
+            native = first.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-terra"),
+            )["dispatches"][0]
+
+            def run_spawn() -> None:
+                try:
+                    first.preflight_spawn(
+                        {"tool_input": native, "tool_use_id": "spawn-race"}
+                    )
+                except BaseException as error:  # captured for the parent test thread
+                    errors.append(error)
+
+            with patch.object(
+                control_plane_module,
+                "verify_workspace",
+                side_effect=delayed_verify,
+            ):
+                thread = threading.Thread(target=run_spawn)
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                now[0] = 1000.0
+                try:
+                    with self.assertRaisesRegex(ControlPlaneError, "workspace writer lease"):
+                        second.next_wave(
+                            capacity=1,
+                            native_catalog=catalog("gpt-5.6-terra"),
+                        )
+                finally:
+                    release.set()
+                    thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
     @unittest.skipUnless(os.name == "nt", "extended path aliases are Windows-specific")
     def test_workspace_lock_identity_collapses_windows_extended_aliases(self) -> None:
         ordinary = str(self.repo.resolve())
@@ -549,9 +699,16 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(waiting["state"], "waiting")
         self.assertEqual(waiting["dispatches"], [])
         continuation = control.prepare_continuation(dispatch_id, {"fact": "now known"})
-        body = json.loads(continuation["message"].split("\n", 1)[1])
+        self.assertEqual(
+            set(continuation),
+            {"action", "tool_input", "tool_name"},
+        )
+        self.assertEqual(continuation["action"], "continue_same_owner")
+        self.assertEqual(continuation["tool_name"], "followup_task")
+        native_input = continuation["tool_input"]
+        body = json.loads(native_input["message"].split("\n", 1)[1])
         self.assertEqual(body["cursor"], 1)
-        self.assertEqual(continuation["target"], owner)
+        self.assertEqual(native_input["target"], owner)
 
     def test_interrupt_is_read_only_until_native_active_status_confirms_success(self) -> None:
         first = self.control("interrupt-one")
@@ -625,6 +782,43 @@ class V9ControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(control.status()["state"], "complete")
 
+    def test_retry_interrupt_settles_already_interrupted_native_owner(self) -> None:
+        first = self.control("interrupt-recovery")
+        second = self.control("interrupt-recovery-writer")
+        brief = self.brief([self.node("n01", "A01", "a.txt")])
+        first.create_plan(self.repo, brief)
+        second.create_plan(self.repo, brief)
+        native = first.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        _dispatch_id, owner = self.start_dispatch(first, native)
+
+        first.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "lost-postflight"}
+        )
+        first.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "recovery-interrupt"}
+        )
+        first.postflight_interrupt(
+            {
+                "tool_input": {"target": owner},
+                "tool_response": {"previous_status": "interrupted"},
+                "tool_use_id": "recovery-interrupt",
+            }
+        )
+
+        self.assertEqual(first.status()["counts"]["fenced"], 1)
+        self.assertEqual(
+            len(
+                second.next_wave(
+                    capacity=1,
+                    native_catalog=catalog("gpt-5.6-terra"),
+                )["dispatches"]
+            ),
+            1,
+        )
+
     def test_paused_continuation_rejects_out_of_scope_change(self) -> None:
         control = self.control()
         control.create_plan(self.repo, self.brief([self.node("n01", "A01", "a.txt")]))
@@ -643,12 +837,15 @@ class V9ControlPlaneTests(unittest.TestCase):
                 failure_signature="missing_fact",
             ),
         )
-        continuation = control.prepare_continuation(dispatch_id, {"fact": "known"})
+        continuation = control.prepare_continuation(dispatch_id, {"fact": "known"})[
+            "tool_input"
+        ]
         (self.repo / "b.txt").write_text("outside\n", encoding="utf-8")
         with self.assertRaisesRegex(ControlPlaneError, "workspace verification failed"):
             control.preflight_continuation(
                 {"tool_input": continuation, "tool_use_id": "continue-call"}
             )
+        self.assertEqual(control.status()["counts"]["paused"], 1)
 
     def test_continuation_message_is_exactly_bound_to_prepared_evidence(self) -> None:
         control = self.control()
@@ -668,7 +865,9 @@ class V9ControlPlaneTests(unittest.TestCase):
                 failure_signature="missing_fact",
             ),
         )
-        continuation = control.prepare_continuation(dispatch_id, {"fact": "approved"})
+        continuation = control.prepare_continuation(dispatch_id, {"fact": "approved"})[
+            "tool_input"
+        ]
         body = json.loads(continuation["message"].split("\n", 1)[1])
         body["evidence_delta"] = {"fact": "rewritten"}
         tampered = {
@@ -790,6 +989,35 @@ class V9ControlPlaneTests(unittest.TestCase):
             parse_task_message(fallback["message"])["dispatch_id"],
         )
 
+    def test_top_level_route_code_is_not_hidden_by_string_error(self) -> None:
+        control = self.control("top-level-route-code")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt", decision="mechanical")]),
+        )
+        first = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
+        )["dispatches"][0]
+        control.preflight_spawn({"tool_input": first, "tool_use_id": "route-code"})
+        control.postflight_tool(
+            {
+                "tool_input": first,
+                "tool_response": {
+                    "success": False,
+                    "code": "unsupported_model",
+                    "error": "Unknown model",
+                },
+                "tool_use_id": "route-code",
+            }
+        )
+
+        fallback = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
+        )["dispatches"][0]
+        self.assertEqual(fallback["model"], "gpt-5.6-terra")
+
     def test_non_route_native_failure_does_not_consume_model_fallback(self) -> None:
         control = self.control("non-route-native-failure")
         control.create_plan(
@@ -824,6 +1052,39 @@ class V9ControlPlaneTests(unittest.TestCase):
             parse_task_message(retried["message"])["dispatch_id"],
             parse_task_message(first["message"])["dispatch_id"],
         )
+
+    def test_compatibility_postflight_transient_failure_is_bounded(self) -> None:
+        control = self.control("bounded-postflight-failure")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt", decision="mechanical")]),
+        )
+        first_dispatch_id: str | None = None
+        for attempt in range(1, 5):
+            native = control.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
+            )["dispatches"][0]
+            self.assertEqual(native["model"], "gpt-5.6-luna")
+            dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+            first_dispatch_id = first_dispatch_id or dispatch_id
+            self.assertEqual(dispatch_id, first_dispatch_id)
+            tool_use_id = f"capacity-{attempt}"
+            control.preflight_spawn(
+                {"tool_input": native, "tool_use_id": tool_use_id}
+            )
+            control.postflight_tool(
+                {
+                    "tool_input": native,
+                    "tool_response": {
+                        "success": False,
+                        "code": "capacity_exhausted",
+                    },
+                    "tool_use_id": tool_use_id,
+                }
+            )
+
+        self.assertEqual(control.status()["counts"]["fenced"], 1)
 
     def test_wave_unit_mutation_is_rejected_before_spawn(self) -> None:
         control = self.control()
@@ -913,10 +1174,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         with self.assertRaisesRegex(ControlPlaneError, "no unsettled native call"):
             control.settle_native_failure(dispatch_id, "rate_limit")
         for attempt in range(2, 4):
-            continuation = {
-                "message": retries[-1]["message"],
-                "target": retries[-1]["target"],
-            }
+            continuation = retries[-1]["tool_input"]
             control.preflight_continuation(
                 {
                     "tool_input": continuation,
@@ -925,11 +1183,9 @@ class V9ControlPlaneTests(unittest.TestCase):
             )
             retries.append(control.settle_native_failure(dispatch_id, "rate_limit"))
         self.assertTrue(all(item["action"] == "continue_same_owner" for item in retries))
-        self.assertTrue(all(item["target"] == owner for item in retries))
-        final_continuation = {
-            "message": retries[-1]["message"],
-            "target": retries[-1]["target"],
-        }
+        self.assertTrue(all(item["tool_name"] == "followup_task" for item in retries))
+        self.assertTrue(all(item["tool_input"]["target"] == owner for item in retries))
+        final_continuation = retries[-1]["tool_input"]
         control.preflight_continuation(
             {
                 "tool_input": final_continuation,

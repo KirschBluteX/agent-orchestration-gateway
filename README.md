@@ -122,7 +122,10 @@ Codex currently exposes no tool-failure Hook. If a native spawn, continuation, o
 running Agent reports a typed failure, CCO settles that exact dispatch through
 `native-failure`. An unclaimed reservation expires defensively; once PreToolUse claims
 a call, its lease remains fail-closed until typed settlement, a terminal result, or host
-restart recovery. It never infers retries from child prose.
+restart recovery. Admission is claimed before workspace verification and rechecked before
+the native call, so reservation expiry cannot open a reader/writer race. Interrupt retry
+can settle an owner the host already reports as interrupted. It never infers retries from
+child prose.
 
 Use `$codex-cost-orchestrator:manage-cco` for installation, doctor, configuration,
 paused work, restart recovery, retry, abandonment, or cleanup. Normal tasks do not load

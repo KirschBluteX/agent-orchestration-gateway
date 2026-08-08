@@ -93,12 +93,13 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py restart
 python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
 ```
 
-- `continue` reads a non-empty JSON evidence delta from stdin and returns one exact
-  `followup_task` input. Dispatch it unchanged.
+- `continue` reads a non-empty JSON evidence delta from stdin and returns
+  `action`, `tool_name`, and `tool_input`. Invoke `tool_name` with only `tool_input`;
+  do not pass the outer metadata to the native tool.
 - `native-failure` settles one Primary-observed typed host failure. Supported kinds are
-  `rate_limit`, `network`, `timeout`, `service`, `route_rejected`, and `other`. Dispatch
-  any returned retry or fallback input unchanged; transient failures permit at most
-  three exact retries of the same native owner.
+  `rate_limit`, `network`, `timeout`, `service`, `route_rejected`, and `other`. When its
+  result has a non-null `tool_name`, invoke it with only the returned `tool_input`.
+  Transient failures permit at most three exact retries of the same native owner.
 - `abandon` fences paused work and releases its write lease.
 - `retry` creates a guarded newer generation for a fenced logical node.
 - `restart` fences active prepared claims, running turns, and paused turns. Inspect the
@@ -111,10 +112,16 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
 State transitions are `waiting → ready → starting → running → retired`, with
 `running → paused → starting` for continuation. Interrupt PreToolUse is validation-only;
 the dispatch is fenced only when the successful native result says its previous status
-was active. A terminal result may therefore win the interrupt race. Prepared claims,
+was active or already interrupted. A terminal result may therefore win the interrupt race.
+The existing `starting` claim is persisted before lock-free workspace verification and
+revalidated afterward; verification failure rolls it back. Prepared claims,
 running writers, and paused writers keep the sole canonical-workspace lease across every
 Codex task. Overlapping readers and writers are mutually excluded across tasks. A reviewer
 dependency is satisfied only by `outcome=accept`.
+
+Lifecycle v1 files left by 2.0.1 with `interrupting` state are read once as conservatively
+fenced work. Invalid or legacy state from another canonical workspace is not allowed to
+block the current workspace.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two

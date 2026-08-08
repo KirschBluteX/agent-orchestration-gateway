@@ -2,6 +2,21 @@
 
 The project follows semantic versioning.
 
+## 2.0.3 - 2026-08-09
+
+- Conservatively migrated persisted 2.0.1 `interrupting` dispatches and logical members
+  to fenced work, while filtering global lifecycle scans by canonical workspace before
+  validating a same-workspace state file.
+- Closed spawn and continuation verification races by persisting the existing native
+  admission claim before lock-free workspace checks, revalidating revision and cross-task
+  compatibility afterward, and rolling back failed verification.
+- Made explicit interrupt retries settle owners already reported as interrupted, while
+  preserving idempotent terminal-result precedence.
+- Preserved top-level typed native failure fields, made compatibility PostToolUse failures
+  use the same bounded settlement policy, and prevented repeated rearming of one route.
+- Standardized continuation and native-failure actions as `tool_name` plus exact
+  `tool_input` envelopes, and made benchmark summaries exit non-zero for missing runs.
+
 ## 2.0.2 - 2026-08-08
 
 - Removed the lifecycle dependency on failure-side PostToolUse and SubagentStop events.
