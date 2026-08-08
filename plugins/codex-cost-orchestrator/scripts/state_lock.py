@@ -143,13 +143,3 @@ def acquire(
             _os_unlock(descriptor)
             os.close(descriptor)
         local.release()
-
-
-def is_locked(root: Path, identity: str) -> bool:
-    """Return whether another process currently owns the named lock."""
-
-    try:
-        with acquire(root, identity, timeout=0):
-            return False
-    except StateLockBusy:
-        return True

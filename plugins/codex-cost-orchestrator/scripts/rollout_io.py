@@ -172,11 +172,3 @@ def first_record(path: Path) -> Mapping[str, Any]:
         return next(iter_records(path))
     except StopIteration as error:
         raise RolloutError("rollout is empty") from error
-
-
-def matching_rollouts(sessions_root: Path, thread_id: str) -> list[Path]:
-    matches = [
-        *sessions_root.rglob(f"rollout-*-{thread_id}.jsonl"),
-        *sessions_root.rglob(f"rollout-*-{thread_id}.jsonl.zst"),
-    ]
-    return sorted(set(matches), key=str)

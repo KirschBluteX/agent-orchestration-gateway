@@ -88,6 +88,19 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(outcome["decision"], "block")
         self.assertIn("opaque collaboration", outcome["reason"])
 
+    def test_native_bypass_marker_has_no_authority(self) -> None:
+        outcome = cco_hook.evaluate(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "hook-session",
+                "tool_input": {"message": "CCO_NATIVE_BYPASS v1\ninspect one image"},
+                "tool_name": "spawn_agent",
+                "tool_use_id": "call",
+            }
+        )
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("every native child", outcome["reason"])
+
     def test_hook_manifest_has_no_global_all_tool_matcher(self) -> None:
         manifest = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -102,6 +115,34 @@ class V9HookTests(unittest.TestCase):
             for group in groups
         )
         self.assertEqual(count, 5)
+
+    def test_pretool_internal_budget_is_below_host_timeout(self) -> None:
+        manifest = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+        host_timeout = manifest["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"]
+        self.assertLess(cco_hook.PRETOOL_INTERNAL_BUDGET_SECONDS, host_timeout)
+        control = cco_hook._control(
+            {"hook_event_name": "PreToolUse", "session_id": "budgeted-hook"}
+        )
+        self.assertLess(control.lock_timeout, 3)
+
+    def test_postflight_delegates_only_success_settlement(self) -> None:
+        class Control:
+            @staticmethod
+            def postflight_tool(_payload: object) -> None:
+                return None
+
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            outcome = cco_hook.evaluate(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "session_id": "hook-session",
+                    "tool_input": {"message": "CCO_TASK cco.v9\n{}"},
+                    "tool_name": "spawn_agent",
+                    "tool_response": {"success": True},
+                    "tool_use_id": "call",
+                }
+            )
+        self.assertEqual(outcome, {})
 
     def test_stop_blocks_only_the_first_stop_event_while_work_is_active(self) -> None:
         class Control:

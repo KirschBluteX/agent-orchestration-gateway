@@ -2,6 +2,24 @@
 
 The project follows semantic versioning.
 
+## 2.0.4 - 2026-08-09
+
+- Removed the public native-spawn bypass and made every requested native subagent pass
+  through the same CCO plan, while retaining Codex as the only Agent runtime.
+- Restored legacy `interrupting` work to its prior running or paused state so an
+  uncertain old interrupt keeps its reader/writer lease until explicit settlement.
+- Partitioned lifecycle filenames by canonical workspace, quarantined unindexable
+  legacy files, and made malformed same-workspace state fail closed without letting an
+  unrelated state file block all workspaces.
+- Added a shared internal PreToolUse deadline, bounded Git and directory inspection,
+  short lock waits, and rollback reserve below the host Hook timeout.
+- Discarded and recaptured an unexecuted stale spawn wave instead of replaying its old
+  baseline forever.
+- Unified single-child, compact DAG, and full DAG creation under one `prepare` entry,
+  and removed unused failure-side PostTool compatibility parsing and rollout helpers.
+- Clarified that `wait_agent` window expiry is not child failure and documented the
+  Codex host's fail-open Hook process boundary.
+
 ## 2.0.3 - 2026-08-09
 
 - Conservatively migrated persisted 2.0.1 `interrupting` dispatches and logical members

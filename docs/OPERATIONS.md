@@ -45,41 +45,47 @@ discovery/trust, and at least one route under the workspace-effective static pol
 task's ID.
 
 ```text
-python -B <PLUGIN_ROOT>/scripts/control_plane.py plan --repo <PROJECT>
-python -B <PLUGIN_ROOT>/scripts/control_plane.py next --capacity <N>
+python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <PROJECT> --capacity <N>
 ```
 
-`plan` reads one brief from stdin. External scopes use `file` or `tree`. The only
-required node fields are `id`, `role`, `objective`, `acceptance`, and `scopes`.
-An existing lifecycle state must be explicitly cleaned before another plan can be
-created in the same Codex task.
+`prepare` reads a compact brief from stdin, creates the plan, captures one baseline, and
+returns complete native inputs for the first ready wave. A single child needs `role`,
+`objective`, acceptance criterion strings, and scopes. A compact DAG uses `goal` and
+`nodes`; every node adds `id` and may add `depends_on` or `review_of`. External scopes use
+`file` or `tree`.
 
 ```json
 {
   "goal": "Update and verify the parser",
-  "acceptance": {
-    "A01": "The parser accepts the new form",
-    "A02": "Existing forms remain valid"
-  },
   "nodes": [
     {
       "id": "parser_change",
       "role": "worker",
       "objective": "Implement the closed parser change",
-      "acceptance": ["A01", "A02"],
+      "acceptance": [
+        "The parser accepts the new form",
+        "Existing forms remain valid"
+      ],
       "scopes": [{"kind": "tree", "path": "src/parser"}]
     }
   ]
 }
 ```
 
+When nodes must share named acceptance IDs, submit a full brief with top-level
+`acceptance` to the same `prepare` command. An existing lifecycle state must be explicitly
+cleaned before another plan can be created in the same Codex task. No form needs a
+temporary contract file.
+
 Omitted `decision` means bounded judgment. Set `decision` to `mechanical` only when
 all allowed choices are acceptance-equivalent. `verification=semantic|manual` or a
 non-empty `risks` list raises the route to guarded.
 
-`next` returns complete native inputs. Dispatch them unchanged, then enter one long
-`wait_agent`. Call `next` again only after the current wave settles. It advances
+`prepare` and `next` return complete native inputs. Dispatch them unchanged, then enter
+one long `wait_agent`. Call `next` only after the current wave settles. It advances
 logical dependencies from lifecycle evidence; Primary never supplies completed nodes.
+`wait_agent` returning `timed_out:true` means only that the wait window ended. The child
+is still active: enter another long wait and do not call `native-failure`.
 
 ## Lifecycle operations
 
@@ -119,9 +125,12 @@ running writers, and paused writers keep the sole canonical-workspace lease acro
 Codex task. Overlapping readers and writers are mutually excluded across tasks. A reviewer
 dependency is satisfied only by `outcome=accept`.
 
-Lifecycle v1 files left by 2.0.1 with `interrupting` state are read once as conservatively
-fenced work. Invalid or legacy state from another canonical workspace is not allowed to
-block the current workspace.
+Lifecycle v1 files left by 2.0.1 with `interrupting` state recover the recorded prior
+`running` or `paused` state. If that field is absent, CCO conservatively restores
+`running`; the uncertain native owner keeps its lease until restart, a terminal result,
+or explicit interrupt settlement. New lifecycle filenames carry canonical workspace and
+task digests, so an invalid indexed state blocks only its workspace. Unindexable malformed
+legacy files move to the local `quarantine` directory for manual inspection.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
@@ -131,6 +140,12 @@ native call identity, its lease stays fail-closed; overdue `status` output repor
 error; never infer a retry from arbitrary assistant prose. A successful spawn response
 without a canonical owner stays running as owner-pending; trusted UUID/rollout evidence may
 bind it when the result stops.
+
+CCO PreToolUse work uses a shared internal deadline, bounded Git subprocesses, and short
+lock waits with rollback reserve below the 30-second manifest timeout. Current Codex logs
+a Hook command crash or timeout but still allows the native tool; this host-level
+fail-open behavior is outside a plugin's enforcement authority. Treat CCO as a workflow
+guardrail, keep Hooks trusted, and inspect host Hook failures.
 
 Wave artifacts contain the fresh baseline and are deleted as soon as every physical
 dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,

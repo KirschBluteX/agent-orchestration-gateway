@@ -15,6 +15,11 @@ import sys
 import tempfile
 from typing import Any
 
+from operation_deadline import (
+    OperationDeadlineExceeded,
+    checkpoint,
+    remaining_seconds,
+)
 from protocol_hash import (
     ProtocolHashError,
     parse_repository_scope_text,
@@ -84,14 +89,20 @@ class StateError(Exception):
 def git(repo: Path, *args: str, allow_failure: bool = False) -> bytes:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    result = subprocess.run(
-        ["git", *args],
-        cwd=repo,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_seconds(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise OperationDeadlineExceeded(
+            "Git workspace inspection exceeded the CCO Hook deadline"
+        ) from error
     if result.returncode and not allow_failure:
         raise StateError("Git repository inspection failed")
     return result.stdout
@@ -191,6 +202,7 @@ def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            checkpoint()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -244,12 +256,14 @@ def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
     records: list[dict[str, Any]] = []
     stack: list[tuple[Path, str]] = [(path, "")]
     while stack:
+        checkpoint()
         current, prefix = stack.pop()
         try:
             children = sorted(os.scandir(current), key=lambda entry: entry.name)
         except OSError as error:
             raise StateError("Git control directory inspection failed") from error
         for child in children:
+            checkpoint()
             relative = f"{prefix}/{child.name}" if prefix else child.name
             metadata = child.stat(follow_symlinks=False)
             mode = stat.S_IMODE(metadata.st_mode)
@@ -386,6 +400,7 @@ def status_entries(root: Path) -> dict[str, dict[str, Any]]:
     entries: dict[str, dict[str, Any]] = {}
     index = 0
     while index < len(fields):
+        checkpoint()
         record = fields[index]
         index += 1
         if not record:
@@ -476,6 +491,7 @@ def ignored_entries(
     total_bytes = 0
     entries: dict[str, dict[str, Any]] = {}
     for path in paths:
+        checkpoint()
         candidate = root / Path(path)
         try:
             metadata = candidate.lstat()
@@ -498,6 +514,7 @@ def repository_index_records(root: Path) -> dict[str, list[dict[str, str]]]:
     raw = git(root, "ls-files", "--stage", "--cached", "-z")
     index_records: dict[str, list[dict[str, str]]] = {}
     for record in raw.split(b"\0"):
+        checkpoint()
         if not record:
             continue
         try:
@@ -524,6 +541,7 @@ def repository_status_hidden_paths(root: Path) -> frozenset[str]:
     raw = git(root, "ls-files", "-v", "-z")
     hidden: set[str] = set()
     for record in raw.split(b"\0"):
+        checkpoint()
         if not record:
             continue
         try:
@@ -598,6 +616,7 @@ def tracked_entries(
         }
     )
     for path, records in sorted(selected_records.items()):
+        checkpoint()
         ordered_records = sorted(
             records,
             key=lambda item: (item["stage"], item["mode"], item["object_id"]),
@@ -673,6 +692,7 @@ def workspace_entries(
     )
     entries: dict[str, dict[str, Any]] = {}
     for path in sorted(set(status) | set(tracked) | set(ignored)):
+        checkpoint()
         entry: dict[str, Any] = {}
         if path in status:
             entry["status"] = status[path]
@@ -705,14 +725,20 @@ def head_oid(root: Path) -> str | None:
 def symbolic_head(root: Path) -> str | None:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
-    result = subprocess.run(
-        ["git", "symbolic-ref", "-q", "HEAD"],
-        cwd=root,
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "-q", "HEAD"],
+            cwd=root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_seconds(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise OperationDeadlineExceeded(
+            "Git symbolic HEAD inspection exceeded the CCO Hook deadline"
+        ) from error
     if result.returncode == 1:
         return None
     if result.returncode != 0:

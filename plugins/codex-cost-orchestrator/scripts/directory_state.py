@@ -11,6 +11,7 @@ import stat
 from typing import Any, Mapping
 import unicodedata
 
+from operation_deadline import checkpoint
 from protocol_hash import (
     ProtocolHashError,
     canonical_bytes,
@@ -105,12 +106,14 @@ def _canonical_child_path(relative: str) -> str:
 
 
 def _child_names(path: Path) -> list[str]:
+    checkpoint()
     try:
         names = [entry.name for entry in os.scandir(path)]
     except OSError as error:
         raise DirectoryStateError("directory workspace enumeration failed") from error
     keys: dict[str, str] = {}
     for name in names:
+        checkpoint()
         if unicodedata.normalize("NFC", name) != name:
             raise DirectoryStateError("directory entry names must use NFC normalization")
         key = name.casefold()
@@ -132,6 +135,7 @@ def normalize_directory_scope(root: Path, value: object) -> dict[str, str]:
     spelling: list[str] = []
     segments = scope["path"].split("/")
     for index, segment in enumerate(segments):
+        checkpoint()
         names = _child_names(current)
         matches = [name for name in names if name.casefold() == segment.casefold()]
         if len(matches) > 1:
@@ -227,9 +231,11 @@ def _walk_tree(
         return
     stack: list[tuple[Path, str]] = [(start, relative)]
     while stack:
+        checkpoint()
         current, prefix = stack.pop()
         directories: list[tuple[Path, str]] = []
         for name in _child_names(current):
+            checkpoint()
             child = current / name
             child_relative = _canonical_child_path(f"{prefix}/{name}" if prefix else name)
             child_record, child_token = _inspect_entry(child, child_relative)
@@ -259,6 +265,7 @@ def _enumerate(
     totals = {"bytes": 0, "entries": 0}
     if capture_mode == "full":
         for name in _child_names(root):
+            checkpoint()
             child = root / name
             relative = _canonical_child_path(name)
             _walk_tree(
@@ -272,6 +279,7 @@ def _enumerate(
             )
     else:
         for scope in scopes:
+            checkpoint()
             target = root / Path(scope["path"])
             if not target.exists() and not target.is_symlink():
                 _append_with_budget(
@@ -346,6 +354,7 @@ def _digest_file(path: Path, expected: tuple[Any, ...]) -> str:
             raise DirectoryStateError("directory file changed during snapshot capture")
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                checkpoint()
                 digest.update(chunk)
         after = path.stat(follow_symlinks=False)
     except OSError as error:
@@ -392,6 +401,7 @@ def capture_directory_state(
     file_count, directory_count, total_bytes = _counts(first)
     entries: list[dict[str, Any]] = []
     for record, token, path in first:
+        checkpoint()
         item = dict(record)
         if path is not None:
             item["sha256"] = _digest_file(path, token)

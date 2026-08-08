@@ -12,7 +12,15 @@ SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from state_lock import acquire, is_locked, lock_path  # noqa: E402
+from state_lock import StateLockBusy, acquire, lock_path  # noqa: E402
+
+
+def is_locked(root: Path, identity: str) -> bool:
+    try:
+        with acquire(root, identity, timeout=0):
+            return False
+    except StateLockBusy:
+        return True
 
 
 class StateLockTests(unittest.TestCase):

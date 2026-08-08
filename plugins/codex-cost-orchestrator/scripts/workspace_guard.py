@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from operation_deadline import checkpoint
 from directory_state import (
     DirectoryStateError,
     capture_directory_state,
@@ -48,6 +49,7 @@ def _absolute(path: Path) -> Path:
 
 def _has_git_marker(path: Path) -> bool:
     for ancestor in (path, *path.parents):
+        checkpoint()
         try:
             (ancestor / ".git").lstat()
             return True
@@ -61,6 +63,7 @@ def _has_git_marker(path: Path) -> bool:
 def discover_workspace(path: Path) -> tuple[str, Path]:
     """Return the authoritative backend and root without creating a repository."""
 
+    checkpoint()
     requested = _absolute(path)
     try:
         return "git", repository_root(requested)
@@ -280,6 +283,7 @@ def verify_state(
 ) -> dict[str, Any]:
     """Verify a wave and return only the current owner's attributable delta."""
 
+    checkpoint()
     bound = validate_baseline(baseline)
     backend, workspace = discover_workspace(root)
     if backend != bound["backend"] or os.path.normcase(str(workspace)) != os.path.normcase(

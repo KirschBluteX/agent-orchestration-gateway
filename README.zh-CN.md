@@ -13,10 +13,11 @@ CCO 只使用 Codex 自身的 Agent runtime，不运行第二套协调器，不�
 
 - 一次编译完整逻辑 DAG，再自动生成依赖已满足的执行波次。
 - 使用与原生职责一致的 `explorer`、`worker`、`reviewer`。
+- 所有需要的原生子 Agent 都必须先进入同一份 CCO plan，不存在提示词级直接派遣绕过。
 - 确定性的机械任务优先 Luna；需要有限判断、保护或审查的任务优先 Terra。
 - 不会自动选择 Sol；用户可在当前任务中明确指定任意原生支持的模型与思考强度。
 - 在宿主真实 Agent 容量内选择最大无冲突 ready set。
-- 所有 Codex 任务共享同一规范工作区时，只允许一个可写子 Agent；只有范围不重叠的只读任务可并行。
+- 所有 Codex 任务共享同一规范工作区时，只允许一个可写子 Agent；只读任务可并行，读写范围重叠时会拒绝准入。
 - ready 数量超过容量时，可安全聚合相容的机械微任务。
 - 每个波次都绑定新的 Git 或有界非 Git 工作区状态。
 - 依靠原生终止事件唤醒 Primary，不轮询进度。
@@ -104,15 +105,24 @@ Primary 只需一次性闭合目标、范围、依赖和验收 ID。之后的 re
 baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地完成。子 Agent
 名称会显示职责、逻辑节点、模型、思考强度与 generation，便于实时查看。
 
+普通首波无论是单个子 Agent 还是紧凑多节点 DAG，都只调用一次本地 `prepare`。
+它从标准输入读取任务并直接返回完整的原生工具参数；派遣过程不创建临时合同文件，
+也不需要读取 CCO 源码。后续依赖波次只调用 `next`。只有多个节点必须共享具名验收
+证据时，向同一个入口提交包含顶层 `acceptance` 的完整 DAG。
+
 一个 Codex 任务在显式清理非活动状态前只拥有一份 plan。`status` 除紧凑计数外，
 还会直接列出暂停、fenced 或等待 owner 绑定的 dispatch。spawn 即时返回缺少 owner
 不会再被当成 worker 失败；SubagentStop 会用受信 rollout 证据完成迟绑定。
+`wait_agent` 的等待窗口到期不代表子 Agent 超时或失败；Primary 会继续一次长等待，
+不会重试子 Agent，也不会开始重叠工作。
 
 Codex 当前没有工具失败 Hook。如果原生 spawn、continuation 或运行中的 Agent 返回 typed failure，
 CCO 会通过 `native-failure` 精确结算对应 dispatch。尚未进入 PreToolUse 的 reservation 会有界过期；
 一旦原生调用已被 claim，lease 会 fail-closed 保留到 typed settlement、终止结果或宿主重启恢复。
 准入 claim 会在工作区校验前持久化，并在原生调用前再次验证，reservation 过期不会形成跨任务读写竞态；
 若宿主已报告 owner 为 interrupted，显式 interrupt 重试也能完成结算。CCO 不会根据子 Agent 的普通文本猜测并重试。
+尚未真正执行的 spawn 若基线已过时，CCO 会废弃该波次，并在下一次 `next` 时重新捕获，
+而不是无限重复旧基线。
 
 安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
 `$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。
@@ -139,6 +149,10 @@ candidates = [
 
 CCO 是工作流护栏，不是操作系统安全边界。Primary 仍是可信控制面，并负责集成和最终
 验收。只读 leaf 请求 read-only sandbox；worker 只获得一个有界写 lease，且不得 stage。
+
+Codex 当前会在 PreToolUse 命令崩溃或被宿主超时终止时 fail-open。CCO 使用明显更短的
+内部期限并在宿主期限前显式阻止调用，但无法把被杀死的 Hook 进程变成操作系统级
+fail-closed 边界。
 
 Git 工作区会保护仓库控制状态、typed scopes、范围内 ignored 内容、路径别名、submodule
 和隐藏 status 情况。非 Git 工作区不会执行 `git init`，默认上限为 20,000 个条目和 1 GiB。

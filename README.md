@@ -14,13 +14,15 @@ routing service, record billing data, or require an MCP server.
 
 - Compiles one logical DAG, then derives dependency-ready execution waves locally.
 - Uses `explorer`, `worker`, and `reviewer` roles aligned with native Agent work.
+- Routes every requested native subagent through one prepared CCO plan; there is no
+  prompt-level direct-spawn bypass.
 - Prefers Luna for deterministic mechanical work and Terra for bounded judgment,
   guarded work, and review.
 - Never selects Sol automatically; a current explicit user pin can select any native
   supported model and reasoning effort.
 - Maximizes non-conflicting work up to the host's observed Agent capacity.
-- Allows one writable child across all Codex tasks sharing a canonical workspace while
-  parallelizing only non-overlapping read work.
+- Allows one writable child across all Codex tasks sharing a canonical workspace,
+  permits parallel readers, and rejects overlapping reader/writer scopes.
 - Aggregates compatible mechanical microtasks when ready work exceeds native capacity.
 - Binds every wave to one fresh Git or bounded non-Git workspace state.
 - Waits for native terminal events instead of polling progress.
@@ -113,10 +115,18 @@ handles readiness, route selection, baseline capture, dispatch identity, continu
 and result mapping. Returned child names include role, logical node, model, effort, and
 generation so the live Agent list remains readable.
 
+The normal first wave uses one local `prepare` call for either one child or a compact
+multi-node DAG. It consumes the brief from stdin and returns complete native tool inputs;
+no temporary contract file or CCO source inspection is part of dispatch. Later dependency
+waves require only `next`. The same entry accepts a full DAG when nodes share named
+acceptance evidence.
+
 One Codex task owns one plan until explicit inactive cleanup. `status` reports compact
 counts plus actionable paused, fenced, or owner-pending dispatch identities. A spawn
 response that omits the owner remains pending until trusted SubagentStop rollout evidence
 binds it; missing response metadata alone is not treated as worker failure.
+An expired `wait_agent` window is not a child timeout: Primary starts another long wait
+without retrying the child or performing overlapping work.
 
 Codex currently exposes no tool-failure Hook. If a native spawn, continuation, or
 running Agent reports a typed failure, CCO settles that exact dispatch through
@@ -125,7 +135,8 @@ a call, its lease remains fail-closed until typed settlement, a terminal result,
 restart recovery. Admission is claimed before workspace verification and rechecked before
 the native call, so reservation expiry cannot open a reader/writer race. Interrupt retry
 can settle an owner the host already reports as interrupted. It never infers retries from
-child prose.
+child prose. If a not-yet-executed spawn baseline is stale, CCO discards that wave and
+captures a fresh one on the next `next` call instead of replaying it indefinitely.
 
 Use `$codex-cost-orchestrator:manage-cco` for installation, doctor, configuration,
 paused work, restart recovery, retry, abandonment, or cleanup. Normal tasks do not load
@@ -154,6 +165,10 @@ select Sol or another native supported model.
 CCO is a workflow guardrail, not an OS security boundary. The Primary remains trusted
 and owns integration and final acceptance. Read leaves request a read-only sandbox;
 workers receive one bounded write lease and must not stage files.
+
+Codex currently treats a crashed or host-timed-out PreToolUse command as fail-open. CCO
+uses a shorter internal deadline and returns an explicit block before the host deadline,
+but it cannot turn a killed Hook process into an OS-level fail-closed boundary.
 
 Git workspaces protect repository control state, typed scopes, ignored content within
 scope, path aliases, submodules, and hidden status cases. Non-Git workspaces are

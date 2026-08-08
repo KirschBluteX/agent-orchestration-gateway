@@ -13,7 +13,6 @@ import unicodedata
 MAX_SAFE_INTEGER = (1 << 53) - 1
 MAX_NESTING_LEVELS = 64
 SCOPE_KINDS = frozenset({"exact", "prefix"})
-CANONICAL_TASK_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 WIN32_DEVICE_BASENAME = re.compile(
     r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$",
     re.IGNORECASE,
@@ -173,10 +172,3 @@ def repository_scopes_overlap(left: dict[str, str], right: dict[str, str]) -> bo
         or (first["kind"] == "prefix" and right_path.startswith(left_path + "/"))
         or (second["kind"] == "prefix" and left_path.startswith(right_path + "/"))
     )
-
-
-def require_canonical_task_path(value: Any, label: str) -> str:
-    path = _text(value, label)
-    if CANONICAL_TASK_PATH.fullmatch(path) is None:
-        raise ProtocolHashError(f"{label} must be a canonical native task path")
-    return path

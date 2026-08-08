@@ -47,6 +47,12 @@ reservations expire defensively, but a PreToolUse-claimed call retains its lease
 typed settlement, a terminal result, or restart recovery because Codex has no native
 tool-failure Hook.
 
+Current Codex treats a PreToolUse command crash or host timeout as fail-open. CCO keeps
+its own admission budget below the manifest timeout, bounds Git and directory inspection,
+and reserves time to roll back an unfinished claim, so ordinary deadline exhaustion
+returns an explicit block. A process killed before it can return that block cannot be
+made fail-closed by a plugin and remains part of the trusted-host boundary.
+
 Review and trust Hook hashes in `/hooks` after every update. Doctor never changes trust.
 
 Opaque host collaboration payloads, including encrypted reasoning objects, must remain

@@ -16,7 +16,6 @@ from protocol_hash import (  # noqa: E402
     object_from_pairs,
     parse_repository_scope_text,
     repository_scopes_overlap,
-    require_canonical_task_path,
     require_repository_path,
 )
 
@@ -70,16 +69,6 @@ class CanonicalHelperTests(unittest.TestCase):
                 {"kind": "exact", "path": "tests/a.py"},
             )
         )
-
-    def test_native_task_path_is_exact(self) -> None:
-        self.assertEqual(
-            require_canonical_task_path("/root/work_n01_routine_g01", "target"),
-            "/root/work_n01_routine_g01",
-        )
-        for value in ("work_n01", "/root/../work", "/root/Work"):
-            with self.subTest(value=value), self.assertRaises(ProtocolHashError):
-                require_canonical_task_path(value, "target")
-
 
 if __name__ == "__main__":
     unittest.main()

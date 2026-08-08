@@ -32,6 +32,8 @@ or `other`; use it only for a typed host error and follow the same envelope rule
 `tool_name` means no native call. `status` identifies paused, fenced, and
 owner-pending work. A Desktop restart fences every active prepared claim, running turn,
 or paused turn; inspect the workspace before `retry`.
+`wait_agent` returning `timed_out:true` is only a wait-window expiry. Continue a long
+wait; do not settle it as a native timeout.
 
 `cleanup` is current-task-only and refuses active or paused child work. Run it only
 after host-card maintenance is no longer needed.

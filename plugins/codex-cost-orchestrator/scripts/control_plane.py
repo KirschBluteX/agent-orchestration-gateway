@@ -14,7 +14,7 @@ import re
 import sys
 import tempfile
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 import unicodedata
 
 from protocol_hash import (
@@ -28,6 +28,12 @@ from protocol_hash import (
     require_repository_path,
 )
 from host_paths import HostPathError, host_path
+from operation_deadline import (
+    OperationDeadlineExceeded,
+    checkpoint,
+    deadline_after,
+    remaining_seconds,
+)
 from routing_catalog import (
     RoutingCatalogError,
     load_native_catalog,
@@ -82,34 +88,13 @@ MAX_AGGREGATE_MEMBERS = 4
 MAX_TOMBSTONES = 256
 MAX_TRANSIENT_RETRIES = 3
 NATIVE_CLAIM_TTL_MILLISECONDS = 120_000
+PREFLIGHT_VERIFICATION_SECONDS = 14.0
+PREFLIGHT_ROLLBACK_RESERVE_SECONDS = 4.0
 NATIVE_FAILURE_KINDS = frozenset(
     {"network", "other", "rate_limit", "route_rejected", "service", "timeout"}
 )
-ROUTE_REJECTION_CODES = frozenset(
-    {
-        "invalid_model",
-        "model_not_found",
-        "model_not_supported",
-        "model_unsupported",
-        "unknown_model",
-        "unsupported_model",
-    }
-)
-RATE_LIMIT_CODES = frozenset({"rate_limit", "rate_limited", "too_many_requests"})
-NETWORK_CODES = frozenset(
-    {"connection_error", "network", "network_error", "transport", "transport_error"}
-)
-TIMEOUT_CODES = frozenset({"deadline_exceeded", "timed_out", "timeout"})
-SERVICE_CODES = frozenset(
-    {
-        "capacity_exhausted",
-        "internal_server_error",
-        "service",
-        "service_unavailable",
-        "temporarily_unavailable",
-    }
-)
 EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
+STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{64})\.json$")
 
 
 class ControlPlaneError(RuntimeError):
@@ -154,8 +139,28 @@ def _workspace_key(value: object) -> str:
 
 
 def _workspace_lock_identity(value: object) -> str:
-    digest = hashlib.sha256(_workspace_key(value).encode("utf-8")).hexdigest()
-    return f"workspace-{digest}"
+    return f"workspace-{_workspace_digest(value)}"
+
+
+def _workspace_digest(value: object) -> str:
+    return hashlib.sha256(_workspace_key(value).encode("utf-8")).hexdigest()
+
+
+def _session_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _lifecycle_state_path(root: Path, workspace: object, session_id: str) -> Path:
+    return root / f"{_workspace_digest(workspace)}--{_session_digest(session_id)}.json"
+
+
+def _preflight_verification_budget() -> float:
+    remaining = remaining_seconds(reserve=PREFLIGHT_ROLLBACK_RESERVE_SECONDS)
+    return (
+        PREFLIGHT_VERIFICATION_SECONDS
+        if remaining is None
+        else min(PREFLIGHT_VERIFICATION_SECONDS, remaining)
+    )
 
 
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -205,12 +210,14 @@ def _write_immutable(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _load_object(path: Path, label: str) -> dict[str, Any]:
+    checkpoint()
     try:
         raw = path.read_bytes()
     except OSError as error:
         raise ControlPlaneUnavailable(f"{label} is unavailable") from error
     if len(raw) > 32 * 1024 * 1024:
         raise ControlPlaneError(f"{label} is too large")
+    checkpoint()
     try:
         value = json.loads(
             raw.decode("utf-8"),
@@ -255,6 +262,125 @@ def _external_scopes(value: object) -> list[dict[str, str]]:
             raise ControlPlaneError(f"node scope {index}.kind must be file or tree")
         normalized.append({"kind": internal, "path": item["path"]})
     return normalized
+
+
+def _single_node_brief(value: object) -> dict[str, Any]:
+    """Expand the common one-child contract without exposing the full DAG schema."""
+
+    if not isinstance(value, Mapping):
+        raise ControlPlaneError("single-child contract must be an object")
+    allowed = {
+        "acceptance",
+        "context_turns",
+        "decision",
+        "goal",
+        "objective",
+        "pin",
+        "risks",
+        "role",
+        "scopes",
+        "verification",
+    }
+    if set(value) - allowed:
+        raise ControlPlaneError("single-child contract contains unsupported fields")
+    required = {"acceptance", "objective", "role", "scopes"}
+    if not required <= set(value):
+        raise ControlPlaneError("single-child contract is incomplete")
+    objective = _text(value["objective"], "single-child objective")
+    criteria = value["acceptance"]
+    if not isinstance(criteria, list) or not 1 <= len(criteria) <= 32:
+        raise ControlPlaneError("single-child acceptance must contain 1 to 32 criteria")
+    acceptance = {
+        f"A{index:02d}": _text(item, f"single-child acceptance {index}", limit=4_096)
+        for index, item in enumerate(criteria, start=1)
+    }
+    node = {
+        key: deepcopy(value[key])
+        for key in (
+            "context_turns",
+            "decision",
+            "pin",
+            "risks",
+            "verification",
+        )
+        if key in value
+    }
+    node.update(
+        {
+            "acceptance": list(acceptance),
+            "id": "task",
+            "objective": objective,
+            "role": value["role"],
+            "scopes": deepcopy(value["scopes"]),
+        }
+    )
+    return {
+        "acceptance": acceptance,
+        "goal": _text(value.get("goal", objective), "single-child goal"),
+        "nodes": [node],
+    }
+
+
+def _compact_graph_brief(value: object) -> dict[str, Any]:
+    """Expand per-node acceptance text into one ordinary cco.v9 DAG brief."""
+
+    if not isinstance(value, Mapping) or set(value) != {"goal", "nodes"}:
+        raise ControlPlaneError("compact graph must contain only goal and nodes")
+    nodes_value = value["nodes"]
+    if not isinstance(nodes_value, list) or not nodes_value:
+        raise ControlPlaneError("compact graph nodes must be a non-empty list")
+    allowed = {
+        "acceptance",
+        "context_turns",
+        "decision",
+        "depends_on",
+        "id",
+        "objective",
+        "pin",
+        "review_of",
+        "risks",
+        "role",
+        "scopes",
+        "verification",
+    }
+    required = {"acceptance", "id", "objective", "role", "scopes"}
+    acceptance: dict[str, str] = {}
+    nodes: list[dict[str, Any]] = []
+    counter = 0
+    for index, raw in enumerate(nodes_value):
+        if not isinstance(raw, Mapping) or set(raw) - allowed or not required <= set(raw):
+            raise ControlPlaneError(f"compact graph node {index} is invalid")
+        criteria = raw["acceptance"]
+        if not isinstance(criteria, list) or not criteria:
+            raise ControlPlaneError(f"compact graph node {index} has no acceptance criteria")
+        ids: list[str] = []
+        for criterion in criteria:
+            counter += 1
+            if counter > 999:
+                raise ControlPlaneError("compact graph exceeds 999 acceptance criteria")
+            acceptance_id = f"A{counter:03d}"
+            acceptance[acceptance_id] = _text(
+                criterion,
+                f"compact graph acceptance {counter}",
+                limit=4_096,
+            )
+            ids.append(acceptance_id)
+        node = deepcopy(dict(raw))
+        node["acceptance"] = ids
+        nodes.append(node)
+    return {
+        "acceptance": acceptance,
+        "goal": _text(value["goal"], "compact graph goal"),
+        "nodes": nodes,
+    }
+
+
+def _prepare_brief(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping) and "nodes" in value:
+        if set(value) == {"acceptance", "goal", "nodes"}:
+            return deepcopy(dict(value))
+        return _compact_graph_brief(value)
+    return _single_node_brief(value)
 
 
 def _normalize_pin(value: object) -> dict[str, str | None]:
@@ -803,84 +929,20 @@ def parse_result(value: object) -> dict[str, Any]:
     }
 
 
-def _native_failure_payload(value: object) -> object | None:
-    """Return only structured native failure fields, never arbitrary result text."""
+def _native_response_failed(value: object) -> bool:
+    """Recognize only an explicit failure marker; never infer a failure kind."""
 
     if not isinstance(value, Mapping):
-        return None
-    failed = (
+        return False
+    error = value.get("error")
+    return (
         value.get("isError") is True
         or value.get("is_error") is True
         or value.get("success") is False
         or value.get("ok") is False
         or str(value.get("status", "")).casefold() in {"error", "failed", "failure"}
+        or (error is not None and error is not False and error != "")
     )
-    error = value.get("error")
-    has_error = error is not None and error is not False and error != ""
-    if not failed and not has_error:
-        return None
-    fields = {
-        key: value[key]
-        for key in (
-            "code",
-            "http_status",
-            "kind",
-            "message",
-            "reason",
-            "status",
-            "status_code",
-            "type",
-        )
-        if key in value
-    }
-    if isinstance(error, Mapping):
-        for key in (
-            "code",
-            "http_status",
-            "kind",
-            "message",
-            "reason",
-            "status",
-            "status_code",
-            "type",
-        ):
-            if key in error and key not in fields:
-                fields[key] = error[key]
-    elif isinstance(error, str) and "message" not in fields:
-        fields["message"] = error
-    return fields or {"status": "failure"}
-
-
-def _native_failure_kind(value: object) -> str | None:
-    """Map typed native status to one bounded settlement kind."""
-
-    failure = _native_failure_payload(value)
-    if failure is None:
-        return None
-    if not isinstance(failure, Mapping):
-        return "other"
-    markers = {
-        re.sub(r"[^a-z0-9]+", "_", raw.casefold()).strip("_")
-        for key in ("code", "kind", "reason", "status", "type")
-        if isinstance((raw := failure.get(key)), str)
-    }
-    if markers & ROUTE_REJECTION_CODES:
-        return "route_rejected"
-    if markers & RATE_LIMIT_CODES:
-        return "rate_limit"
-    if markers & NETWORK_CODES:
-        return "network"
-    if markers & TIMEOUT_CODES:
-        return "timeout"
-    if markers & SERVICE_CODES:
-        return "service"
-    status_code = failure.get("status_code", failure.get("http_status"))
-    if isinstance(status_code, int) and not isinstance(status_code, bool):
-        if status_code == 429:
-            return "rate_limit"
-        if 500 <= status_code <= 599:
-            return "service"
-    return "other"
 
 
 def _tool_action(
@@ -1010,8 +1072,27 @@ class ControlPlane:
             raise ControlPlaneError("lock timeout must be positive")
         self.session_id = session_id
         self.root = Path(os.path.abspath((root or _state_root()).expanduser()))
-        self.state_path = self.root / f"{session_id}.json"
+        self._state_path: Path | None = None
         self.lock_timeout = float(lock_timeout)
+
+    @property
+    def state_path(self) -> Path:
+        """Resolve this task's workspace-partitioned state without parsing other tasks."""
+
+        if self._state_path is not None:
+            return self._state_path
+        suffix = f"--{_session_digest(self.session_id)}.json"
+        try:
+            matches = sorted(self.root.glob(f"*{suffix}"), key=lambda item: item.name)
+        except OSError as error:
+            raise ControlPlaneUnavailable("lifecycle state directory is unavailable") from error
+        legacy = self.root / f"{self.session_id}.json"
+        if legacy.exists():
+            matches.append(legacy)
+        if len(matches) > 1:
+            raise ControlPlaneError("current task has multiple lifecycle state files")
+        self._state_path = matches[0] if matches else legacy
+        return self._state_path
 
     @staticmethod
     def _validate_lifecycle_state(
@@ -1035,28 +1116,53 @@ class ControlPlane:
         if legacy:
             logical = normalized.get("logical")
             dispatches = normalized.get("dispatches")
+            migrated_members: set[str] = set()
             if isinstance(dispatches, Mapping):
                 for dispatch in dispatches.values():
                     if not isinstance(dispatch, dict) or dispatch.get("state") != "interrupting":
                         continue
-                    dispatch["state"] = "fenced"
+                    previous = dispatch.pop("interrupt_previous", None)
+                    previous_state = (
+                        previous.get("state")
+                        if isinstance(previous, Mapping)
+                        and previous.get("state") in {"running", "paused"}
+                        else "running"
+                    )
+                    previous_tool = (
+                        previous.get("tool_kind")
+                        if isinstance(previous, Mapping)
+                        and previous.get("tool_kind") in {"spawn", "continuation"}
+                        else (
+                            "continuation"
+                            if dispatch.get("pending_cursor") is not None
+                            else "spawn"
+                        )
+                    )
+                    dispatch["state"] = previous_state
+                    dispatch["tool_kind"] = previous_tool
                     dispatch["tool_use_id"] = None
                     dispatch["claim_expires_at"] = None
                     for member in dispatch.get("members", []):
-                        item = logical.get(member) if isinstance(logical, Mapping) else None
+                        if isinstance(member, str):
+                            migrated_members.add(member)
+                        item = (
+                            logical.get(member)
+                            if isinstance(logical, Mapping) and isinstance(member, str)
+                            else None
+                        )
                         if isinstance(item, dict):
-                            item["state"] = "fenced"
-                            item["result"] = {
-                                "failure_signature": "legacy_interrupting_migrated",
-                                "summary": "legacy interrupting state fenced during upgrade",
-                            }
+                            item["state"] = previous_state
             if isinstance(logical, Mapping):
-                for item in logical.values():
-                    if isinstance(item, dict) and item.get("state") == "interrupting":
+                for member, item in logical.items():
+                    if (
+                        isinstance(item, dict)
+                        and item.get("state") == "interrupting"
+                        and member not in migrated_members
+                    ):
                         item["state"] = "fenced"
                         item["result"] = {
-                            "failure_signature": "legacy_interrupting_migrated",
-                            "summary": "legacy interrupting state fenced during upgrade",
+                            "failure_signature": "legacy_interrupting_orphaned",
+                            "summary": "legacy interrupting member had no owning dispatch",
                         }
 
         session = normalized.get("session_id")
@@ -1104,7 +1210,9 @@ class ControlPlane:
         deadline = time.monotonic() + self.lock_timeout
 
         def remaining() -> float:
-            return max(0.0, deadline - time.monotonic())
+            local = max(0.0, deadline - time.monotonic())
+            operation = remaining_seconds()
+            return local if operation is None else min(local, operation)
 
         with acquire(
             self.root,
@@ -1167,6 +1275,121 @@ class ControlPlane:
                 )
             self._write_state(state)
 
+    def _discard_stale_spawn_wave(self, dispatch_id: str, tool_use_id: str) -> bool:
+        """Discard a baseline that never reached a native child and can be recaptured."""
+
+        with self._coordinated():
+            state = self._read_state()
+            dispatch = self._find_dispatch(state, dispatch_id)
+            if (
+                dispatch.get("state") != "starting"
+                or dispatch.get("tool_kind") != "spawn"
+                or dispatch.get("tool_use_id") != tool_use_id
+            ):
+                return False
+            wave_id = dispatch["wave_id"]
+            wave_records = [
+                item
+                for item in state["dispatches"].values()
+                if item.get("wave_id") == wave_id
+            ]
+            rebuildable = bool(wave_records) and all(
+                item.get("state") == "starting"
+                and item.get("owner") is None
+                and (
+                    item.get("tool_use_id") is None
+                    or item.get("dispatch_id") == dispatch_id
+                )
+                for item in wave_records
+            )
+            if not rebuildable:
+                self._fence_members(state, dispatch, "workspace_baseline_stale")
+                self._settle_wave(state)
+                self._write_state(state)
+                return False
+            plan = self._read_plan(state)
+            for item in wave_records:
+                self._append_tombstone(state, item, "workspace_baseline_recaptured")
+                for member in item["members"]:
+                    logical = state["logical"][member]
+                    logical["dispatch_id"] = None
+                    logical["result"] = None
+                    logical["state"] = "waiting"
+                del state["dispatches"][item["dispatch_id"]]
+            state["active_wave_id"] = None
+            self._refresh_ready(state, plan)
+            self._write_state(state)
+            return True
+
+    def _quarantine_legacy_state(self, path: Path) -> None:
+        """Isolate an unindexable pre-2.0.4 state without blocking unrelated workspaces."""
+
+        quarantine = self.root / "quarantine"
+        quarantine.mkdir(parents=True, exist_ok=True)
+        identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()
+        destination = quarantine / f"legacy-{identity}.json"
+        try:
+            os.replace(path, destination)
+        except FileNotFoundError:
+            return
+        try:
+            os.chmod(destination, 0o600)
+        except OSError:
+            pass
+
+    def _workspace_state_candidates(
+        self,
+        workspace_root: object,
+    ) -> list[tuple[Path, dict[str, Any]]]:
+        """Load only indexed same-workspace state plus quarantinable legacy files."""
+
+        workspace_digest = _workspace_digest(workspace_root)
+        try:
+            indexed = sorted(
+                self.root.glob(f"{workspace_digest}--*.json"),
+                key=lambda item: item.name,
+            )
+            legacy = sorted(
+                (
+                    item
+                    for item in self.root.glob("*.json")
+                    if STATE_FILE_RE.fullmatch(item.name) is None
+                ),
+                key=lambda item: item.name,
+            )
+        except OSError as error:
+            raise ControlPlaneUnavailable(
+                "lifecycle state directory is unavailable"
+            ) from error
+        candidates: list[tuple[Path, dict[str, Any]]] = []
+        for path in indexed:
+            checkpoint()
+            match = STATE_FILE_RE.fullmatch(path.name)
+            if match is None:
+                raise ControlPlaneError("indexed lifecycle filename is invalid")
+            raw_state = _load_object(path, "cco.v9 lifecycle state")
+            state = self._validate_lifecycle_state(raw_state)
+            if (
+                match.group("workspace") != _workspace_digest(state["workspace_root"])
+                or match.group("session") != _session_digest(state["session_id"])
+            ):
+                raise ControlPlaneError("indexed lifecycle filename does not match its state")
+            candidates.append((path, state))
+        for path in legacy:
+            checkpoint()
+            try:
+                raw_state = _load_object(path, "legacy cco.v9 lifecycle state")
+                state = self._validate_lifecycle_state(raw_state)
+                state_workspace_digest = _workspace_digest(state["workspace_root"])
+            except ControlPlaneUnavailable:
+                raise
+            except ControlPlaneError:
+                self._quarantine_legacy_state(path)
+                continue
+            if state_workspace_digest == workspace_digest:
+                candidates.append((path, state))
+        return candidates
+
     def _assert_cross_task_compatible(
         self,
         workspace_root: object,
@@ -1176,26 +1399,9 @@ class ControlPlane:
         current_dispatch: str | None = None,
     ) -> None:
         target = _workspace_key(workspace_root)
-        try:
-            paths = sorted(self.root.glob("*.json"), key=lambda item: item.name)
-        except OSError as error:
-            raise ControlPlaneUnavailable(
-                "lifecycle state directory is unavailable"
-            ) from error
         now = _now_milliseconds()
-        for path in paths:
-            try:
-                raw_state = _load_object(path, "cco.v9 lifecycle state")
-            except ControlPlaneError:
-                if not path.exists():
-                    continue
-                raise
-            try:
-                if _workspace_key(raw_state.get("workspace_root")) != target:
-                    continue
-            except ControlPlaneError:
-                continue
-            state = self._validate_lifecycle_state(raw_state)
+        for _path, state in self._workspace_state_candidates(workspace_root):
+            checkpoint()
             if _workspace_key(state["workspace_root"]) != target:
                 continue
             for dispatch in state["dispatches"].values():
@@ -1233,16 +1439,38 @@ class ControlPlane:
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
 
     def _read_state(self) -> dict[str, Any]:
-        raw_state = _load_object(self.state_path, "cco.v9 lifecycle state")
+        source = self.state_path
+        raw_state = _load_object(source, "cco.v9 lifecycle state")
         state = self._validate_lifecycle_state(
             raw_state,
             expected_session=self.session_id,
         )
-        if state != raw_state:
+        canonical = _lifecycle_state_path(
+            self.root,
+            state["workspace_root"],
+            self.session_id,
+        )
+        if STATE_FILE_RE.fullmatch(source.name) is not None and source != canonical:
+            raise ControlPlaneError("indexed lifecycle filename does not match its state")
+        if source != canonical:
+            if canonical.exists():
+                raise ControlPlaneError("current task has conflicting lifecycle state files")
+            self._state_path = canonical
+            self._write_state(state)
+            try:
+                source.unlink()
+            except FileNotFoundError:
+                pass
+        elif state != raw_state:
             self._write_state(state)
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
+        self._state_path = _lifecycle_state_path(
+            self.root,
+            state["workspace_root"],
+            self.session_id,
+        )
         state["revision"] = int(state.get("revision", 0)) + 1
         _atomic_write(self.state_path, state)
         artifacts = self.root / "artifacts"
@@ -1768,6 +1996,85 @@ class ControlPlane:
         ):
             raise ControlPlaneError("dispatch native route does not match its wave")
 
+    def _verify_native_admission(
+        self,
+        dispatch_id: str,
+        tool_use_id: str,
+        claim: Callable[
+            [dict[str, Any]],
+            tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]],
+        ],
+        *,
+        recapture_stale_spawn: bool,
+    ) -> None:
+        """Run the shared two-phase admission around lock-free workspace verification."""
+
+        with self._coordinated():
+            state = self._read_state()
+            if self._reconcile_expired_claims(state):
+                self._write_state(state)
+            dispatch, wave, allowed = claim(state)
+            workspace_root = Path(dispatch["workspace_root"])
+            self._assert_cross_task_compatible(
+                workspace_root,
+                role=dispatch["role"],
+                scopes=dispatch["scopes"],
+                current_dispatch=dispatch["dispatch_id"],
+            )
+            baseline = deepcopy(wave["baseline"])
+            owner_scopes = deepcopy(dispatch["scopes"])
+            self._begin_native_claim(state, dispatch, tool_use_id)
+            self._write_state(state)
+            claim_revision = state["revision"]
+        try:
+            with deadline_after(_preflight_verification_budget()):
+                verify_workspace(
+                    workspace_root,
+                    baseline,
+                    allowed_scopes=allowed,
+                    owner_scopes=owner_scopes,
+                    pre_spawn=True,
+                )
+        except OperationDeadlineExceeded as error:
+            self._rollback_native_claim(dispatch_id, tool_use_id)
+            raise ControlPlaneUnavailable(str(error)) from error
+        except WorkspaceGuardError as error:
+            if recapture_stale_spawn:
+                recaptured = self._discard_stale_spawn_wave(dispatch_id, tool_use_id)
+                action = (
+                    "call next again"
+                    if recaptured
+                    else "inspect and retry the fenced node"
+                )
+                raise ControlPlaneError(
+                    f"{error}; the stale native admission was settled—{action}"
+                ) from error
+            self._rollback_native_claim(dispatch_id, tool_use_id)
+            raise ControlPlaneError(str(error)) from error
+        try:
+            with self._coordinated():
+                state = self._read_state()
+                if state["revision"] != claim_revision:
+                    raise ControlPlaneError(
+                        "lifecycle changed while verifying the native admission"
+                    )
+                dispatch, _wave, _allowed = claim(state)
+                if dispatch.get("tool_use_id") != tool_use_id:
+                    raise ControlPlaneError("native admission claim is stale")
+                self._assert_cross_task_compatible(
+                    workspace_root,
+                    role=dispatch["role"],
+                    scopes=dispatch["scopes"],
+                    current_dispatch=dispatch["dispatch_id"],
+                )
+                dispatch["claim_expires_at"] = (
+                    _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+                )
+                self._write_state(state)
+        except Exception:
+            self._rollback_native_claim(dispatch_id, tool_use_id)
+            raise
+
     def preflight_spawn(self, payload: Mapping[str, Any]) -> None:
         tool_input = payload.get("tool_input")
         if not isinstance(tool_input, Mapping):
@@ -1810,57 +2117,12 @@ class ControlPlane:
                 )
             return dispatch, wave, sibling_writer_scopes
 
-        with self._coordinated():
-            state = self._read_state()
-            if self._reconcile_expired_claims(state):
-                self._write_state(state)
-            dispatch, wave, allowed = claim(state)
-            workspace_root = Path(dispatch["workspace_root"])
-            self._assert_cross_task_compatible(
-                workspace_root,
-                role=dispatch["role"],
-                scopes=dispatch["scopes"],
-                current_dispatch=dispatch["dispatch_id"],
-            )
-            baseline = deepcopy(wave["baseline"])
-            owner_scopes = deepcopy(dispatch["scopes"])
-            self._begin_native_claim(state, dispatch, tool_use_id)
-            self._write_state(state)
-            claim_revision = state["revision"]
-        try:
-            verify_workspace(
-                workspace_root,
-                baseline,
-                allowed_scopes=allowed,
-                owner_scopes=owner_scopes,
-                pre_spawn=True,
-            )
-        except WorkspaceGuardError as error:
-            self._rollback_native_claim(dispatch_id, tool_use_id)
-            raise ControlPlaneError(str(error)) from error
-        try:
-            with self._coordinated():
-                state = self._read_state()
-                if state["revision"] != claim_revision:
-                    raise ControlPlaneError(
-                        "lifecycle changed while verifying the native admission"
-                    )
-                dispatch, _wave, _allowed = claim(state)
-                if dispatch.get("tool_use_id") != tool_use_id:
-                    raise ControlPlaneError("native admission claim is stale")
-                self._assert_cross_task_compatible(
-                    workspace_root,
-                    role=dispatch["role"],
-                    scopes=dispatch["scopes"],
-                    current_dispatch=dispatch["dispatch_id"],
-                )
-                dispatch["claim_expires_at"] = (
-                    _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
-                )
-                self._write_state(state)
-        except Exception:
-            self._rollback_native_claim(dispatch_id, tool_use_id)
-            raise
+        self._verify_native_admission(
+            dispatch_id,
+            tool_use_id,
+            claim,
+            recapture_stale_spawn=True,
+        )
 
     def preflight_continuation(self, payload: Mapping[str, Any]) -> None:
         tool_input = payload.get("tool_input")
@@ -1905,57 +2167,12 @@ class ControlPlane:
             )
             return dispatch, wave, allowed
 
-        with self._coordinated():
-            state = self._read_state()
-            if self._reconcile_expired_claims(state):
-                self._write_state(state)
-            dispatch, wave, allowed = claim(state)
-            workspace_root = Path(dispatch["workspace_root"])
-            self._assert_cross_task_compatible(
-                workspace_root,
-                role=dispatch["role"],
-                scopes=dispatch["scopes"],
-                current_dispatch=dispatch["dispatch_id"],
-            )
-            baseline = deepcopy(wave["baseline"])
-            owner_scopes = deepcopy(dispatch["scopes"])
-            self._begin_native_claim(state, dispatch, tool_use_id)
-            self._write_state(state)
-            claim_revision = state["revision"]
-        try:
-            verify_workspace(
-                workspace_root,
-                baseline,
-                allowed_scopes=allowed,
-                owner_scopes=owner_scopes,
-                pre_spawn=True,
-            )
-        except WorkspaceGuardError as error:
-            self._rollback_native_claim(body["dispatch_id"], tool_use_id)
-            raise ControlPlaneError(str(error)) from error
-        try:
-            with self._coordinated():
-                state = self._read_state()
-                if state["revision"] != claim_revision:
-                    raise ControlPlaneError(
-                        "lifecycle changed while verifying the native admission"
-                    )
-                dispatch, _wave, _allowed = claim(state)
-                if dispatch.get("tool_use_id") != tool_use_id:
-                    raise ControlPlaneError("native admission claim is stale")
-                self._assert_cross_task_compatible(
-                    workspace_root,
-                    role=dispatch["role"],
-                    scopes=dispatch["scopes"],
-                    current_dispatch=dispatch["dispatch_id"],
-                )
-                dispatch["claim_expires_at"] = (
-                    _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
-                )
-                self._write_state(state)
-        except Exception:
-            self._rollback_native_claim(body["dispatch_id"], tool_use_id)
-            raise
+        self._verify_native_admission(
+            body["dispatch_id"],
+            tool_use_id,
+            claim,
+            recapture_stale_spawn=False,
+        )
 
     def _append_tombstone(self, state: dict[str, Any], dispatch: Mapping[str, Any], reason: str) -> None:
         state["tombstones"].append(
@@ -2080,16 +2297,10 @@ class ControlPlane:
             ] != tool_use_id:
                 raise ControlPlaneError("native tool result call identity is stale")
             response = payload.get("tool_response")
-            failure_kind = _native_failure_kind(response)
-            if failure_kind is not None:
-                if failure_kind == "route_rejected" and not (
-                    dispatch["state"] == "starting"
-                    and dispatch["tool_kind"] == "spawn"
-                ):
-                    failure_kind = "other"
-                self._settle_native_failure_locked(state, dispatch, failure_kind)
-                self._write_state(state)
-                return
+            if _native_response_failed(response):
+                raise ControlPlaneError(
+                    "failure-side PostToolUse is not a settlement event; use native-failure"
+                )
             self._assert_cross_task_compatible(
                 dispatch["workspace_root"],
                 role=dispatch["role"],
@@ -2120,6 +2331,7 @@ class ControlPlane:
             for member in dispatch["members"]:
                 state["logical"][member]["state"] = "running"
             self._write_state(state)
+            return
 
     def prepare_continuation(self, dispatch_id: str, evidence_delta: object) -> dict[str, Any]:
         if not isinstance(evidence_delta, Mapping) or not evidence_delta:
@@ -2679,8 +2891,10 @@ def _stdin_json() -> Any:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Compile and operate one compact cco.v9 plan.")
     sub = root.add_subparsers(dest="command", required=True)
-    plan = sub.add_parser("plan")
-    plan.add_argument("--repo", type=Path, default=Path.cwd())
+    prepare = sub.add_parser("prepare")
+    prepare.add_argument("--repo", type=Path, default=Path.cwd())
+    prepare.add_argument("--capacity", type=int, default=1)
+    prepare.add_argument("--catalog", type=Path)
     next_parser = sub.add_parser("next")
     next_parser.add_argument("--capacity", type=int, required=True)
     next_parser.add_argument("--catalog", type=Path)
@@ -2703,8 +2917,14 @@ def main() -> int:
     args = parser().parse_args()
     try:
         control = ControlPlane(_session_arg())
-        if args.command == "plan":
-            result = control.create_plan(args.repo, _stdin_json())
+        if args.command == "prepare":
+            catalog = _load_object(args.catalog, "native catalogue") if args.catalog else None
+            brief = _prepare_brief(_stdin_json())
+            control.create_plan(args.repo, brief)
+            result = control.next_wave(
+                capacity=args.capacity,
+                native_catalog=catalog,
+            )
         elif args.command == "next":
             catalog = _load_object(args.catalog, "native catalogue") if args.catalog else None
             result = control.next_wave(capacity=args.capacity, native_catalog=catalog)

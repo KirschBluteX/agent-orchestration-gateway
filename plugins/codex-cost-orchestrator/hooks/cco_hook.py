@@ -24,6 +24,7 @@ from control_plane import (  # noqa: E402
     ControlPlaneUnavailable,
 )
 from host_paths import HostPathError, host_path, is_within  # noqa: E402
+from operation_deadline import checkpoint, deadline_after  # noqa: E402
 from rollout_io import RolloutError, first_record, is_rollout_path  # noqa: E402
 from state_lock import StateLockBusy  # noqa: E402
 
@@ -40,7 +41,6 @@ MESSAGE_TOOLS = frozenset(
 INTERRUPT_TOOLS = frozenset(
     {"interrupt_agent", "interruptAgent", "collaborationinterrupt_agent"}
 )
-BYPASS_HEADER = "CCO_NATIVE_BYPASS v1"
 PROTECTED_TOKEN = re.compile(r"gAAAA[A-Za-z0-9_-]{80,}={0,2}")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -50,6 +50,7 @@ MAX_INPUT_BYTES = 4 * 1024 * 1024
 MAX_PROTECTED_DEPTH = 32
 MAX_PROTECTED_NODES = 10_000
 MAX_PROTECTED_BYTES = 1024 * 1024
+PRETOOL_INTERNAL_BUDGET_SECONDS = 24.0
 
 
 def _control(payload: Mapping[str, Any]) -> ControlPlane:
@@ -59,7 +60,7 @@ def _control(payload: Mapping[str, Any]) -> ControlPlane:
     event = payload.get("hook_event_name")
     lock_timeout = {
         "PostToolUse": 3.0,
-        "PreToolUse": 20.0,
+        "PreToolUse": 2.5,
         "SessionStart": 3.0,
         "Stop": 3.0,
         "SubagentStop": 90.0,
@@ -101,6 +102,7 @@ def _protected(value: object) -> bool:
 
     def walk(item: object, depth: int) -> bool:
         nonlocal visited, decoded_bytes
+        checkpoint()
         visited += 1
         if visited > MAX_PROTECTED_NODES or depth > MAX_PROTECTED_DEPTH:
             return True
@@ -136,24 +138,6 @@ def _protected(value: object) -> bool:
         return False
 
     return walk(value, 0)
-
-
-def _bypass(tool_input: Mapping[str, Any]) -> dict[str, Any]:
-    message = tool_input.get("message")
-    if not isinstance(message, str) or not message.startswith(BYPASS_HEADER + "\n"):
-        raise ControlPlaneError("native bypass marker is malformed")
-    stripped = message[len(BYPASS_HEADER) + 1 :]
-    if not stripped:
-        raise ControlPlaneError("native bypass task is empty")
-    updated = dict(tool_input)
-    updated["message"] = stripped
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": updated,
-        }
-    }
 
 
 def _sessions_root() -> Path:
@@ -239,49 +223,58 @@ def evaluate(value: object) -> dict[str, Any]:
                 }
             return {}
         if event == "PreToolUse":
-            tool = value.get("tool_name")
-            tool_input = value.get("tool_input")
-            if tool in SPAWN_TOOLS:
-                if not isinstance(tool_input, Mapping):
-                    raise ControlPlaneError("spawn input is missing")
-                message = tool_input.get("message")
-                if _protected(message):
-                    raise ControlPlaneError(
-                        "opaque collaboration content must remain in its protected host field"
-                    )
-                if isinstance(message, str) and message.startswith(BYPASS_HEADER):
-                    return _bypass(tool_input)
-                if not isinstance(message, str) or not message.startswith(TASK_HEADER + "\n"):
-                    raise ControlPlaneError(
-                        "prepare native child work through cco.v9 or use an explicit user-authorized bypass"
-                    )
-                _control(value).preflight_spawn(value)
+            with deadline_after(PRETOOL_INTERNAL_BUDGET_SECONDS):
+                tool = value.get("tool_name")
+                tool_input = value.get("tool_input")
+                if tool in SPAWN_TOOLS:
+                    if not isinstance(tool_input, Mapping):
+                        raise ControlPlaneError("spawn input is missing")
+                    message = tool_input.get("message")
+                    if _protected(message):
+                        raise ControlPlaneError(
+                            "opaque collaboration content must remain in its protected host field"
+                        )
+                    if not isinstance(message, str) or not message.startswith(
+                        TASK_HEADER + "\n"
+                    ):
+                        raise ControlPlaneError(
+                            "prepare every native child through the current cco.v9 plan"
+                        )
+                    _control(value).preflight_spawn(value)
+                    return {}
+                if tool in MESSAGE_TOOLS:
+                    if not isinstance(tool_input, Mapping):
+                        raise ControlPlaneError("message input is missing")
+                    message = tool_input.get("message")
+                    if _protected(message):
+                        raise ControlPlaneError(
+                            "opaque collaboration content must remain in its protected host field"
+                        )
+                    target = tool_input.get("target")
+                    control = _control(value)
+                    if isinstance(message, str) and message.startswith(
+                        CONTINUE_HEADER + "\n"
+                    ):
+                        if tool not in FOLLOWUP_TOOLS:
+                            raise ControlPlaneError(
+                                "a CCO continuation must use followup_task"
+                            )
+                        control.preflight_continuation(value)
+                    elif isinstance(target, str) and control.owner_is_managed(target):
+                        raise ControlPlaneError(
+                            "raw messages cannot replace a managed CCO continuation"
+                        )
+                    return {}
+                if tool in INTERRUPT_TOOLS:
+                    if not isinstance(tool_input, Mapping) or not isinstance(
+                        tool_input.get("target"), str
+                    ):
+                        raise ControlPlaneError("interrupt target is missing")
+                    control = _control(value)
+                    if control.owner_is_managed(tool_input["target"]):
+                        control.preflight_interrupt(value)
+                    return {}
                 return {}
-            if tool in MESSAGE_TOOLS:
-                if not isinstance(tool_input, Mapping):
-                    raise ControlPlaneError("message input is missing")
-                message = tool_input.get("message")
-                if _protected(message):
-                    raise ControlPlaneError(
-                        "opaque collaboration content must remain in its protected host field"
-                    )
-                target = tool_input.get("target")
-                control = _control(value)
-                if isinstance(message, str) and message.startswith(CONTINUE_HEADER + "\n"):
-                    if tool not in FOLLOWUP_TOOLS:
-                        raise ControlPlaneError("a CCO continuation must use followup_task")
-                    control.preflight_continuation(value)
-                elif isinstance(target, str) and control.owner_is_managed(target):
-                    raise ControlPlaneError("raw messages cannot replace a managed CCO continuation")
-                return {}
-            if tool in INTERRUPT_TOOLS:
-                if not isinstance(tool_input, Mapping) or not isinstance(tool_input.get("target"), str):
-                    raise ControlPlaneError("interrupt target is missing")
-                control = _control(value)
-                if control.owner_is_managed(tool_input["target"]):
-                    control.preflight_interrupt(value)
-                return {}
-            return {}
         if event == "PostToolUse":
             if value.get("tool_name") in INTERRUPT_TOOLS:
                 tool_input = value.get("tool_input")

@@ -26,7 +26,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertRegex(manifest["version"], r"^2\.0\.3\+codex\.[a-z0-9.-]+$")
+        self.assertRegex(manifest["version"], r"^2\.0\.4\+codex\.[a-z0-9.-]+$")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -39,17 +39,18 @@ class ProjectContractTests(unittest.TestCase):
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
         installer = text(PLUGIN / "scripts" / "install_agents.py")
         changelog = text(ROOT / "CHANGELOG.md")
-        self.assertIn('PLUGIN_VERSION = "2.0.3"', installer)
-        self.assertRegex(manifest["version"], r"^2\.0\.3\+")
-        self.assertRegex(changelog, r"(?m)^## 2\.0\.3 - ")
+        self.assertIn('PLUGIN_VERSION = "2.0.4"', installer)
+        self.assertRegex(manifest["version"], r"^2\.0\.4\+")
+        self.assertRegex(changelog, r"(?m)^## 2\.0\.4 - ")
 
     def test_two_thin_skills_use_progressive_disclosure(self) -> None:
         hot = text(ORCHESTRATE / "SKILL.md")
         cold = text(MANAGE / "SKILL.md")
         hot_words = len(re.findall(r"\S+", hot))
         self.assertLessEqual(hot_words, 450)
-        self.assertIn("control_plane.py plan", hot)
-        self.assertIn("one long event wait", hot)
+        self.assertIn("control_plane.py prepare", hot)
+        self.assertNotIn("control_plane.py plan", hot)
+        self.assertIn("one long `wait_agent`", hot)
         self.assertIn("$codex-cost-orchestrator:manage-cco", hot)
         self.assertNotIn("repair_host_edges", hot)
         self.assertNotIn("migration", cold.casefold())
@@ -96,6 +97,7 @@ class ProjectContractTests(unittest.TestCase):
             "prepared_graph",
             "TaskLedger",
             "CCO_DISPATCH_REF",
+            "CCO_NATIVE_BYPASS",
         ):
             self.assertNotIn(old, runtime)
         for forbidden in ("sqlite", "radar", "token ledger", "billing dashboard", "mcp server"):
