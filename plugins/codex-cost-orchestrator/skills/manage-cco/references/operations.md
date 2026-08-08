@@ -25,8 +25,9 @@ python -B scripts/control_plane.py cleanup
 ```
 
 `continue` reads one non-empty JSON evidence delta from stdin. Dispatch its output with
-`followup_task` unchanged. A Desktop restart fences every starting, running, or paused
-native turn; inspect the workspace before `retry`.
+`followup_task` unchanged. `status` identifies paused, fenced, and owner-pending work.
+A Desktop restart fences every starting, running, paused, or interrupting native turn;
+inspect the workspace before `retry`.
 
 `cleanup` is current-task-only and refuses active or paused child work. Run it only
 after host-card maintenance is no longer needed.

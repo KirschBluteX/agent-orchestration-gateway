@@ -1,6 +1,6 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "2.0.0+codex.20260807153227",
+  "version": "2.0.1+codex.20260808191205",
   "description": "Fast role-aware Codex orchestration with thin skills, static native Agent routing, and exact-state acceptance evidence.",
   "author": {
     "name": "KirschQAQ",

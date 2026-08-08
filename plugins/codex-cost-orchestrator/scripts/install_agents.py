@@ -20,11 +20,16 @@ import time
 import tomllib
 from typing import Any, Callable, Mapping
 
-from routing_catalog import RoutingCatalogError, load_native_catalog, resolve_route_plan
+from routing_catalog import (
+    RoutingCatalogError,
+    load_native_catalog,
+    load_route_policy,
+    resolve_route_plan,
+)
 
 
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "2.0.0"
+PLUGIN_VERSION = "2.0.1"
 PROFILES = {
     "read": ("codex-cost-orchestrator-read-leaf.toml", "cost_orchestrator_read_leaf"),
     "write": ("codex-cost-orchestrator-write-leaf.toml", "cost_orchestrator_write_leaf"),
@@ -306,6 +311,7 @@ def doctor(
     workspace: Path,
     native_loader: Callable[[], dict[str, object]] | None = None,
     hook_loader: Callable[[Path], dict[str, object]] | None = None,
+    policy_loader: Callable[[Path], dict[str, object]] | None = None,
 ) -> int:
     errors: list[str] = []
     if sys.version_info < (3, 11):
@@ -350,6 +356,7 @@ def doctor(
         errors.append(f"CCO Hook trust could not be verified: {error}")
     try:
         catalog = (native_loader or load_native_catalog)()
+        policy = (policy_loader or load_route_policy)(workspace)["policy"]
         plan = resolve_route_plan(
             [
                 {
@@ -360,6 +367,7 @@ def doctor(
                 }
             ],
             catalog,
+            policy=policy,
         )
         selected = plan["routes"][0]["candidates"][0]
         print(f"ROUTE READY: {selected['model']}/{selected['effort']}")

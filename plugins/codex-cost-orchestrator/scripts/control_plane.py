@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
@@ -12,7 +13,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 import unicodedata
 
 from protocol_hash import (
@@ -25,6 +26,7 @@ from protocol_hash import (
     repository_scopes_overlap,
     require_repository_path,
 )
+from host_paths import HostPathError, host_path
 from routing_catalog import (
     RoutingCatalogError,
     load_native_catalog,
@@ -54,11 +56,22 @@ WRITE_ROLE = "cost_orchestrator_write_leaf"
 ROLES = frozenset({"explorer", "worker", "reviewer"})
 ASSURANCES = frozenset({"mechanical", "bounded", "guarded"})
 LOGICAL_STATES = frozenset(
-    {"waiting", "ready", "starting", "running", "paused", "retired", "fenced"}
+    {
+        "waiting",
+        "ready",
+        "starting",
+        "running",
+        "paused",
+        "interrupting",
+        "retired",
+        "fenced",
+    }
 )
 DISPATCH_STATES = frozenset(
-    {"starting", "running", "paused", "retired", "fenced", "rejected"}
+    {"starting", "running", "paused", "interrupting", "retired", "fenced", "rejected"}
 )
+WRITER_LEASE_STATES = frozenset({"starting", "running", "paused", "interrupting"})
+ACTIVE_STATES = frozenset({"starting", "running", "paused", "interrupting"})
 NODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 ACCEPTANCE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -68,6 +81,7 @@ FAILURE_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_AGGREGATE_MEMBERS = 4
 MAX_TOMBSTONES = 256
+MAX_TRANSIENT_RETRIES = 3
 EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 
 
@@ -96,6 +110,21 @@ def _state_root() -> Path:
         else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "v9"
     )
     return Path(os.path.abspath(root))
+
+
+def _workspace_key(value: object) -> str:
+    if not isinstance(value, (str, os.PathLike)):
+        raise ControlPlaneError("lifecycle workspace root is invalid")
+    try:
+        ordinary = host_path(os.fspath(value))
+    except (HostPathError, OSError, TypeError) as error:
+        raise ControlPlaneError("lifecycle workspace root is invalid") from error
+    return os.path.normcase(os.path.realpath(os.path.abspath(ordinary)))
+
+
+def _workspace_lock_identity(value: object) -> str:
+    digest = hashlib.sha256(_workspace_key(value).encode("utf-8")).hexdigest()
+    return f"workspace-{digest}"
 
 
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -241,6 +270,10 @@ def _normalize_brief(
         acceptance_id = _text(raw_id, "acceptance ID", limit=32)
         if ACCEPTANCE_RE.fullmatch(acceptance_id) is None:
             raise ControlPlaneError(f"invalid acceptance ID: {acceptance_id}")
+        if acceptance_id in acceptance:
+            raise ControlPlaneError(
+                f"acceptance IDs collide after normalization: {acceptance_id}"
+            )
         acceptance[acceptance_id] = _text(
             raw_criterion,
             f"acceptance {acceptance_id}",
@@ -536,11 +569,20 @@ def _model_label(model: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")[-16:] or "model"
 
 
-def _task_name(unit: Mapping[str, Any], route: Mapping[str, str], generation: int) -> str:
+def _task_name(
+    unit: Mapping[str, Any],
+    route: Mapping[str, str],
+    generation: int,
+    dispatch_id: str,
+) -> str:
     role = unit["role"]
     prefix = {"explorer": "explorer", "worker": "worker", "reviewer": "reviewer"}[role]
     base = re.sub(r"[^a-z0-9_]+", "_", str(unit["id"]).casefold()).strip("_")[:32]
-    return f"{prefix}_{base}_{_model_label(route['model'])}_{route['effort']}_g{generation:02d}"
+    suffix = dispatch_id.removeprefix("sha256:")[:10]
+    return (
+        f"{prefix}_{base}_{suffix}_{_model_label(route['model'])}_"
+        f"{route['effort']}_g{generation:02d}"
+    )
 
 
 def _render_task(
@@ -559,8 +601,11 @@ def _render_task(
         members.append(
             {
                 "acceptance": node["acceptance"],
+                "depends_on": node["depends_on"],
                 "id": member_id,
                 "objective": node["objective"],
+                "review_of": node["review_of"],
+                "scopes": node["scopes"],
             }
         )
         for acceptance_id in node["acceptance"]:
@@ -692,10 +737,18 @@ def parse_result(value: object) -> dict[str, Any]:
     evidence_value = result["evidence"]
     if not isinstance(evidence_value, Mapping):
         raise ControlPlaneError("cco.v9 evidence must be an object")
-    evidence = {
-        _text(key, "result evidence ID", limit=32): _text(value, "result evidence", limit=8_192)
-        for key, value in evidence_value.items()
-    }
+    evidence: dict[str, str] = {}
+    for raw_id, raw_evidence in evidence_value.items():
+        evidence_id = _text(raw_id, "result evidence ID", limit=32)
+        if evidence_id in evidence:
+            raise ControlPlaneError(
+                f"result evidence IDs collide after normalization: {evidence_id}"
+            )
+        evidence[evidence_id] = _text(
+            raw_evidence,
+            "result evidence",
+            limit=8_192,
+        )
     failure = result["failure_signature"]
     if failure is not None:
         failure = _text(failure, "result failure signature", limit=256)
@@ -732,6 +785,28 @@ def _native_rejected(value: object) -> bool:
     return False
 
 
+def _native_failed(value: object) -> bool:
+    if isinstance(value, Mapping):
+        if (
+            value.get("isError") is True
+            or value.get("is_error") is True
+            or value.get("success") is False
+            or value.get("ok") is False
+            or str(value.get("status", "")).casefold() in {"error", "failed", "failure"}
+        ):
+            return True
+        error = value.get("error")
+        if error is not None and error is not False and error != "":
+            return True
+        return any(_native_failed(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_native_failed(item) for item in value)
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        return lowered.startswith(("error:", "failed:", "failure:"))
+    return False
+
+
 def _task_paths(value: object, *, key: str = "") -> set[str]:
     found: set[str] = set()
     if isinstance(value, str):
@@ -748,6 +823,15 @@ def _task_paths(value: object, *, key: str = "") -> set[str]:
     return found
 
 
+def _owner_matches_task(owner: object, task_name: object) -> bool:
+    return (
+        isinstance(owner, str)
+        and isinstance(task_name, str)
+        and TASK_PATH_RE.fullmatch(owner) is not None
+        and owner.endswith("/" + task_name)
+    )
+
+
 def _sibling_writer_scopes(
     state: Mapping[str, Any],
     dispatch: Mapping[str, Any],
@@ -758,7 +842,7 @@ def _sibling_writer_scopes(
         if item["wave_id"] == dispatch["wave_id"]
         and item["role"] == "worker"
         and item["dispatch_id"] != dispatch["dispatch_id"]
-        and item["state"] in {"starting", "running", "paused", "retired"}
+        and item["state"] in {"starting", "running", "paused", "interrupting", "retired"}
         for scope in item["scopes"]
     ]
 
@@ -773,18 +857,98 @@ class ControlPlane:
         self.root = Path(os.path.abspath((root or _state_root()).expanduser()))
         self.state_path = self.root / f"{session_id}.json"
 
+    @staticmethod
+    def _validate_lifecycle_state(
+        state: Mapping[str, Any],
+        *,
+        expected_session: str | None = None,
+    ) -> dict[str, Any]:
+        session = state.get("session_id")
+        if state.get("protocol") != LIFECYCLE_PROTOCOL:
+            raise ControlPlaneError("lifecycle state is not cco.v9; start a new Codex task")
+        if not isinstance(session, str) or SESSION_RE.fullmatch(session) is None:
+            raise ControlPlaneError("lifecycle state session is invalid")
+        if expected_session is not None and session != expected_session:
+            raise ControlPlaneError("lifecycle state session does not match")
+        if not isinstance(state.get("workspace_root"), str):
+            raise ControlPlaneError("lifecycle workspace root is invalid")
+        dispatches = state.get("dispatches")
+        if not isinstance(dispatches, Mapping):
+            raise ControlPlaneError("lifecycle dispatch collection is invalid")
+        for dispatch_id, dispatch in dispatches.items():
+            if (
+                not isinstance(dispatch_id, str)
+                or SHA256_RE.fullmatch(dispatch_id) is None
+                or not isinstance(dispatch, Mapping)
+                or dispatch.get("dispatch_id") != dispatch_id
+                or dispatch.get("state") not in DISPATCH_STATES
+                or dispatch.get("role") not in ROLES
+            ):
+                raise ControlPlaneError("lifecycle dispatch record is invalid")
+        return dict(state)
+
+    def _workspace_hint(self) -> str:
+        state = self._validate_lifecycle_state(
+            _load_object(self.state_path, "cco.v9 lifecycle state"),
+            expected_session=self.session_id,
+        )
+        return str(state["workspace_root"])
+
+    @contextmanager
+    def _coordinated(self, workspace_root: object | None = None) -> Iterator[None]:
+        """Serialize lease-affecting state changes for one canonical workspace."""
+
+        workspace = self._workspace_hint() if workspace_root is None else workspace_root
+        with acquire(self.root, _workspace_lock_identity(workspace)):
+            with acquire(self.root, self.session_id):
+                yield
+
+    def _assert_writer_available(
+        self,
+        workspace_root: object,
+        *,
+        current_dispatch: str | None = None,
+    ) -> None:
+        target = _workspace_key(workspace_root)
+        try:
+            paths = sorted(self.root.glob("*.json"), key=lambda item: item.name)
+        except OSError as error:
+            raise ControlPlaneError("lifecycle state directory is unavailable") from error
+        for path in paths:
+            try:
+                state = self._validate_lifecycle_state(
+                    _load_object(path, "cco.v9 lifecycle state")
+                )
+            except ControlPlaneError:
+                if not path.exists():
+                    continue
+                raise
+            if _workspace_key(state["workspace_root"]) != target:
+                continue
+            for dispatch in state["dispatches"].values():
+                if (
+                    dispatch.get("role") == "worker"
+                    and dispatch.get("state") in WRITER_LEASE_STATES
+                    and not (
+                        state["session_id"] == self.session_id
+                        and dispatch.get("dispatch_id") == current_dispatch
+                    )
+                ):
+                    raise ControlPlaneError(
+                        "workspace writer lease is already held by "
+                        f"{state['session_id']}:{dispatch['dispatch_id']}"
+                    )
+
     def _artifact_path(self, kind: str, identity: str) -> Path:
         if kind not in {"plan", "wave"} or SHA256_RE.fullmatch(identity) is None:
             raise ControlPlaneError("artifact identity is invalid")
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
 
     def _read_state(self) -> dict[str, Any]:
-        state = _load_object(self.state_path, "cco.v9 lifecycle state")
-        if state.get("protocol") != LIFECYCLE_PROTOCOL:
-            raise ControlPlaneError("lifecycle state is not cco.v9; start a new Codex task")
-        if state.get("session_id") != self.session_id:
-            raise ControlPlaneError("lifecycle state session does not match")
-        return state
+        return self._validate_lifecycle_state(
+            _load_object(self.state_path, "cco.v9 lifecycle state"),
+            expected_session=self.session_id,
+        )
 
     def _write_state(self, state: dict[str, Any]) -> None:
         state["revision"] = int(state.get("revision", 0)) + 1
@@ -870,13 +1034,10 @@ class ControlPlane:
         plan_path = self._artifact_path("plan", plan_id)
         with acquire(self.root, self.session_id):
             if self.state_path.exists():
-                current = self._read_state()
-                active = any(
-                    item["state"] in {"starting", "running", "paused"}
-                    for item in current.get("dispatches", {}).values()
+                self._read_state()
+                raise ControlPlaneError(
+                    "the current task already has CCO lifecycle proof; run explicit cleanup first"
                 )
-                if active:
-                    raise ControlPlaneError("the current task already has active CCO work")
             _write_immutable(plan_path, plan)
             logical = {
                 item["id"]: {
@@ -912,7 +1073,22 @@ class ControlPlane:
         }
 
     @staticmethod
-    def _refresh_ready(state: dict[str, Any], plan: Mapping[str, Any]) -> None:
+    def _logical_satisfied(
+        state: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        node_id: str,
+    ) -> bool:
+        logical = state["logical"][node_id]
+        if logical["state"] != "retired":
+            return False
+        node = _node_map(plan)[node_id]
+        return (
+            node["role"] != "reviewer"
+            or (logical.get("result") or {}).get("outcome") == "accept"
+        )
+
+    @classmethod
+    def _refresh_ready(cls, state: dict[str, Any], plan: Mapping[str, Any]) -> None:
         nodes = _node_map(plan)
         changed = True
         while changed:
@@ -920,8 +1096,10 @@ class ControlPlane:
             for node_id, logical in state["logical"].items():
                 if logical["state"] != "waiting":
                     continue
-                dependencies = [state["logical"][item]["state"] for item in nodes[node_id]["depends_on"]]
-                if all(item == "retired" for item in dependencies):
+                if all(
+                    cls._logical_satisfied(state, plan, dependency)
+                    for dependency in nodes[node_id]["depends_on"]
+                ):
                     logical["state"] = "ready"
                     changed = True
 
@@ -929,7 +1107,7 @@ class ControlPlane:
     def _overall_state(state: Mapping[str, Any], plan: Mapping[str, Any]) -> str:
         logical = state["logical"]
         states = [item["state"] for item in logical.values()]
-        if any(item in {"starting", "running", "paused"} for item in states):
+        if any(item in ACTIVE_STATES for item in states):
             return "active"
         if any(item in {"fenced", "waiting"} for item in states):
             return "blocked"
@@ -1007,7 +1185,7 @@ class ControlPlane:
             "wave_id": wave_id,
         }
         dispatch_id = _digest(b"cco.dispatch.v1\0", identity)
-        task_name = _task_name(unit, route, generation)
+        task_name = _task_name(unit, route, generation, dispatch_id)
         message = _render_task(
             plan,
             unit,
@@ -1032,6 +1210,7 @@ class ControlPlane:
             "native": native,
             "owner": None,
             "pending_cursor": None,
+            "transient_retries": 0,
             "role": unit["role"],
             "route_candidates": deepcopy(unit["route"]["candidates"]),
             "route_cursor": route_cursor,
@@ -1064,7 +1243,7 @@ class ControlPlane:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ControlPlaneError("native capacity must be a positive integer")
         catalog = load_native_catalog() if native_catalog is None else native_catalog
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             plan = self._read_plan(state)
             if state["active_wave_id"] is not None:
@@ -1081,7 +1260,7 @@ class ControlPlane:
                     item
                     for item in state["dispatches"].values()
                     if item["wave_id"] == state["active_wave_id"]
-                    and item["state"] in {"starting", "running", "paused"}
+                    and item["state"] in ACTIVE_STATES
                 ]
                 if active:
                     return self._public_batch(state, [])
@@ -1130,6 +1309,8 @@ class ControlPlane:
                 downstream=downstream,
             )
             selected = _select_units(units, capacity)
+            if any(unit["role"] == "worker" for unit in selected):
+                self._assert_writer_available(plan["workspace_root"])
             wave_scopes = {
                 (scope["kind"], scope["path"]): dict(scope)
                 for unit in selected
@@ -1274,10 +1455,15 @@ class ControlPlane:
                 )
             return dispatch, wave, sibling_writer_scopes
 
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             dispatch, wave, allowed = claim(state)
             workspace_root = Path(dispatch["workspace_root"])
+            if dispatch["role"] == "worker":
+                self._assert_writer_available(
+                    workspace_root,
+                    current_dispatch=dispatch["dispatch_id"],
+                )
             baseline = deepcopy(wave["baseline"])
             owner_scopes = deepcopy(dispatch["scopes"])
         try:
@@ -1290,7 +1476,7 @@ class ControlPlane:
             )
         except WorkspaceGuardError as error:
             raise ControlPlaneError(str(error)) from error
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             dispatch, _wave, _allowed = claim(state)
             dispatch["tool_use_id"] = tool_use_id
@@ -1332,10 +1518,15 @@ class ControlPlane:
             )
             return dispatch, wave, allowed
 
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             dispatch, wave, allowed = claim(state)
             workspace_root = Path(dispatch["workspace_root"])
+            if dispatch["role"] == "worker":
+                self._assert_writer_available(
+                    workspace_root,
+                    current_dispatch=dispatch["dispatch_id"],
+                )
             baseline = deepcopy(wave["baseline"])
             owner_scopes = deepcopy(dispatch["scopes"])
         try:
@@ -1348,7 +1539,7 @@ class ControlPlane:
             )
         except WorkspaceGuardError as error:
             raise ControlPlaneError(str(error)) from error
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             dispatch, _wave, _allowed = claim(state)
             dispatch["tool_use_id"] = tool_use_id
@@ -1424,7 +1615,7 @@ class ControlPlane:
         tool_use_id = payload.get("tool_use_id")
         if not isinstance(tool_use_id, str):
             raise ControlPlaneError("native tool result has no call identity")
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             matches = [item for item in state["dispatches"].values() if item.get("tool_use_id") == tool_use_id]
             if len(matches) != 1:
@@ -1456,12 +1647,19 @@ class ControlPlane:
                 return
             if dispatch["tool_kind"] == "spawn":
                 owners = _task_paths(response)
-                if len(owners) != 1:
-                    self._fence_members(state, dispatch, "native_owner_unresolved")
+                if len(owners) > 1:
+                    self._fence_members(state, dispatch, "native_owner_ambiguous")
                     self._settle_wave(state)
                     self._write_state(state)
                     return
-                dispatch["owner"] = owners.pop()
+                if owners:
+                    owner = owners.pop()
+                    if not _owner_matches_task(owner, dispatch["task_name"]):
+                        self._fence_members(state, dispatch, "native_owner_mismatch")
+                        self._settle_wave(state)
+                        self._write_state(state)
+                        return
+                    dispatch["owner"] = owner
             elif dispatch["pending_cursor"] is not None:
                 dispatch["cursor"] = dispatch["pending_cursor"]
                 dispatch["pending_cursor"] = None
@@ -1474,11 +1672,16 @@ class ControlPlane:
     def prepare_continuation(self, dispatch_id: str, evidence_delta: object) -> dict[str, Any]:
         if not isinstance(evidence_delta, Mapping) or not evidence_delta:
             raise ControlPlaneError("continuation requires a non-empty evidence object")
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             dispatch = self._find_dispatch(state, dispatch_id)
             if dispatch["state"] != "paused" or not isinstance(dispatch.get("owner"), str):
                 raise ControlPlaneError("dispatch is not continuable")
+            if dispatch["role"] == "worker":
+                self._assert_writer_available(
+                    dispatch["workspace_root"],
+                    current_dispatch=dispatch["dispatch_id"],
+                )
             cursor = dispatch["cursor"] + 1
             try:
                 message = _render_continue(dispatch, evidence_delta, cursor)
@@ -1506,18 +1709,69 @@ class ControlPlane:
             state = self._read_state()
             return any(item.get("owner") == owner for item in state["dispatches"].values())
 
-    def interrupt_owner(self, owner: str) -> None:
-        with acquire(self.root, self.session_id):
+    def preflight_interrupt(self, payload: Mapping[str, Any]) -> None:
+        tool_input = payload.get("tool_input")
+        tool_use_id = payload.get("tool_use_id")
+        if (
+            not isinstance(tool_input, Mapping)
+            or not isinstance(tool_input.get("target"), str)
+            or not isinstance(tool_use_id, str)
+            or not tool_use_id
+        ):
+            raise ControlPlaneError("interrupt input is incomplete")
+        owner = tool_input["target"]
+        with self._coordinated():
             state = self._read_state()
             matches = [
                 item
                 for item in state["dispatches"].values()
-                if item.get("owner") == owner and item["state"] in {"running", "paused", "starting"}
+                if item.get("owner") == owner and item["state"] in {"running", "paused"}
             ]
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt target has no unique active dispatch")
-            self._fence_members(state, matches[0], "interrupted")
-            self._settle_wave(state)
+            dispatch = matches[0]
+            dispatch["interrupt_previous"] = {
+                "state": dispatch["state"],
+                "tool_kind": dispatch["tool_kind"],
+            }
+            dispatch["state"] = "interrupting"
+            dispatch["tool_kind"] = "interrupt"
+            dispatch["tool_use_id"] = tool_use_id
+            for member in dispatch["members"]:
+                state["logical"][member]["state"] = "interrupting"
+            self._write_state(state)
+
+    def postflight_interrupt(self, payload: Mapping[str, Any]) -> None:
+        tool_use_id = payload.get("tool_use_id")
+        if not isinstance(tool_use_id, str):
+            raise ControlPlaneError("interrupt result has no call identity")
+        with self._coordinated():
+            state = self._read_state()
+            matches = [
+                item
+                for item in state["dispatches"].values()
+                if item.get("tool_use_id") == tool_use_id
+                and item.get("tool_kind") == "interrupt"
+                and item.get("state") == "interrupting"
+            ]
+            if len(matches) != 1:
+                raise ControlPlaneError("interrupt result has no unique pending dispatch")
+            dispatch = matches[0]
+            previous = dispatch.pop("interrupt_previous", None)
+            if not isinstance(previous, Mapping) or previous.get("state") not in {
+                "running",
+                "paused",
+            }:
+                raise ControlPlaneError("interrupt previous state is invalid")
+            dispatch["tool_use_id"] = None
+            if _native_failed(payload.get("tool_response")):
+                dispatch["state"] = previous["state"]
+                dispatch["tool_kind"] = previous.get("tool_kind", "spawn")
+                for member in dispatch["members"]:
+                    state["logical"][member]["state"] = previous["state"]
+            else:
+                self._fence_members(state, dispatch, "interrupted")
+                self._settle_wave(state)
             self._write_state(state)
 
     def record_result(self, owner: str, raw_result: object) -> dict[str, Any]:
@@ -1533,7 +1787,13 @@ class ControlPlane:
             list[dict[str, str]],
         ]:
             dispatch = self._find_dispatch(state, result["dispatch_id"])
-            if dispatch.get("owner") != owner or dispatch["state"] != "running":
+            if dispatch["state"] != "running":
+                raise ControlPlaneError("result owner is stale or fenced")
+            if dispatch.get("owner") is None:
+                if not _owner_matches_task(owner, dispatch.get("task_name")):
+                    raise ControlPlaneError("result owner does not match the prepared task")
+                dispatch["owner"] = owner
+            elif dispatch.get("owner") != owner:
                 raise ControlPlaneError("result owner is stale or fenced")
             if result["cursor"] != dispatch["cursor"]:
                 raise ControlPlaneError("result cursor is stale")
@@ -1575,9 +1835,14 @@ class ControlPlane:
             )
             return dispatch, plan, nodes, wave, allowed
 
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
+            owner_was_pending = self._find_dispatch(
+                state, result["dispatch_id"]
+            ).get("owner") is None
             dispatch, _plan, _nodes, wave, allowed = claim(state)
+            if owner_was_pending:
+                self._write_state(state)
             workspace_root = Path(dispatch["workspace_root"])
             baseline = deepcopy(wave["baseline"])
             owner_scopes = deepcopy(dispatch["scopes"])
@@ -1599,7 +1864,7 @@ class ControlPlane:
         if role != "worker" and actual:
             raise ControlPlaneError("read-only child changed its declared scope")
 
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             dispatch, plan, nodes, _wave, _allowed = claim(state)
             dispatch["result"] = result
@@ -1647,15 +1912,67 @@ class ControlPlane:
                 "verification": verification,
             }
 
-    def fence_invalid_result(self, owner: str, reason: str = "invalid_result") -> None:
-        with acquire(self.root, self.session_id):
+    def register_transient_failure(self, owner: str, signature: str) -> int | None:
+        """Keep one native owner live for at most three strong transient failures."""
+
+        if signature not in {
+            "native_network_failure",
+            "native_rate_limit",
+            "native_service_unavailable",
+            "native_timeout",
+        }:
+            raise ControlPlaneError("transient failure signature is invalid")
+        with self._coordinated():
             state = self._read_state()
             matches = [
                 item
                 for item in state["dispatches"].values()
-                if item.get("owner") == owner and item["state"] in {"running", "paused", "starting"}
+                if item["state"] == "running"
+                and (
+                    item.get("owner") == owner
+                    or (
+                        item.get("owner") is None
+                        and _owner_matches_task(owner, item.get("task_name"))
+                    )
+                )
+            ]
+            if len(matches) != 1:
+                raise ControlPlaneError("transient failure owner has no active dispatch")
+            dispatch = matches[0]
+            if dispatch.get("owner") is None:
+                dispatch["owner"] = owner
+            attempts = dispatch.get("transient_retries", 0)
+            if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+                raise ControlPlaneError("transient retry counter is invalid")
+            if attempts >= MAX_TRANSIENT_RETRIES:
+                self._fence_members(state, dispatch, "transient_retry_exhausted")
+                self._settle_wave(state)
+                self._write_state(state)
+                return None
+            attempts += 1
+            dispatch["transient_retries"] = attempts
+            dispatch["last_transient_failure"] = signature
+            self._write_state(state)
+            return attempts
+
+    def fence_invalid_result(self, owner: str, reason: str = "invalid_result") -> None:
+        with self._coordinated():
+            state = self._read_state()
+            matches = [
+                item
+                for item in state["dispatches"].values()
+                if item["state"] in ACTIVE_STATES
+                and (
+                    item.get("owner") == owner
+                    or (
+                        item.get("owner") is None
+                        and _owner_matches_task(owner, item.get("task_name"))
+                    )
+                )
             ]
             if len(matches) == 1:
+                if matches[0].get("owner") is None:
+                    matches[0]["owner"] = owner
                 self._fence_members(state, matches[0], reason)
                 self._settle_wave(state)
                 self._write_state(state)
@@ -1663,11 +1980,11 @@ class ControlPlane:
     def restart(self) -> int:
         if not self.state_path.exists():
             return 0
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             count = 0
             for dispatch in state["dispatches"].values():
-                if dispatch["state"] in {"starting", "running", "paused"}:
+                if dispatch["state"] in ACTIVE_STATES:
                     self._fence_members(state, dispatch, "host_restart")
                     count += 1
             self._settle_wave(state)
@@ -1676,7 +1993,7 @@ class ControlPlane:
             return count
 
     def abandon(self, node_id: str) -> None:
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             logical = state["logical"].get(node_id)
             if not isinstance(logical, dict) or logical["state"] != "paused":
@@ -1687,7 +2004,7 @@ class ControlPlane:
             self._write_state(state)
 
     def retry(self, node_id: str) -> None:
-        with acquire(self.root, self.session_id):
+        with self._coordinated():
             state = self._read_state()
             plan = self._read_plan(state)
             logical = state["logical"].get(node_id)
@@ -1698,8 +2015,14 @@ class ControlPlane:
             logical["dispatch_id"] = None
             logical["result"] = None
             nodes = _node_map(plan)
-            dependencies = [state["logical"][item]["state"] for item in nodes[node_id]["depends_on"]]
-            logical["state"] = "ready" if all(item == "retired" for item in dependencies) else "waiting"
+            logical["state"] = (
+                "ready"
+                if all(
+                    self._logical_satisfied(state, plan, dependency)
+                    for dependency in nodes[node_id]["depends_on"]
+                )
+                else "waiting"
+            )
             self._write_state(state)
 
     def status(self) -> dict[str, Any]:
@@ -1709,7 +2032,37 @@ class ControlPlane:
             counts = {name: 0 for name in sorted(LOGICAL_STATES)}
             for item in state["logical"].values():
                 counts[item["state"]] += 1
+            attention = []
+            for node_id, logical in sorted(state["logical"].items()):
+                if logical["state"] not in {"paused", "fenced"}:
+                    continue
+                dispatch_id = logical.get("dispatch_id")
+                dispatch = state["dispatches"].get(dispatch_id, {})
+                attention.append(
+                    {
+                        "dispatch_id": dispatch_id,
+                        "nodes": [node_id],
+                        "owner": dispatch.get("owner"),
+                        "state": logical["state"],
+                    }
+                )
+            for dispatch in sorted(
+                state["dispatches"].values(),
+                key=lambda item: item["dispatch_id"],
+            ):
+                if dispatch["state"] == "running" and dispatch.get("owner") is None:
+                    attention.append(
+                        {
+                            "dispatch_id": dispatch["dispatch_id"],
+                            "nodes": list(dispatch["members"]),
+                            "owner": None,
+                            "reason": "awaiting_native_owner",
+                            "state": "running",
+                            "task_name": dispatch["task_name"],
+                        }
+                    )
             return {
+                "attention": attention,
                 "counts": counts,
                 "epoch": state["epoch"],
                 "plan_id": state["plan_id"],
@@ -1721,11 +2074,16 @@ class ControlPlane:
         """Remove only this task's inactive v9 state and immutable artifacts."""
 
         removed = 0
-        with acquire(self.root, self.session_id):
+        coordination = (
+            self._coordinated()
+            if self.state_path.exists()
+            else acquire(self.root, self.session_id)
+        )
+        with coordination:
             if self.state_path.exists():
                 state = self._read_state()
                 if any(
-                    item["state"] in {"starting", "running", "paused"}
+                    item["state"] in ACTIVE_STATES
                     for item in state["dispatches"].values()
                 ):
                     raise ControlPlaneError(
@@ -1772,15 +2130,15 @@ class ControlPlane:
         with acquire(self.root, self.session_id):
             state = self._read_state()
             if any(
-                item["state"] in {"starting", "running"}
+                item["state"] in {"starting", "running", "interrupting"}
                 for item in state["dispatches"].values()
             ):
                 return "CCO child work is still active; wait for its native terminal event."
             return None
 
 
-def _session_arg(value: str | None) -> str:
-    session = value or os.environ.get("CODEX_THREAD_ID")
+def _session_arg() -> str:
+    session = os.environ.get("CODEX_THREAD_ID")
     if not session:
         raise ControlPlaneError("CODEX_THREAD_ID is unavailable")
     return session
@@ -1806,7 +2164,6 @@ def _stdin_json() -> Any:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Compile and operate one compact cco.v9 plan.")
-    root.add_argument("--session")
     sub = root.add_subparsers(dest="command", required=True)
     plan = sub.add_parser("plan")
     plan.add_argument("--repo", type=Path, default=Path.cwd())
@@ -1828,7 +2185,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
-        control = ControlPlane(_session_arg(args.session))
+        control = ControlPlane(_session_arg())
         if args.command == "plan":
             result = control.create_plan(args.repo, _stdin_json())
         elif args.command == "next":

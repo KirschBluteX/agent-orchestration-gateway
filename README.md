@@ -19,12 +19,15 @@ routing service, record billing data, or require an MCP server.
 - Never selects Sol automatically; a current explicit user pin can select any native
   supported model and reasoning effort.
 - Maximizes non-conflicting work up to the host's observed Agent capacity.
-- Allows one writable child per workspace while parallelizing compatible read work.
+- Allows one writable child across all Codex tasks sharing a canonical workspace while
+  parallelizing compatible read work.
 - Aggregates compatible mechanical microtasks when ready work exceeds native capacity.
 - Binds every wave to one fresh Git or bounded non-Git workspace state.
 - Waits for native terminal events instead of polling progress.
-- Preserves paused writer leases, fences interrupted or restarted work, and rejects
-  stale results.
+- Preserves paused and interrupting writer leases; reviewer rejection blocks downstream
+  work; confirmed interruption and restart fence stale results.
+- Retries the same native owner at most three times for strongly identified 429,
+  network, timeout, or temporary service failures.
 
 ```mermaid
 flowchart LR
@@ -108,6 +111,11 @@ Primary closes objectives, scopes, dependencies, and acceptance IDs once. CCO th
 handles readiness, route selection, baseline capture, dispatch identity, continuation,
 and result mapping. Returned child names include role, logical node, model, effort, and
 generation so the live Agent list remains readable.
+
+One Codex task owns one plan until explicit inactive cleanup. `status` reports compact
+counts plus actionable paused, fenced, or owner-pending dispatch identities. A spawn
+response that omits the owner remains pending until trusted SubagentStop rollout evidence
+binds it; missing response metadata alone is not treated as worker failure.
 
 Use `$codex-cost-orchestrator:manage-cco` for installation, doctor, configuration,
 paused work, restart recovery, retry, abandonment, or cleanup. Normal tasks do not load

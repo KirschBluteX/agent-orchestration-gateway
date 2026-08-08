@@ -16,11 +16,12 @@ CCO 只使用 Codex 自身的 Agent runtime，不运行第二套协调器，不�
 - 确定性的机械任务优先 Luna；需要有限判断、保护或审查的任务优先 Terra。
 - 不会自动选择 Sol；用户可在当前任务中明确指定任意原生支持的模型与思考强度。
 - 在宿主真实 Agent 容量内选择最大无冲突 ready set。
-- 同一工作区只允许一个可写子 Agent，同时并行执行兼容的只读任务。
+- 所有 Codex 任务共享同一规范工作区时，只允许一个可写子 Agent；兼容的只读任务仍可并行。
 - ready 数量超过容量时，可安全聚合相容的机械微任务。
 - 每个波次都绑定新的 Git 或有界非 Git 工作区状态。
 - 依靠原生终止事件唤醒 Primary，不轮询进度。
-- 暂停的 worker 保留写 lease；中断、重启和迟到结果会被 fencing。
+- 暂停和正在中断的 worker 都保留写 lease；reviewer 未接受时不会放行下游；只有确认成功的中断、重启和迟到结果才会被 fencing。
+- 对明确识别的 429、网络、超时或临时服务错误，同一个原生 Agent 最多自动重试三次。
 
 ```mermaid
 flowchart LR
@@ -101,6 +102,10 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 Primary 只需一次性闭合目标、范围、依赖和验收 ID。之后的 ready 计算、路由、
 baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地完成。子 Agent
 名称会显示职责、逻辑节点、模型、思考强度与 generation，便于实时查看。
+
+一个 Codex 任务在显式清理非活动状态前只拥有一份 plan。`status` 除紧凑计数外，
+还会直接列出暂停、fenced 或等待 owner 绑定的 dispatch。spawn 即时返回缺少 owner
+不会再被当成 worker 失败；SubagentStop 会用受信 rollout 证据完成迟绑定。
 
 安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
 `$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。

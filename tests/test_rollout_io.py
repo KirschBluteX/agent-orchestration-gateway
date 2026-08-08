@@ -50,6 +50,17 @@ class RolloutIoTests(unittest.TestCase):
             self.assertEqual(records[-1], {"tail": True})
             self.assertLess(len(records), 10)
 
+    def test_plain_tail_keeps_first_record_when_window_starts_at_its_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            terminal = b'{"tail":true}\n'
+            path.write_bytes(b'{"history":true}\n' + terminal)
+
+            self.assertEqual(
+                list(iter_tail_records(path, max_bytes=len(terminal))),
+                [{"tail": True}],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

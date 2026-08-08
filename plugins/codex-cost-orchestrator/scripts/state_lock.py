@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One re-entrant cross-process lock for each cco.v9 lifecycle state."""
+"""Small re-entrant cross-process locks for cco.v9 state coordination."""
 
 from __future__ import annotations
 
@@ -22,10 +22,10 @@ _LOCAL_LOCKS: dict[str, threading.RLock] = {}
 _HELD: dict[str, tuple[int, int]] = {}
 
 
-def lock_path(root: Path, session_id: str) -> Path:
-    """Return the one lock path shared by a task's lifecycle operations."""
+def lock_path(root: Path, identity: str) -> Path:
+    """Return the lock path for one validated coordination identity."""
 
-    return Path(root) / f".{session_id}.cco-state.lock"
+    return Path(root) / f".{identity}.cco-state.lock"
 
 
 def _key(path: Path) -> str:
@@ -95,15 +95,15 @@ def _open_lock(path: Path) -> int:
 @contextmanager
 def acquire(
     root: Path,
-    session_id: str,
+    identity: str,
     *,
     timeout: float = _DEFAULT_WAIT_SECONDS,
 ) -> Iterator[None]:
-    """Acquire one re-entrant OS lock for a session state directory."""
+    """Acquire one re-entrant OS lock for a lifecycle or workspace identity."""
 
     if timeout < 0:
         raise ValueError("state lock timeout must be non-negative")
-    path = lock_path(root, session_id)
+    path = lock_path(root, identity)
     key = _key(path)
     local = _local_lock(key)
     if not local.acquire(timeout=timeout):
@@ -145,11 +145,11 @@ def acquire(
         local.release()
 
 
-def is_locked(root: Path, session_id: str) -> bool:
-    """Return whether another process currently owns the session lock."""
+def is_locked(root: Path, identity: str) -> bool:
+    """Return whether another process currently owns the named lock."""
 
     try:
-        with acquire(root, session_id, timeout=0):
+        with acquire(root, identity, timeout=0):
             return False
     except StateLockBusy:
         return True

@@ -17,6 +17,7 @@ if str(SCRIPTS) not in sys.path:
 
 from control_plane import (  # noqa: E402
     CONTINUE_HEADER,
+    RESULT_HEADER,
     TASK_HEADER,
     TASK_PATH_RE,
     ControlPlane,
@@ -48,6 +49,27 @@ MAX_INPUT_BYTES = 4 * 1024 * 1024
 MAX_PROTECTED_DEPTH = 32
 MAX_PROTECTED_NODES = 10_000
 MAX_PROTECTED_BYTES = 1024 * 1024
+
+
+def _transient_signature(value: object) -> str | None:
+    if not isinstance(value, str) or value.startswith(RESULT_HEADER + "\n"):
+        return None
+    lowered = value.casefold()
+    if re.search(r"(?:\b429\b|too many requests|rate[ _-]?limit)", lowered):
+        return "native_rate_limit"
+    if re.search(
+        r"(?:\b(?:502|503|504)\b|service unavailable|temporarily unavailable|overloaded)",
+        lowered,
+    ):
+        return "native_service_unavailable"
+    if re.search(r"(?:timed? out|timeout)", lowered):
+        return "native_timeout"
+    if re.search(
+        r"(?:network error|connection (?:reset|refused|aborted|closed)|dns failure)",
+        lowered,
+    ):
+        return "native_network_failure"
+    return None
 
 
 def _control(payload: Mapping[str, Any]) -> ControlPlane:
@@ -255,10 +277,17 @@ def evaluate(value: object) -> dict[str, Any]:
                     raise ControlPlaneError("interrupt target is missing")
                 control = _control(value)
                 if control.owner_is_managed(tool_input["target"]):
-                    control.interrupt_owner(tool_input["target"])
+                    control.preflight_interrupt(value)
                 return {}
             return {}
         if event == "PostToolUse":
+            if value.get("tool_name") in INTERRUPT_TOOLS:
+                tool_input = value.get("tool_input")
+                target = tool_input.get("target") if isinstance(tool_input, Mapping) else None
+                control = _control(value)
+                if isinstance(target, str) and control.owner_is_managed(target):
+                    control.postflight_interrupt(value)
+                return {}
             tool_input = value.get("tool_input")
             message = tool_input.get("message") if isinstance(tool_input, Mapping) else None
             if isinstance(message, str) and message.startswith(
@@ -282,8 +311,38 @@ def evaluate(value: object) -> dict[str, Any]:
                         "CCO could not map the native child result; Primary must inspect the actual state."
                     )
                 }
+            message = value.get("last_assistant_message")
+            transient = _transient_signature(message)
+            if transient is not None:
+                try:
+                    attempt = control.register_transient_failure(owner, transient)
+                except Exception:
+                    control.fence_invalid_result(owner)
+                    return {
+                        "continue": False,
+                        "systemMessage": (
+                            "CCO could not bind the transient failure to one active owner; "
+                            "Primary must inspect the actual state."
+                        ),
+                    }
+                if attempt is not None:
+                    return {
+                        "decision": "block",
+                        "reason": (
+                            f"Transient native failure; retrying the same CCO owner "
+                            f"({attempt}/3). Continue from the last safe point under "
+                            "the original contract; do not restart or widen scope."
+                        ),
+                    }
+                return {
+                    "continue": False,
+                    "systemMessage": (
+                        "CCO fenced the child after three transient retries; "
+                        "Primary must inspect the actual state."
+                    ),
+                }
             try:
-                control.record_result(owner, value.get("last_assistant_message"))
+                control.record_result(owner, message)
             except Exception:
                 control.fence_invalid_result(owner)
                 return {

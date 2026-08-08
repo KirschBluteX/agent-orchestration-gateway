@@ -311,6 +311,66 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(usage["families"]["terra"]["input_tokens"], 50)
         self.assertEqual(usage["families"]["luna"]["input_tokens"], 20)
 
+    def test_usage_reads_zstd_rollout_through_hardened_reader(self) -> None:
+        try:
+            from compression import zstd
+        except ImportError:
+            try:
+                import zstandard
+            except ImportError:
+                self.skipTest("zstandard support is unavailable")
+            raw_compress = zstandard.ZstdCompressor().compress
+        else:
+            raw_compress = zstd.compress
+
+        usage = {
+            "input_tokens": 20,
+            "cached_input_tokens": 5,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 4,
+            "reasoning_output_tokens": 2,
+            "total_tokens": 24,
+        }
+        records = [
+            {
+                "type": "turn_context",
+                "payload": {"effort": "max", "model": "gpt-5.6-luna"},
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": usage,
+                        "total_token_usage": usage,
+                    },
+                },
+            },
+        ]
+        raw = ("\n".join(json.dumps(item) for item in records) + "\n").encode()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "luna.jsonl.zst"
+            path.write_bytes(raw_compress(raw))
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.cco_benchmark",
+                    "usage",
+                    "--rollout",
+                    str(path),
+                ],
+                cwd=REPO,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertEqual(report["families"]["luna"]["input_tokens"], 20)
+        self.assertEqual(report["families"]["luna"]["cache_read_input_tokens"], 5)
+
     def test_validate_requires_sol_max_as_primary_for_every_arm(self) -> None:
         manifest = self._manifest()
         arms = manifest["arms"]

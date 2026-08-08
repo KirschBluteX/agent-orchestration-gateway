@@ -35,12 +35,13 @@ temporary-directory protections.
 
 CCO ships five synchronous definitions with exact matchers. There is no global
 `PreToolUse: .*` Hook. PreToolUse validates only native spawn, continuation, message,
-and interrupt tools; PostToolUse records only spawn and continuation outcomes.
+and interrupt tools; PostToolUse settles spawn, continuation, and interrupt outcomes.
 SessionStart fences work at host `resume` or `clear` recovery boundaries, never during
 context compaction. Stop is an exceptional fallback for a Primary attempting to end
 while a native child turn is active. SubagentStop binds the native owner, cco.v9 result,
-cursor, wave, scopes, and workspace state, then prevents another Hook from continuing a
-terminal child.
+cursor, wave, scopes, and workspace state. It may continue the same owner at most three
+times for strongly identified transient native failures; terminal work and exhausted or
+non-retryable failures do not continue.
 
 Review and trust Hook hashes in `/hooks` after every update. Doctor never changes trust.
 
@@ -56,8 +57,9 @@ entries, reparses, and submodule control state. Non-Git workspaces bind the exac
 reject reparses and special files, enforce entry/byte budgets before hashing, and never
 run `git init`.
 
-Only one physical worker is admitted per workspace wave. A paused worker keeps the
-lease. Compatible read leaves may run beside a non-overlapping writer; their results
+Only one physical worker is admitted across all Codex tasks sharing a canonical
+workspace. Starting, running, paused, and interrupting workers keep the lease.
+Compatible read leaves may run beside a non-overlapping writer; their results
 permit only the known sibling writer scope and must show no read-scope delta.
 
 ## Host maintenance

@@ -2,6 +2,31 @@
 
 The project follows semantic versioning.
 
+## 2.0.1 - 2026-08-08
+
+- Enforced one active writer across different Codex tasks for the same canonical
+  workspace, including ordinary and Windows extended path aliases, with a shared OS
+  coordination lock and validated lifecycle-state scan; no second lease registry was
+  added.
+- Made reviewer acceptance an actual dependency gate, so a terminal rejection cannot
+  release downstream implementation or deployment work.
+- Added two-phase interrupt settlement. Writers remain leased while the native call is
+  pending, native failure restores the prior state, and only confirmed success fences.
+- Added bounded same-owner recovery for strong 429, network, timeout, and temporary
+  service failures. SubagentStop uses the current native blocking-continuation
+  contract, retries at most three times, and fences exhaustion.
+- Allowed UUID/rollout evidence to bind a native owner at SubagentStop when the spawn
+  response did not expose a canonical task path, avoiding false
+  `native_owner_unresolved` failures.
+- Removed cross-task `--session` control, added dispatch-derived task-name suffixes,
+  preserved per-member aggregate scopes/dependencies/review sources, and required
+  explicit cleanup before replacing lifecycle proof.
+- Made Doctor validate the workspace-effective route policy, rejected normalized
+  acceptance/evidence ID collisions, fixed exact-boundary rollout tails, and reused
+  the hardened JSONL/JSONL.ZST reader in benchmark usage collection.
+- Removed the unreferenced runtime-inspector surface and made compact status output
+  identify paused, fenced, and owner-pending work directly.
+
 ## 2.0.0 - 2026-08-07
 
 - Replaced caller-authored graph/lifecycle details with a compact plan brief and a

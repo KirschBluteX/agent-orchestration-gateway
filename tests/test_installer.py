@@ -130,6 +130,26 @@ class InstallerTests(unittest.TestCase):
                 ),
                 1,
             )
+            self.assertEqual(
+                doctor(
+                    target,
+                    workspace=ROOT,
+                    native_loader=native_catalog,
+                    hook_loader=lambda _workspace: hook_inventory(),
+                    policy_loader=lambda _workspace: {
+                        "policy": {
+                            "worker": {
+                                "mechanical": {
+                                    "candidates": [
+                                        {"effort": "max", "model": "gpt-unsupported"}
+                                    ]
+                                }
+                            }
+                        }
+                    },
+                ),
+                1,
+            )
 
 
 if __name__ == "__main__":

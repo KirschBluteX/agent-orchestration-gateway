@@ -38,13 +38,15 @@ Unsupported routes remain fenced; never silently inherit Primary's model.
 After dispatch, call `wait_agent` once for one long event wait. Do not poll, duplicate a
 child, perform overlapping Primary work, or forward protected collaboration payloads.
 Wake for a native terminal event, blocking input, or user input. A paused worker keeps
-the sole write lease until explicit continuation or abandonment.
+the sole cross-task workspace lease until explicit continuation or abandonment.
+Strong 429/network/timeout/service failures retry the same owner at most three times.
 
 Treat every child result as a claim. Hooks bind it to the dispatch, cursor, exact wave
 baseline, scopes, logical acceptance IDs, and native owner. Call `next` after a wave
 settles; Primary never supplies completed nodes. Primary inspects the actual delta and
 owns final acceptance. Use an independent reviewer only for semantic/manual evidence,
 risk, deviation, Primary-owned implementation, or an explicit user request.
+Only reviewer `accept` evidence satisfies a downstream review dependency.
 
 Use `$codex-cost-orchestrator:manage-cco` only for installation, doctor, policy,
 status, continuation, retry, restart recovery, or cleanup.

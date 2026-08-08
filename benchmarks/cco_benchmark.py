@@ -21,6 +21,14 @@ import tempfile
 from typing import Any, Mapping
 
 
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from rollout_io import RolloutError, first_record, is_rollout_path, iter_records  # noqa: E402
+
+
 MANIFEST_PROTOCOL = "cco.benchmark-manifest.v1"
 PLAN_PROTOCOL = "cco.benchmark-plan.v1"
 USAGE_PROTOCOL = "cco.benchmark-usage.v1"
@@ -657,21 +665,8 @@ def collect_usage(paths: list[Path]) -> dict[str, Any]:
         current_effort: str | None = None
         previous_total: dict[str, int] | None = None
         try:
-            stream = path.open("r", encoding="utf-8")
-        except OSError as error:
-            raise BenchmarkError(f"rollout is not readable: {path.name}") from error
-        with stream:
-            for number, line in enumerate(stream, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line, object_pairs_hook=_unique_object)
-                except (json.JSONDecodeError, BenchmarkError) as error:
-                    raise BenchmarkError(
-                        f"rollout {path.name} has invalid JSON at line {number}"
-                    ) from error
-                if not isinstance(record, Mapping):
-                    continue
+            records = iter_records(path)
+            for record in records:
                 payload = record.get("payload")
                 if record.get("type") == "turn_context" and isinstance(payload, Mapping):
                     model = payload.get("model")
@@ -719,6 +714,8 @@ def collect_usage(paths: list[Path]) -> dict[str, Any]:
                     unexpected_models.add(current_model)
                 else:
                     _add_usage(families[family], delta)
+        except RolloutError as error:
+            raise BenchmarkError(f"rollout is not readable: {path.name}: {error}") from error
 
     return {
         "families": families,
@@ -759,18 +756,9 @@ def _plain_file_inside(path: Path, *, root: Path, label: str) -> Path:
 
 def _first_session_meta(path: Path) -> Mapping[str, Any]:
     try:
-        with path.open("rb") as stream:
-            line = stream.readline(64 * 1024 + 1)
-    except OSError as error:
-        raise BenchmarkError(f"rollout metadata is unavailable: {path.name}") from error
-    if not line or len(line) > 64 * 1024:
-        raise BenchmarkError(f"rollout metadata is missing or oversized: {path.name}")
-    try:
-        value = json.loads(line.decode("utf-8"), object_pairs_hook=_unique_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, BenchmarkError) as error:
+        value = first_record(path)
+    except RolloutError as error:
         raise BenchmarkError(f"rollout metadata is invalid: {path.name}") from error
-    if not isinstance(value, Mapping):
-        raise BenchmarkError(f"rollout metadata is invalid: {path.name}")
     return value
 
 
@@ -860,6 +848,8 @@ def discover_rollouts(codex_home: Path, root_thread_id: str) -> list[Path]:
         rollout = _plain_file_inside(
             Path(rollout_value), root=sessions, label=f"thread {thread_id} rollout"
         )
+        if not is_rollout_path(rollout):
+            raise BenchmarkError(f"thread {thread_id} rollout has an unsupported suffix")
         first = _first_session_meta(rollout)
         payload = first.get("payload")
         if (

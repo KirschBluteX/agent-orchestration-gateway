@@ -127,11 +127,15 @@ def iter_tail_records(
                 stream.seek(0, 2)
                 size = stream.tell()
                 start = max(0, size - max_bytes)
+                previous = b""
+                if start:
+                    stream.seek(start - 1)
+                    previous = stream.read(1)
                 stream.seek(start)
                 data = stream.read(size - start)
         except OSError as error:
             raise RolloutError("rollout is unavailable") from error
-        if start:
+        if start and previous != b"\n":
             boundary = data.find(b"\n")
             if boundary < 0:
                 raise RolloutError("rollout terminal tail is incomplete")

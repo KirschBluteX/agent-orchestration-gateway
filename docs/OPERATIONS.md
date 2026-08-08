@@ -21,7 +21,7 @@ Open `/hooks`, review and trust these five definitions:
 
 1. SessionStart
 2. exact PreToolUse for native spawn, continuation, message, and interrupt tools
-3. exact PostToolUse for spawn and continuation
+3. exact PostToolUse for spawn, continuation, and interrupt settlement
 4. Stop fallback
 5. SubagentStop for the two CCO leaf profiles
 
@@ -36,7 +36,7 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 ```
 
 Doctor is read-only. It verifies Python, exact profiles, manifest identity, Hook
-discovery/trust, and at least one native static route.
+discovery/trust, and at least one route under the workspace-effective static policy.
 
 ## Normal control-plane flow
 
@@ -50,6 +50,8 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py next --capacity <N>
 
 `plan` reads one brief from stdin. External scopes use `file` or `tree`. The only
 required node fields are `id`, `role`, `objective`, `acceptance`, and `scopes`.
+An existing lifecycle state must be explicitly cleaned before another plan can be
+created in the same Codex task.
 
 ```json
 {
@@ -93,14 +95,24 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
   `followup_task` input. Dispatch it unchanged.
 - `abandon` fences paused work and releases its write lease.
 - `retry` creates a guarded newer generation for a fenced logical node.
-- `restart` fences starting, running, and paused native turns. Inspect the workspace
-  before retrying.
+- `restart` fences starting, running, paused, and interrupting native turns. Inspect the
+  workspace before retrying.
 - `cleanup` deletes only the current task's inactive state and artifacts. It refuses
   active or paused child work; retain state until host-card maintenance is unnecessary.
+- `status` includes compact counts and direct identities for paused, fenced, and
+  owner-pending dispatches.
 
 State transitions are `waiting → ready → starting → running → retired`, with
-`running → paused → starting` for continuation and `starting/running/paused → fenced`
-for interruption. A paused writer keeps the sole workspace write lease.
+`running → paused → starting` for continuation and
+`running/paused → interrupting → fenced` for confirmed interruption. Native interrupt
+failure restores the prior state. Paused and interrupting writers keep the sole
+canonical-workspace lease across every Codex task. A reviewer dependency is satisfied
+only by `outcome=accept`.
+
+SubagentStop may continue the same native owner up to three times only for strongly
+identified 429, network, timeout, or temporary service failures. All other invalid
+results fence immediately. A successful spawn response without a canonical owner stays
+running as owner-pending; trusted UUID/rollout evidence may bind it when the result stops.
 
 Wave artifacts contain the fresh baseline and are deleted as soon as every physical
 dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,
