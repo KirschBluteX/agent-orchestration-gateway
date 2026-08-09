@@ -385,6 +385,31 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(post, {})
         self.assertEqual(interrupt, {})
 
+    def test_ambiguous_session_state_blocks_raw_managed_message(self) -> None:
+        class Control:
+            @staticmethod
+            def owner_is_managed(_owner: str) -> bool:
+                raise cco_hook.ControlPlaneError(
+                    "current task has lifecycle state in multiple workspaces"
+                )
+
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            outcome = cco_hook.evaluate(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "ambiguous-session",
+                    "tool_input": {
+                        "message": "raw override",
+                        "target": "/root/worker_n01",
+                    },
+                    "tool_name": "send_message",
+                    "tool_use_id": "raw-message",
+                }
+            )
+
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("multiple workspaces", outcome["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

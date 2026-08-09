@@ -1316,6 +1316,38 @@ class ControlPlane:
             raise ControlPlaneError("current task has multiple lifecycle state files")
         if len(recovery) > 1:
             raise ControlPlaneError("current task has multiple lifecycle recovery files")
+        legacy_matches = [path for path in matches if path.name == legacy.name]
+        if recovery and (indexed or legacy_matches):
+            recovery_state = self._validate_lifecycle_state(
+                _load_object(recovery[0], "cco.v9 recovery lifecycle state"),
+                expected_session=self.session_id,
+            )
+            recovery_canonical = _lifecycle_state_path(
+                self.root,
+                recovery_state["workspace_root"],
+                self.session_id,
+            )
+            for candidate in indexed + legacy_matches:
+                candidate_state = self._validate_lifecycle_state(
+                    _load_object(candidate, "cco.v9 lifecycle state"),
+                    expected_session=self.session_id,
+                )
+                candidate_canonical = _lifecycle_state_path(
+                    self.root,
+                    candidate_state["workspace_root"],
+                    self.session_id,
+                )
+                if (
+                    candidate_canonical != recovery_canonical
+                    or candidate_state["lineage_id"] != recovery_state["lineage_id"]
+                    or (
+                        STATE_FILE_RE.fullmatch(candidate.name) is not None
+                        and candidate != candidate_canonical
+                    )
+                ):
+                    raise ControlPlaneError(
+                        "current task has lifecycle state in multiple workspaces or plans"
+                    )
         self._state_path = (
             recovery[0]
             if recovery
@@ -1499,6 +1531,7 @@ class ControlPlane:
         """Serialize lease-affecting state changes for one canonical workspace."""
 
         workspace = self._workspace_hint() if workspace_root is None else workspace_root
+        workspace_key = _workspace_key(workspace)
         deadline = time.monotonic() + self.lock_timeout
 
         def remaining() -> float:
@@ -1512,6 +1545,15 @@ class ControlPlane:
             timeout=remaining(),
         ):
             with acquire(self.root, self.session_id, timeout=remaining()):
+                # Resolve again only after both locks are held. A newly visible
+                # recovery may fail closed, but it cannot switch this operation to
+                # another workspace after admission locking was chosen.
+                self._state_path = None
+                locked_workspace = self._workspace_hint()
+                if _workspace_key(locked_workspace) != workspace_key:
+                    raise ControlPlaneError(
+                        "lifecycle workspace changed during coordination"
+                    )
                 yield
 
     @staticmethod
@@ -1624,7 +1666,10 @@ class ControlPlane:
             self._write_state(state)
             return True
 
-    def _quarantine_legacy_state(self, path: Path) -> list[dict[str, Any]]:
+    def _quarantine_legacy_state(
+        self,
+        path: Path,
+    ) -> list[tuple[Path, dict[str, Any]]]:
         """Atomically isolate invalid legacy state inside a marked CCO root."""
 
         if not self._state_root_is_marked():
@@ -1682,11 +1727,7 @@ class ControlPlane:
             staged_state = None
 
         if staged_state is not None:
-            _replayed_path, replayed = self._replay_recovery_state(
-                staging,
-                staged_state,
-            )
-            recovered = [replayed]
+            recovered = [(staging, staged_state)]
             if path.exists():
                 try:
                     replacement = self._validate_lifecycle_state(
@@ -1697,8 +1738,8 @@ class ControlPlane:
                 except ControlPlaneError:
                     pass
                 else:
-                    if replacement not in recovered:
-                        recovered.append(replacement)
+                    if not any(replacement == item[1] for item in recovered):
+                        recovered.append((path, replacement))
             return recovered
 
         name_identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
@@ -1717,7 +1758,7 @@ class ControlPlane:
             staging.unlink(missing_ok=True)
         except OSError as error:
             raise ControlPlaneUnavailable("legacy quarantine finalization failed") from error
-        recovered: list[dict[str, Any]] = []
+        recovered: list[tuple[Path, dict[str, Any]]] = []
         if path.exists():
             try:
                 replacement = self._validate_lifecycle_state(
@@ -1728,8 +1769,8 @@ class ControlPlane:
             except ControlPlaneError:
                 pass
             else:
-                if replacement not in recovered:
-                    recovered.append(replacement)
+                if not any(replacement == item[1] for item in recovered):
+                    recovered.append((path, replacement))
         return recovered
 
     def _replay_recovery_state(
@@ -1898,15 +1939,17 @@ class ControlPlane:
                 raise
             except ControlPlaneError:
                 recovered = self._quarantine_legacy_state(path)
-                for state in recovered:
+                for recovered_path, state in recovered:
                     if _workspace_digest(state["workspace_root"]) == workspace_digest:
-                        candidates.append((path, state))
+                        if RECOVERY_FILE_RE.fullmatch(recovered_path.name) is not None:
+                            recovered_path, state = self._replay_recovery_state(
+                                recovered_path,
+                                state,
+                            )
+                        candidates.append((recovered_path, state))
                 continue
             if state_workspace_digest == workspace_digest:
-                if (
-                    RECOVERY_FILE_RE.fullmatch(path.name) is not None
-                    and self._state_root_is_marked()
-                ):
+                if RECOVERY_FILE_RE.fullmatch(path.name) is not None:
                     path, state = self._replay_recovery_state(path, state)
                 candidates.append((path, state))
         return candidates
@@ -1960,29 +2003,6 @@ class ControlPlane:
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
 
     def _read_state(self) -> dict[str, Any]:
-        # A failed recovery finalization can leave both the cached canonical path
-        # and a later recovery path. Refresh only at the authoritative read point
-        # so an existing ControlPlane cannot advance past an unseen recovery.
-        if (
-            self._state_path is not None
-            and self._state_path.exists()
-            and STATE_FILE_RE.fullmatch(self._state_path.name) is not None
-        ):
-            with acquire(
-                self.root,
-                STATE_ROOT_CAPACITY_LOCK,
-                timeout=_bounded_lock_timeout(self.lock_timeout),
-            ):
-                matches = _session_state_paths(self.root, self.session_id)
-            recoveries = [
-                path for path in matches if RECOVERY_FILE_RE.fullmatch(path.name)
-            ]
-            if len(recoveries) > 1:
-                raise ControlPlaneError(
-                    "current task has multiple lifecycle recovery files"
-                )
-            if recoveries:
-                self._state_path = recoveries[0]
         source = self.state_path
         raw_state = _load_object(source, "cco.v9 lifecycle state")
         state = self._validate_lifecycle_state(
@@ -1995,10 +2015,7 @@ class ControlPlane:
             state["workspace_root"],
             self.session_id,
         )
-        if (
-            RECOVERY_FILE_RE.fullmatch(source.name) is not None
-            and self._state_root_is_marked()
-        ):
+        if RECOVERY_FILE_RE.fullmatch(source.name) is not None:
             source, state = self._replay_recovery_state(source, state)
             self._state_path = source
             raw_state = deepcopy(state)

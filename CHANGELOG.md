@@ -2,6 +2,16 @@
 
 The project follows semantic versioning.
 
+## 4.0.3 - 2026-08-09
+
+- Fail closed when one Codex session has indexed and recovery state from different
+  workspaces or plan lineages, and revalidate that identity after coordination locks.
+- Defer repair-during-quarantine replay until the recovered state matches the workspace
+  whose lock is already held, avoiding cross-workspace nested lock acquisition.
+- Replay valid recovery state independently of the quarantine ownership sentinel, so a
+  full unmarked root keeps the recovery in its existing capacity slot.
+- Bind the release identity test to the current changelog version.
+
 ## 4.0.2 - 2026-08-09
 
 - Recover context inheritance for active v1 continuations from their immutable wave,

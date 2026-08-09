@@ -1538,6 +1538,133 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertTrue(recovery.exists())
         self.assertFalse(canonical.exists())
 
+    def test_same_session_foreign_recovery_cannot_replace_cached_workspace(self) -> None:
+        session = "same-session-cross-workspace"
+        active = self.control(session)
+        active.create_plan(
+            self.repo,
+            self.brief([self.node("writer_a", "A01", "a.txt")]),
+        )
+        native = active.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(active, native)
+        canonical_a = active.state_path
+        self.assertTrue(active.owner_is_managed(owner))
+
+        other_repo = self.root / "same-session-other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        foreign_root = self.root / "foreign-state-root"
+        foreign = ControlPlane(session, root=foreign_root)
+        foreign.create_plan(
+            other_repo,
+            self.brief([self.node("writer_b", "A02", "other.txt")]),
+        )
+        foreign_native = foreign.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(foreign, foreign_native)
+        recovery = self.state_root / ".cco-recovery-other-workspace-same-session.json"
+        recovery.write_bytes(foreign.state_path.read_bytes())
+        canonical_b = control_plane_module._lifecycle_state_path(
+            self.state_root,
+            other_repo,
+            session,
+        )
+
+        with self.assertRaisesRegex(ControlPlaneError, "multiple workspaces"):
+            active.owner_is_managed(owner)
+
+        self.assertTrue(canonical_a.exists())
+        self.assertTrue(recovery.exists())
+        self.assertFalse(canonical_b.exists())
+
+        legacy_a = self.state_root / f"{session}.json"
+        os.replace(canonical_a, legacy_a)
+        with self.assertRaisesRegex(ControlPlaneError, "multiple workspaces"):
+            self.control(session).stop_reason()
+        self.assertTrue(legacy_a.exists())
+        self.assertTrue(recovery.exists())
+        self.assertFalse(canonical_b.exists())
+
+    def test_repaired_foreign_legacy_state_is_not_replayed_under_current_lock(self) -> None:
+        other_repo = self.root / "quarantine-other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        foreign = ControlPlane("foreign-quarantine", root=self.root / "foreign-quarantine")
+        foreign.create_plan(
+            other_repo,
+            self.brief([self.node("writer", "A01", "other.txt")]),
+        )
+        repaired = foreign.state_path.read_bytes()
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
+        legacy = self.state_root / "repair-to-foreign-workspace.json"
+        legacy.write_text('{"broken":', encoding="utf-8")
+        control = self.control("quarantine-current-workspace")
+        original_replace = os.replace
+
+        def repair_then_replace(source: object, destination: object) -> None:
+            if Path(source) == legacy:
+                legacy.write_bytes(repaired)
+            original_replace(source, destination)
+
+        with (
+            patch.object(
+                control_plane_module.os,
+                "replace",
+                side_effect=repair_then_replace,
+            ),
+            patch.object(
+                control,
+                "_replay_recovery_state",
+                side_effect=AssertionError("foreign recovery replayed under current lock"),
+            ),
+        ):
+            candidates = control._workspace_state_candidates(self.repo)
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+
+    def test_unmarked_full_root_keeps_valid_recovery_in_its_existing_slot(self) -> None:
+        other_repo = self.root / "unmarked-recovery-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        session = "unmarked-recovery"
+        source_root = self.root / "unmarked-source"
+        source = ControlPlane(session, root=source_root)
+        source.create_plan(
+            other_repo,
+            self.brief([self.node("reader", "A01", "other.txt", role="explorer")]),
+        )
+        unmarked_root = self.root / "unmarked-full-root"
+        unmarked_root.mkdir()
+        (unmarked_root / "occupied.json").write_text("{}", encoding="utf-8")
+        recovery = unmarked_root / ".cco-recovery-valid.json"
+        recovery.write_bytes(source.state_path.read_bytes())
+        canonical = control_plane_module._lifecycle_state_path(
+            unmarked_root,
+            other_repo,
+            session,
+        )
+        recovered = ControlPlane(session, root=unmarked_root)
+
+        with patch.object(control_plane_module, "MAX_STATE_FILES", 1):
+            self.assertEqual(recovered.status()["state"], "ready")
+
+        self.assertTrue(recovery.exists())
+        self.assertFalse(canonical.exists())
+        self.assertFalse((unmarked_root / ".cco-state-root-v1").exists())
+
     def test_recovery_replay_serializes_with_its_own_workspace_writer(self) -> None:
         owner = self.control("recovery-race-owner")
         owner.create_plan(

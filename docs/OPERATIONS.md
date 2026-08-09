@@ -156,7 +156,9 @@ deleted. Valid recovery state remains lease-visible and is replayed to its canon
 under that recovery's own workspace lock. An existing canonical state is replaced or
 finalized only when exact content or a hash-proven direct parent transition establishes
 its lineage; invalid state moves to content-addressed quarantine only after the durable
-object is available.
+object is available. Recovery state from another workspace or plan can never replace the
+current session's canonical state; the operation preserves both and fails closed. The
+ownership sentinel authorizes invalid-file quarantine only, not valid recovery replay.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
