@@ -638,16 +638,15 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         contender = self.control("legacy-race-contender")
         contender.create_plan(self.repo, brief)
-        original_glob = Path.glob
+        original_snapshot = control_plane_module._state_json_paths
         migrated = False
         inside_migration = False
 
-        def racing_glob(path: Path, pattern: str):  # type: ignore[no-untyped-def]
+        def racing_snapshot(path: Path) -> list[Path]:
             nonlocal inside_migration, migrated
-            snapshot = list(original_glob(path, pattern))
+            snapshot = original_snapshot(path)
             if (
                 path == self.state_root
-                and pattern == "*.json"
                 and not migrated
                 and not inside_migration
             ):
@@ -657,10 +656,14 @@ class V9ControlPlaneTests(unittest.TestCase):
                     self.assertTrue(legacy.owner_is_managed(owner))
                 finally:
                     inside_migration = False
-            return iter(snapshot)
+            return snapshot
 
         with (
-            patch.object(Path, "glob", new=racing_glob),
+            patch.object(
+                control_plane_module,
+                "_state_json_paths",
+                side_effect=racing_snapshot,
+            ),
             self.assertRaises(ControlPlaneUnavailable),
         ):
             contender.next_wave(
@@ -771,6 +774,37 @@ class V9ControlPlaneTests(unittest.TestCase):
         ):
             control._mark_state_root_if_safe()
 
+    def test_state_root_budget_blocks_preflight_before_a_native_claim(self) -> None:
+        control = self.control("bounded-state-root")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        (self.state_root / "unrelated.json").write_text("{}", encoding="utf-8")
+
+        with (
+            patch.object(
+                control_plane_module,
+                "MAX_STATE_FILES",
+                1,
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "file limit"),
+        ):
+            control.preflight_spawn(
+                {
+                    "tool_input": native,
+                    "tool_use_id": "bounded-state-call",
+                }
+            )
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = next(iter(state["dispatches"].values()))
+        self.assertIsNone(dispatch["tool_use_id"])
+
     def test_quarantine_never_overwrites_an_earlier_payload(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
         (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
@@ -791,36 +825,54 @@ class V9ControlPlaneTests(unittest.TestCase):
             self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
         )
         repaired = source.state_path.read_bytes()
+        source.state_path.unlink()
         legacy = self.state_root / "replace-during-quarantine.json"
         legacy.write_text('{"broken":', encoding="utf-8")
-        original_read = control_plane_module._read_bounded_bytes
-        target_reads = 0
+        original_replace = os.replace
 
-        def replace_after_read(
-            path: Path,
-            label: str,
-            *,
-            limit: int = control_plane_module.MAX_STATE_FILE_BYTES,
-        ) -> bytes:
-            nonlocal target_reads
-            raw = original_read(path, label, limit=limit)
-            if path == legacy:
-                target_reads += 1
-                if target_reads == 2:
-                    legacy.unlink()
-                    legacy.write_bytes(repaired)
-            return raw
+        def replace_then_repair(source_path: object, destination: object) -> None:
+            original_replace(source_path, destination)
+            if Path(source_path) == legacy:
+                legacy.write_bytes(repaired)
 
         with patch.object(
-            control_plane_module,
-            "_read_bounded_bytes",
-            side_effect=replace_after_read,
+            control_plane_module.os,
+            "replace",
+            side_effect=replace_then_repair,
         ):
-            source._workspace_state_candidates(self.repo)
+            candidates = source._workspace_state_candidates(self.repo)
 
-        self.assertEqual(target_reads, 2)
         self.assertTrue(legacy.exists())
         self.assertEqual(legacy.read_bytes(), repaired)
+        self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
+
+    def test_quarantine_restores_a_valid_state_moved_by_the_race(self) -> None:
+        source = self.control("quarantine-valid-move-source")
+        source.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        repaired = source.state_path.read_bytes()
+        source.state_path.unlink()
+        legacy = self.state_root / "repair-before-quarantine-move.json"
+        legacy.write_text('{"broken":', encoding="utf-8")
+        original_replace = os.replace
+
+        def repair_then_replace(source_path: object, destination: object) -> None:
+            if Path(source_path) == legacy:
+                legacy.write_bytes(repaired)
+            original_replace(source_path, destination)
+
+        with patch.object(
+            control_plane_module.os,
+            "replace",
+            side_effect=repair_then_replace,
+        ):
+            candidates = source._workspace_state_candidates(self.repo)
+
+        self.assertTrue(legacy.exists())
+        self.assertEqual(legacy.read_bytes(), repaired)
+        self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
 
     def test_invalid_indexed_same_workspace_state_blocks_admission(self) -> None:
         control = self.control("indexed-corruption")

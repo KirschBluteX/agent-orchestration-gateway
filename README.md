@@ -173,6 +173,8 @@ uses a shorter internal deadline and returns an explicit block before the host d
 but it cannot turn a killed Hook process into an OS-level fail-closed boundary.
 SubagentStop also settles within its own shorter budget; temporary Git, filesystem, or
 state-lock failures ask the child to repeat the exact same result rather than fencing it.
+Lifecycle discovery, Git output and records, and Git control-directory inspection have
+explicit fail-closed size limits; exceeding one blocks admission instead of sampling.
 
 Git workspaces protect repository control state, typed scopes, ignored content within
 scope, path aliases, submodules, and hidden status cases. Non-Git workspaces are

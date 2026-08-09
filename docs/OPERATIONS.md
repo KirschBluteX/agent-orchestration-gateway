@@ -135,6 +135,14 @@ state root carries CCO's ownership marker. Unmarked shared directories are never
 quarantine unrelated JSON, but every valid legacy lifecycle file still participates in
 reader/writer lease checks.
 
+Lifecycle discovery uses incremental `scandir` and refuses more than 4,096 root-level
+JSON files. Git inspection spools output outside process memory, refuses more than 64 MiB
+or 200,000 parsed records, and stops each Git control-directory digest at 100,000 entries.
+These are admission limits: CCO blocks and asks for cleanup instead of truncating evidence.
+Legacy quarantine first atomically moves the pathname to unique staging and validates the
+object actually moved. A concurrent replacement at the original path is never deleted; a
+valid object caught by the move is restored when possible or retained as recovery evidence.
+
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
 minutes and is rearmed only after admission is checked again. Once PreToolUse records a

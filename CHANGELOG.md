@@ -2,6 +2,17 @@
 
 The project follows semantic versioning.
 
+## 3.0.1 - 2026-08-09
+
+- Bounded lifecycle-root discovery at 4,096 JSON files using incremental directory
+  enumeration, so oversized roots block admission before a native claim is recorded.
+- Spool Git stdout outside process memory, reject output above 64 MiB, limit parsed Git
+  output to 200,000 records, and stop Git control-directory enumeration at 100,000
+  entries instead of fully materializing untrusted output first.
+- Made legacy quarantine atomically move the pathname to unique staging before validating
+  the moved object. Concurrent replacements remain untouched, and an object repaired
+  before the move is restored or retained rather than deleted.
+
 ## 3.0.0 - 2026-08-09
 
 - Declared the unified `prepare` interface and removal of the native-spawn bypass as a

@@ -52,6 +52,9 @@ its own admission budget below the manifest timeout, bounds Git and directory in
 and reserves time to roll back an unfinished claim, so ordinary deadline exhaustion
 returns an explicit block. A process killed before it can return that block cannot be
 made fail-closed by a plugin and remains part of the trusted-host boundary.
+Lifecycle roots are limited to 4,096 JSON files; Git output is limited to 64 MiB and
+200,000 records; each Git control-directory digest is limited to 100,000 entries. Limit
+violations block admission and never authorize truncated evidence.
 SubagentStop has a separate internal budget below its manifest timeout. Git, filesystem,
 deadline, and state-lock unavailability request an exact result replay; they do not fence
 the owner as though it violated scope.
@@ -79,6 +82,8 @@ Legacy state migration is scanned from one directory snapshot. A duplicate left 
 the canonical write and legacy unlink is removed only when its normalized state and
 revision prove it is the same migration. The state-root ownership marker authorizes
 quarantine only; valid legacy lifecycle files retain lease authority without it.
+Quarantine atomically stages the exact pathname object before validation and finalization,
+so it never performs a validation-then-unlink against a replaceable original pathname.
 
 ## Host maintenance
 

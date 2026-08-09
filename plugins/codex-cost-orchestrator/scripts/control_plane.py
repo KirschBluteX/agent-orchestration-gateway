@@ -99,6 +99,7 @@ STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{
 STATE_ROOT_SENTINEL = ".cco-state-root-v1"
 STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
 MAX_STATE_FILE_BYTES = 32 * 1024 * 1024
+MAX_STATE_FILES = 4_096
 STATE_READ_CHUNK_BYTES = 1024 * 1024
 
 
@@ -263,18 +264,31 @@ def _load_object(path: Path, label: str) -> dict[str, Any]:
     return _decode_object(_read_bounded_bytes(path, label), label)
 
 
-def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
-    return os.path.samestat(left, right) and (
-        left.st_mode,
-        left.st_size,
-        left.st_mtime_ns,
-        left.st_ctime_ns,
-    ) == (
-        right.st_mode,
-        right.st_size,
-        right.st_mtime_ns,
-        right.st_ctime_ns,
-    )
+def _state_json_paths(root: Path) -> list[Path]:
+    """Return a deterministic, memory-bounded snapshot of lifecycle files."""
+
+    paths: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                checkpoint()
+                if not entry.name.endswith(".json"):
+                    continue
+                if len(paths) >= MAX_STATE_FILES:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle state directory exceeds the "
+                        f"{MAX_STATE_FILES} file limit"
+                    )
+                paths.append(Path(entry.path))
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise ControlPlaneUnavailable(
+            "lifecycle state directory is unavailable"
+        ) from error
+    checkpoint()
+    paths.sort(key=lambda item: item.name)
+    return paths
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1136,10 +1150,7 @@ class ControlPlane:
         self.root.mkdir(parents=True, exist_ok=True)
         if self._state_root_is_marked():
             return
-        try:
-            json_files = list(self.root.glob("*.json"))
-        except OSError as error:
-            raise ControlPlaneUnavailable("lifecycle state directory is unavailable") from error
+        json_files = _state_json_paths(self.root)
         if json_files and not self._uses_default_root:
             for path in json_files:
                 if STATE_FILE_RE.fullmatch(path.name) is not None:
@@ -1178,10 +1189,7 @@ class ControlPlane:
         if self._state_path is not None:
             return self._state_path
         suffix = f"--{_session_digest(self.session_id)}.json"
-        try:
-            snapshot = sorted(self.root.glob("*.json"), key=lambda item: item.name)
-        except OSError as error:
-            raise ControlPlaneUnavailable("lifecycle state directory is unavailable") from error
+        snapshot = _state_json_paths(self.root)
         legacy = self.root / f"{self.session_id}.json"
         matches = [path for path in snapshot if path.name.endswith(suffix)]
         if len(matches) > 1:
@@ -1427,39 +1435,74 @@ class ControlPlane:
             self._write_state(state)
             return True
 
-    def _quarantine_legacy_state(self, path: Path) -> None:
-        """Isolate invalid legacy state only inside a marked CCO-owned root."""
+    def _quarantine_legacy_state(self, path: Path) -> list[dict[str, Any]]:
+        """Atomically isolate invalid legacy state inside a marked CCO root."""
 
         if not self._state_root_is_marked():
-            return
+            return []
+        quarantine = self.root / "quarantine"
         try:
-            before = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return
+            quarantine.mkdir(parents=True, exist_ok=True)
+            descriptor, staging_name = tempfile.mkstemp(
+                dir=quarantine,
+                prefix=".legacy-staging-",
+                suffix=".json",
+            )
+            os.close(descriptor)
         except OSError as error:
-            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
-        raw = _read_bounded_bytes(path, "legacy lifecycle state")
+            raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
+        staging = Path(staging_name)
         try:
-            after_read = path.stat(follow_symlinks=False)
+            os.replace(path, staging)
         except FileNotFoundError:
-            return
+            staging.unlink(missing_ok=True)
+            return []
         except OSError as error:
+            staging.unlink(missing_ok=True)
             raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
-        if not _same_file_version(before, after_read):
-            return
+
+        # The pathname is no longer consulted after this atomic move.  A repair that
+        # creates a replacement at the original path therefore cannot be unlinked by
+        # quarantine finalization.
+        raw = _read_bounded_bytes(staging, "staged legacy lifecycle state")
         try:
-            self._validate_lifecycle_state(
-                _decode_object(raw, "legacy cco.v9 lifecycle state")
+            staged_state = self._validate_lifecycle_state(
+                _decode_object(raw, "staged legacy cco.v9 lifecycle state")
             )
         except ControlPlaneError:
-            pass
-        else:
-            return
-        quarantine = self.root / "quarantine"
-        quarantine.mkdir(parents=True, exist_ok=True)
+            staged_state = None
+
         name_identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
         content_identity = hashlib.sha256(raw).hexdigest()
-        destination = quarantine / f"legacy-{name_identity}-{content_identity}.json"
+        prefix = "recovered-valid" if staged_state is not None else "legacy"
+        destination = quarantine / f"{prefix}-{name_identity}-{content_identity}.json"
+
+        if staged_state is not None:
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                pass
+            except OSError as error:
+                raise ControlPlaneUnavailable(
+                    "valid legacy lifecycle state could not be restored"
+                ) from error
+            else:
+                try:
+                    with os.fdopen(descriptor, "wb") as handle:
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                except OSError as error:
+                    raise ControlPlaneUnavailable(
+                        "valid legacy lifecycle state could not be restored"
+                    ) from error
+                staging.unlink(missing_ok=True)
+                return [staged_state]
+
         try:
             descriptor = os.open(
                 destination,
@@ -1469,50 +1512,31 @@ class ControlPlane:
         except FileExistsError:
             if _read_bounded_bytes(destination, "quarantined lifecycle state") != raw:
                 raise ControlPlaneError("legacy quarantine identity collision")
-        except FileNotFoundError:
-            return
+        except OSError as error:
+            raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
         else:
             try:
                 with os.fdopen(descriptor, "wb") as handle:
                     handle.write(raw)
                     handle.flush()
                     os.fsync(handle.fileno())
-            except Exception:
-                destination.unlink(missing_ok=True)
+            except OSError as error:
+                raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
+        staging.unlink(missing_ok=True)
+        recovered = [staged_state] if staged_state is not None else []
+        if path.exists():
+            try:
+                replacement = self._validate_lifecycle_state(
+                    _load_object(path, "replacement legacy cco.v9 lifecycle state")
+                )
+            except ControlPlaneUnavailable:
                 raise
-        try:
-            before_unlink = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        except OSError as error:
-            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
-        if not _same_file_version(before, before_unlink):
-            return
-        current = _read_bounded_bytes(path, "legacy lifecycle state")
-        try:
-            after_reread = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        except OSError as error:
-            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
-        if (
-            current != raw
-            or not _same_file_version(before_unlink, after_reread)
-            or not _same_file_version(before, after_reread)
-        ):
-            return
-        try:
-            self._validate_lifecycle_state(
-                _decode_object(current, "legacy cco.v9 lifecycle state")
-            )
-        except ControlPlaneError:
-            pass
-        else:
-            return
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+            except ControlPlaneError:
+                pass
+            else:
+                if replacement not in recovered:
+                    recovered.append(replacement)
+        return recovered
 
     def _workspace_state_candidates(
         self,
@@ -1521,12 +1545,7 @@ class ControlPlane:
         """Load only indexed same-workspace state plus quarantinable legacy files."""
 
         workspace_digest = _workspace_digest(workspace_root)
-        try:
-            snapshot = sorted(self.root.glob("*.json"), key=lambda item: item.name)
-        except OSError as error:
-            raise ControlPlaneUnavailable(
-                "lifecycle state directory is unavailable"
-            ) from error
+        snapshot = _state_json_paths(self.root)
         indexed: list[Path] = []
         legacy: list[Path] = []
         for path in snapshot:
@@ -1559,7 +1578,10 @@ class ControlPlane:
             except ControlPlaneUnavailable:
                 raise
             except ControlPlaneError:
-                self._quarantine_legacy_state(path)
+                recovered = self._quarantine_legacy_state(path)
+                for state in recovered:
+                    if _workspace_digest(state["workspace_root"]) == workspace_digest:
+                        candidates.append((path, state))
                 continue
             if state_workspace_digest == workspace_digest:
                 candidates.append((path, state))

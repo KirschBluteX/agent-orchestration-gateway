@@ -34,6 +34,47 @@ STATE_TOOL = (
 
 
 class WorkspaceStateBehaviorTests(unittest.TestCase):
+    def test_git_output_is_rejected_before_it_exceeds_the_memory_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = self.make_repo(Path(temp_dir))
+            with (
+                mock.patch.object(
+                    workspace_state_module,
+                    "MAX_GIT_OUTPUT_BYTES",
+                    4,
+                ),
+                self.assertRaisesRegex(StateUnavailable, "output byte limit"),
+            ):
+                workspace_state_module.git(repo, "rev-parse", "--show-toplevel")
+
+    def test_git_record_count_is_bounded_before_records_are_materialized(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = self.make_repo(Path(temp_dir))
+            with (
+                mock.patch.object(
+                    workspace_state_module,
+                    "MAX_GIT_RECORDS",
+                    1,
+                ),
+                self.assertRaisesRegex(StateUnavailable, "record limit"),
+            ):
+                workspace_state_module.repository_index_records(repo)
+
+    def test_git_control_directory_entry_count_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "one").write_text("1", encoding="utf-8")
+            (root / "two").write_text("2", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    workspace_state_module,
+                    "MAX_GIT_CONTROL_ENTRIES",
+                    1,
+                ),
+                self.assertRaisesRegex(StateUnavailable, "control entry limit"),
+            ):
+                workspace_state_module.directory_digest(root)
+
     def test_head_oid_rejects_an_unexpected_git_failure(self) -> None:
         failed = subprocess.CompletedProcess(
             ["git", "rev-parse"],

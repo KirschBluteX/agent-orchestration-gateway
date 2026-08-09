@@ -155,6 +155,8 @@ Codex 当前会在 PreToolUse 命令崩溃或被宿主超时终止时 fail-open�
 内部期限并在宿主期限前显式阻止调用，但无法把被杀死的 Hook 进程变成操作系统级
 fail-closed 边界。SubagentStop 同样使用短于宿主的内部期限；临时 Git、文件系统或状态锁
 故障只会要求子 Agent 原样重复同一份结果，不会 fencing 合法结果。
+生命周期文件发现、Git 输出与记录、Git 控制目录检查均有明确的 fail-closed 大小上限；
+超限时会阻止 admission，而不是截断或抽样后继续。
 
 Git 工作区会保护仓库控制状态、typed scopes、范围内 ignored 内容、路径别名、submodule
 和隐藏 status 情况。非 Git 工作区不会执行 `git init`，默认上限为 20,000 个条目和 1 GiB。

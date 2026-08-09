@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 from operation_deadline import (
     OperationDeadlineExceeded,
@@ -31,6 +31,9 @@ SCHEMA = "cco.workspace-state.v3"
 WORKSPACE_MODES = frozenset({"light", "strict"})
 DEFAULT_IGNORED_MAX_FILES = 10_000
 DEFAULT_IGNORED_MAX_BYTES = 256 * 1024 * 1024
+MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
+MAX_GIT_RECORDS = 200_000
+MAX_GIT_CONTROL_ENTRIES = 100_000
 GIT_ADMIN_PATHS = (
     "AUTO_MERGE",
     "BISECT_EXPECTED_REV",
@@ -93,22 +96,64 @@ class StateUnavailable(StateError):
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    command = ["git", *args]
+    process: subprocess.Popen[bytes] | None = None
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=repo,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=remaining_seconds(),
-        )
-    except subprocess.TimeoutExpired as error:
-        raise OperationDeadlineExceeded(
-            "Git workspace inspection exceeded the CCO Hook deadline"
-        ) from error
+        with tempfile.TemporaryFile(mode="w+b") as output:
+            process = subprocess.Popen(
+                command,
+                cwd=repo,
+                env=environment,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                while True:
+                    remaining = remaining_seconds()
+                    wait_slice = 0.01 if remaining is None else min(0.01, remaining)
+                    try:
+                        process.wait(timeout=wait_slice)
+                    except subprocess.TimeoutExpired:
+                        if os.fstat(output.fileno()).st_size > MAX_GIT_OUTPUT_BYTES:
+                            process.kill()
+                            process.wait()
+                            raise StateUnavailable(
+                                "Git repository inspection exceeds the "
+                                f"{MAX_GIT_OUTPUT_BYTES} output byte limit"
+                            )
+                        continue
+                    break
+            except OperationDeadlineExceeded as error:
+                process.kill()
+                process.wait()
+                raise OperationDeadlineExceeded(
+                    "Git workspace inspection exceeded the CCO Hook deadline"
+                ) from error
+            if os.fstat(output.fileno()).st_size > MAX_GIT_OUTPUT_BYTES:
+                raise StateUnavailable(
+                    "Git repository inspection exceeds the "
+                    f"{MAX_GIT_OUTPUT_BYTES} output byte limit"
+                )
+            output.seek(0)
+            raw = output.read(MAX_GIT_OUTPUT_BYTES + 1)
+    except (OperationDeadlineExceeded, StateUnavailable):
+        raise
     except OSError as error:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
         raise StateUnavailable("Git repository inspection is unavailable") from error
+    if len(raw) > MAX_GIT_OUTPUT_BYTES:
+        raise StateUnavailable(
+            "Git repository inspection exceeds the "
+            f"{MAX_GIT_OUTPUT_BYTES} output byte limit"
+        )
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout=raw,
+        stderr=b"",
+    )
 
 
 def git(repo: Path, *args: str) -> bytes:
@@ -116,6 +161,35 @@ def git(repo: Path, *args: str) -> bytes:
     if result.returncode:
         raise StateUnavailable("Git repository inspection failed")
     return result.stdout
+
+
+def _git_records(raw: bytes, separator: bytes, label: str) -> Iterator[bytes]:
+    """Yield bounded Git records without materializing a split list."""
+
+    start = 0
+    count = 0
+    while start <= len(raw):
+        checkpoint()
+        end = raw.find(separator, start)
+        if end < 0:
+            record = raw[start:]
+            start = len(raw) + 1
+        else:
+            record = raw[start:end]
+            start = end + len(separator)
+        if not record:
+            continue
+        count += 1
+        if count > MAX_GIT_RECORDS:
+            raise StateUnavailable(
+                f"{label} exceeds the {MAX_GIT_RECORDS} record limit"
+            )
+        yield record
+
+
+def _assert_git_record_budget(raw: bytes, separator: bytes, label: str) -> None:
+    for _record in _git_records(raw, separator, label):
+        pass
 
 
 def decode_path(value: bytes) -> str:
@@ -222,19 +296,19 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def git_config_digest(root: Path) -> str:
-    return sha256_bytes(
-        git(root, "config", "--null", "--show-origin", "--list", "--includes")
-    )
+    raw = git(root, "config", "--null", "--show-origin", "--list", "--includes")
+    _assert_git_record_budget(raw, b"\0", "Git config")
+    return sha256_bytes(raw)
 
 
 def refs_digest(root: Path) -> str:
-    return sha256_bytes(
-        git(
-            root,
-            "for-each-ref",
-            "--format=%(refname)%00%(objectname)%00%(symref)",
-        )
+    raw = git(
+        root,
+        "for-each-ref",
+        "--format=%(refname)%00%(objectname)%00%(symref)",
     )
+    _assert_git_record_budget(raw, b"\n", "Git refs")
+    return sha256_bytes(raw)
 
 
 def reparse_target(path: str | os.PathLike[str]) -> str | None:
@@ -268,10 +342,20 @@ def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
     while stack:
         checkpoint()
         current, prefix = stack.pop()
+        children: list[os.DirEntry[str]] = []
         try:
-            children = sorted(os.scandir(current), key=lambda entry: entry.name)
+            with os.scandir(current) as entries:
+                for child in entries:
+                    checkpoint()
+                    if len(records) + len(children) >= MAX_GIT_CONTROL_ENTRIES:
+                        raise StateUnavailable(
+                            "Git control directory exceeds the "
+                            f"{MAX_GIT_CONTROL_ENTRIES} control entry limit"
+                        )
+                    children.append(child)
         except OSError as error:
             raise StateUnavailable("Git control directory inspection failed") from error
+        children.sort(key=lambda entry: entry.name)
         for child in children:
             checkpoint()
             relative = f"{prefix}/{child.name}" if prefix else child.name
@@ -406,15 +490,9 @@ def status_entries(root: Path) -> dict[str, dict[str, Any]]:
         "--untracked-files=all",
         "--ignore-submodules=none",
     )
-    fields = raw.split(b"\0")
     entries: dict[str, dict[str, Any]] = {}
-    index = 0
-    while index < len(fields):
-        checkpoint()
-        record = fields[index]
-        index += 1
-        if not record:
-            continue
+    records = iter(_git_records(raw, b"\0", "Git status"))
+    for record in records:
         marker = record[:1]
         if marker == b"1":
             parts = record.split(b" ", 8)
@@ -427,11 +505,13 @@ def status_entries(root: Path) -> dict[str, dict[str, Any]]:
             }
         elif marker == b"2":
             parts = record.split(b" ", 9)
-            if len(parts) != 10 or index >= len(fields):
+            if len(parts) != 10:
                 raise StateError("unexpected Git rename record")
             path = decode_path(parts[9])
-            original = decode_path(fields[index])
-            index += 1
+            try:
+                original = decode_path(next(records))
+            except StopIteration as error:
+                raise StateError("unexpected Git rename record") from error
             status = decode_path(b" ".join(parts[:9]))
             entries[path] = {
                 "status": status,
@@ -491,13 +571,15 @@ def ignored_entries(
         "--exclude-standard",
         "-z",
     )
-    paths = sorted(decode_path(value) for value in raw.split(b"\0") if value)
-    if scopes is not None:
-        paths = [path for path in paths if is_allowed(path, scopes)]
-    if len(paths) > max_files:
-        raise StateError(
-            f"ignored scan exceeds the {max_files} file limit"
-        )
+    paths: list[str] = []
+    for value in _git_records(raw, b"\0", "Git ignored paths"):
+        path = decode_path(value)
+        if scopes is not None and not is_allowed(path, scopes):
+            continue
+        if len(paths) >= max_files:
+            raise StateError(f"ignored scan exceeds the {max_files} file limit")
+        paths.append(path)
+    paths.sort()
     total_bytes = 0
     entries: dict[str, dict[str, Any]] = {}
     for path in paths:
@@ -523,10 +605,7 @@ def ignored_entries(
 def repository_index_records(root: Path) -> dict[str, list[dict[str, str]]]:
     raw = git(root, "ls-files", "--stage", "--cached", "-z")
     index_records: dict[str, list[dict[str, str]]] = {}
-    for record in raw.split(b"\0"):
-        checkpoint()
-        if not record:
-            continue
+    for record in _git_records(raw, b"\0", "Git index"):
         try:
             metadata, raw_path = record.split(b"\t", 1)
             mode, object_id, stage = metadata.decode("ascii").split(" ")
@@ -550,10 +629,7 @@ def repository_status_hidden_paths(root: Path) -> frozenset[str]:
 
     raw = git(root, "ls-files", "-v", "-z")
     hidden: set[str] = set()
-    for record in raw.split(b"\0"):
-        checkpoint()
-        if not record:
-            continue
+    for record in _git_records(raw, b"\0", "Git visibility"):
         try:
             marker, raw_path = record.split(b" ", 1)
         except ValueError as error:
