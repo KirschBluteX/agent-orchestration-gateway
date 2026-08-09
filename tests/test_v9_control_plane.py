@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -174,6 +175,37 @@ class V9ControlPlaneTests(unittest.TestCase):
             result_text(first_id, evidence={"A01": "first complete"}),
         )
         return control, first_id, owner
+
+    def downgrade_active_wave_to_v1(self, control: ControlPlane) -> None:
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        current_wave_id = state["active_wave_id"]
+        current_wave_path = control._artifact_path("wave", current_wave_id)
+        wave = json.loads(current_wave_path.read_text(encoding="utf-8"))
+        wave["protocol"] = "cco.wave.v1"
+        identity = {
+            key: wave[key]
+            for key in ("baseline_id", "plan_id", "protocol", "sequence", "units")
+        }
+        legacy_wave_id = control_plane_module._digest(b"cco.wave.v1\0", identity)
+        wave["wave_id"] = legacy_wave_id
+        control._artifact_path("wave", legacy_wave_id).write_text(
+            json.dumps(wave, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        state["active_wave_id"] = legacy_wave_id
+        state.pop("lineage_id", None)
+        state.pop("parent_state_sha256", None)
+        for dispatch in state["dispatches"].values():
+            if dispatch["wave_id"] != current_wave_id:
+                continue
+            dispatch["wave_id"] = legacy_wave_id
+            dispatch.pop("context_turns", None)
+            dispatch.pop("fallback_from_owner", None)
+            dispatch.pop("reused_from", None)
+        control.state_path.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
 
     def test_direct_dependency_reuses_same_owner_with_a_fresh_dispatch(self) -> None:
         control, first_id, owner = self.ready_reuse_chain("reuse-direct")
@@ -1465,6 +1497,139 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertTrue(legacy.exists())
         self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
 
+    def test_quarantining_a_recovery_at_the_exact_limit_needs_no_new_slot(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
+        source = self.state_root / ".cco-recovery-source.json"
+        source.write_text('{"broken":', encoding="utf-8")
+        (self.state_root / ".cco-recovery-peer.json").write_text(
+            '{"also-broken":', encoding="utf-8"
+        )
+
+        with patch.object(control_plane_module, "MAX_RECOVERY_FILES", 2):
+            self.control("recovery-at-limit")._quarantine_legacy_state(source)
+
+        self.assertFalse(source.exists())
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+        self.assertEqual(len(list((self.state_root / "quarantine").glob("*.json"))), 1)
+
+    def test_foreign_workspace_scan_does_not_replay_recovery(self) -> None:
+        other_repo = self.root / "other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        foreign = self.control("foreign-recovery")
+        foreign.create_plan(
+            other_repo,
+            self.brief([self.node("writer", "A01", "other.txt")]),
+        )
+        native = foreign.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(foreign, native)
+        canonical = foreign.state_path
+        recovery = self.state_root / ".cco-recovery-foreign-workspace.json"
+        os.replace(canonical, recovery)
+
+        self.control("local-scan")._workspace_state_candidates(self.repo)
+
+        self.assertTrue(recovery.exists())
+        self.assertFalse(canonical.exists())
+
+    def test_recovery_replay_serializes_with_its_own_workspace_writer(self) -> None:
+        owner = self.control("recovery-race-owner")
+        owner.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        canonical = owner.state_path
+        writer = self.control("recovery-race-owner")
+        self.assertEqual(writer.status()["epoch"], 1)
+        canonical_raw = canonical.read_bytes()
+        recovery_state = json.loads(canonical_raw.decode("utf-8"))
+        recovery_state["revision"] += 1
+        recovery_state["epoch"] = 11
+        recovery_state["parent_state_sha256"] = (
+            "sha256:" + hashlib.sha256(canonical_raw).hexdigest()
+        )
+        recovery = self.state_root / ".cco-recovery-workspace-race.json"
+        recovery.write_text(
+            json.dumps(recovery_state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        replay = self.control("recovery-race-reader")
+        entered = threading.Event()
+        release = threading.Event()
+        writer_done = threading.Event()
+        errors: list[BaseException] = []
+        original_replace = os.replace
+
+        def blocking_replace(source: object, destination: object) -> None:
+            if Path(source) == recovery and Path(destination) == canonical:
+                entered.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test recovery barrier timed out")
+            original_replace(source, destination)
+
+        def replay_recovery() -> None:
+            try:
+                replay._replay_recovery_state(recovery, recovery_state)
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        def update_owner() -> None:
+            try:
+                with writer._coordinated():
+                    state = writer._read_state()
+                    state["epoch"] = 99
+                    writer._write_state(state)
+                writer_done.set()
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        with patch.object(control_plane_module.os, "replace", side_effect=blocking_replace):
+            replay_thread = threading.Thread(target=replay_recovery)
+            writer_thread = threading.Thread(target=update_owner)
+            replay_thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            writer_thread.start()
+            try:
+                self.assertFalse(writer_done.wait(timeout=0.2))
+            finally:
+                release.set()
+            replay_thread.join(timeout=5)
+            writer_thread.join(timeout=5)
+
+        self.assertFalse(replay_thread.is_alive())
+        self.assertFalse(writer_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(json.loads(canonical.read_text(encoding="utf-8"))["epoch"], 99)
+
+    def test_same_lineage_recovery_requires_direct_parent_proof(self) -> None:
+        control = self.control("recovery-parent-proof")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        canonical = control.state_path
+        canonical_raw = canonical.read_bytes()
+        recovery_state = json.loads(canonical_raw.decode("utf-8"))
+        recovery_state["revision"] += 1
+        recovery_state["parent_state_sha256"] = "sha256:" + ("0" * 64)
+        recovery = self.state_root / ".cco-recovery-wrong-parent.json"
+        recovery.write_text(
+            json.dumps(recovery_state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ControlPlaneError, "conflicting lifecycle recovery"):
+            control._replay_recovery_state(recovery, recovery_state)
+
+        self.assertEqual(canonical.read_bytes(), canonical_raw)
+        self.assertTrue(recovery.exists())
+
     def test_invalid_indexed_same_workspace_state_blocks_admission(self) -> None:
         control = self.control("indexed-corruption")
         control.create_plan(
@@ -2234,32 +2399,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
         )["dispatches"][0]["tool_input"]
-        state = json.loads(control.state_path.read_text(encoding="utf-8"))
-        current_wave_id = state["active_wave_id"]
-        current_wave_path = control._artifact_path("wave", current_wave_id)
-        wave = json.loads(current_wave_path.read_text(encoding="utf-8"))
-        wave["protocol"] = "cco.wave.v1"
-        identity = {
-            key: wave[key]
-            for key in ("baseline_id", "plan_id", "protocol", "sequence", "units")
-        }
-        legacy_wave_id = control_plane_module._digest(b"cco.wave.v1\0", identity)
-        wave["wave_id"] = legacy_wave_id
-        control._artifact_path("wave", legacy_wave_id).write_text(
-            json.dumps(wave, separators=(",", ":"), sort_keys=True),
-            encoding="utf-8",
-        )
-        state["active_wave_id"] = legacy_wave_id
-        state.pop("lineage_id")
-        for dispatch in state["dispatches"].values():
-            dispatch["wave_id"] = legacy_wave_id
-            dispatch.pop("context_turns")
-            dispatch.pop("fallback_from_owner")
-            dispatch.pop("reused_from")
-        control.state_path.write_text(
-            json.dumps(state, separators=(",", ":"), sort_keys=True),
-            encoding="utf-8",
-        )
+        self.downgrade_active_wave_to_v1(control)
 
         dispatch_id, owner = self.start_dispatch(control, native)
         result = control.record_result(
@@ -2269,6 +2409,59 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         self.assertEqual(result["state"], "retired")
         self.assertEqual(control.status()["state"], "complete")
+
+    def test_real_v1_prepared_continuation_restores_context_from_wave(self) -> None:
+        control = self.control("legacy-v1-continuation")
+        node = self.node("n01", "A01", "a.txt")
+        node["context_turns"] = 3
+        control.create_plan(self.repo, self.brief([node]))
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        control.record_result(
+            owner,
+            result_text(
+                dispatch_id,
+                status="blocked",
+                outcome="pause",
+                blockers=["need one fact"],
+                failure_signature="missing_fact",
+            ),
+        )
+        prepared = control.prepare_continuation(dispatch_id, {"fact": "known"})
+        self.assertEqual(set(prepared["tool_input"]), {"message", "target"})
+        self.downgrade_active_wave_to_v1(control)
+
+        upgraded = self.control("legacy-v1-continuation")
+        self.assertEqual(upgraded.status()["counts"]["paused"], 1)
+        migrated = json.loads(upgraded.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["dispatches"][dispatch_id]["context_turns"], 3)
+        upgraded.preflight_continuation(
+            {
+                "tool_input": prepared["tool_input"],
+                "tool_use_id": "legacy-followup",
+            }
+        )
+        upgraded.postflight_tool(
+            {
+                "tool_input": prepared["tool_input"],
+                "tool_response": {"ok": True},
+                "tool_use_id": "legacy-followup",
+            }
+        )
+        result = upgraded.record_result(
+            owner,
+            result_text(
+                dispatch_id,
+                cursor=1,
+                evidence={"A01": "legacy continuation settled"},
+            ),
+        )
+
+        self.assertEqual(result["state"], "retired")
+        self.assertEqual(upgraded.status()["state"], "complete")
 
     def test_wave_unit_mutation_is_rejected_before_spawn(self) -> None:
         control = self.control()

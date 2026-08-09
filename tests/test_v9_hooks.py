@@ -150,6 +150,15 @@ class V9HookTests(unittest.TestCase):
         )
         self.assertLess(control.lock_timeout, 3)
 
+    def test_posttool_internal_budget_is_below_host_timeout(self) -> None:
+        manifest = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+        host_timeout = manifest["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"]
+        self.assertLess(cco_hook.POSTTOOL_INTERNAL_BUDGET_SECONDS, host_timeout)
+        control = cco_hook._control(
+            {"hook_event_name": "PostToolUse", "session_id": "budgeted-post-hook"}
+        )
+        self.assertLess(control.lock_timeout, cco_hook.POSTTOOL_INTERNAL_BUDGET_SECONDS)
+
     def test_subagent_stop_budget_leaves_host_settlement_reserve(self) -> None:
         manifest = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
         host_timeout = manifest["hooks"]["SubagentStop"][0]["hooks"][0]["timeout"]
@@ -324,16 +333,14 @@ class V9HookTests(unittest.TestCase):
 
         class Control:
             @staticmethod
-            def owner_is_managed(_owner: str) -> bool:
+            def preflight_interrupt(payload: object) -> bool:
+                calls.append(("pre", payload))
                 return True
 
             @staticmethod
-            def preflight_interrupt(payload: object) -> None:
-                calls.append(("pre", payload))
-
-            @staticmethod
-            def postflight_interrupt(payload: object) -> None:
+            def postflight_interrupt(payload: object) -> bool:
                 calls.append(("post", payload))
+                return True
 
         pre = {
             "hook_event_name": "PreToolUse",
@@ -355,6 +362,10 @@ class V9HookTests(unittest.TestCase):
         class Control:
             @staticmethod
             def owner_is_managed(_owner: str) -> bool:
+                return False
+
+            @staticmethod
+            def preflight_interrupt(_payload: object) -> bool:
                 return False
 
         with patch.object(cco_hook, "_control", return_value=Control()):

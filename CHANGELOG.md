@@ -2,6 +2,17 @@
 
 The project follows semantic versioning.
 
+## 4.0.2 - 2026-08-09
+
+- Recover context inheritance for active v1 continuations from their immutable wave,
+  while conservatively excluding an unresolvable legacy dispatch from owner reuse.
+- Replay lifecycle recovery only while holding its canonical workspace lock and only
+  across an exact state or a hash-proven direct parent transition.
+- Let recovery quarantine reuse its own slot at the 32-file boundary instead of
+  requiring a nonexistent extra slot.
+- Settle managed interrupts in one control-plane transaction and bound all
+  PostToolUse work to 3.5 seconds inside the host's five-second timeout.
+
 ## 4.0.1 - 2026-08-09
 
 - Keep active recovery state visible to its owning Codex task and bind recovery

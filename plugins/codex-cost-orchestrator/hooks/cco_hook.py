@@ -60,6 +60,7 @@ MAX_PROTECTED_DEPTH = 32
 MAX_PROTECTED_NODES = 10_000
 MAX_PROTECTED_BYTES = 1024 * 1024
 PRETOOL_INTERNAL_BUDGET_SECONDS = 24.0
+POSTTOOL_INTERNAL_BUDGET_SECONDS = 3.5
 SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS = 100.0
 
 
@@ -301,26 +302,25 @@ def evaluate(value: object) -> dict[str, Any]:
                         tool_input.get("target"), str
                     ):
                         raise ControlPlaneError("interrupt target is missing")
-                    control = _control(value)
-                    if control.owner_is_managed(tool_input["target"]):
-                        control.preflight_interrupt(value)
+                    _control(value).preflight_interrupt(value)
                     return {}
                 return {}
         if event == "PostToolUse":
-            if value.get("tool_name") in INTERRUPT_TOOLS:
+            with deadline_after(POSTTOOL_INTERNAL_BUDGET_SECONDS):
+                if value.get("tool_name") in INTERRUPT_TOOLS:
+                    _control(value).postflight_interrupt(value)
+                    return {}
                 tool_input = value.get("tool_input")
-                target = tool_input.get("target") if isinstance(tool_input, Mapping) else None
-                control = _control(value)
-                if isinstance(target, str) and control.owner_is_managed(target):
-                    control.postflight_interrupt(value)
+                message = (
+                    tool_input.get("message")
+                    if isinstance(tool_input, Mapping)
+                    else None
+                )
+                if isinstance(message, str) and message.startswith(
+                    (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
+                ):
+                    _control(value).postflight_tool(value)
                 return {}
-            tool_input = value.get("tool_input")
-            message = tool_input.get("message") if isinstance(tool_input, Mapping) else None
-            if isinstance(message, str) and message.startswith(
-                (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
-            ):
-                _control(value).postflight_tool(value)
-            return {}
         if event == "Stop":
             if value.get("stop_hook_active") is True:
                 return {}

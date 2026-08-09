@@ -55,6 +55,9 @@ its own admission budget below the manifest timeout, bounds Git and directory in
 and reserves time to roll back an unfinished claim, so ordinary deadline exhaustion
 returns an explicit block. A process killed before it can return that block cannot be
 made fail-closed by a plugin and remains part of the trusted-host boundary.
+PostToolUse uses one 3.5-second internal deadline within the host's five-second timeout;
+interrupt ownership and settlement share one workspace-coordinated transaction instead
+of consuming separate lock budgets.
 Lifecycle roots are limited to 4,096 JSON files; Git output is limited to 64 MiB and
 200,000 records; each Git control-directory digest is limited to 100,000 entries. Limit
 violations block admission and never authorize truncated evidence.

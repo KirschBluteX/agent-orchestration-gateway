@@ -19,8 +19,9 @@ The installer stages both profiles before replacement and rolls back a partial w
 It does not overwrite another filename or remove modified content.
 
 An update may leave an already active `cco.wave.v1` artifact. CCO accepts that artifact
-only until its existing work settles; every newly created wave uses v2. Updating does
-not require interrupting active v1 children first.
+only until its existing work settles; continuation context is recovered from the
+immutable wave instead of the mutable follow-up input. Every newly created wave uses
+v2, so updating does not require interrupting active v1 children first.
 
 Open `/hooks`, review and trust these five definitions:
 
@@ -152,8 +153,10 @@ target. These are admission limits: CCO blocks instead of truncating evidence.
 Legacy quarantine first atomically moves the pathname to top-level recovery staging and
 validates the object actually moved. A concurrent replacement at the original path is never
 deleted. Valid recovery state remains lease-visible and is replayed to its canonical pathname
-with an atomic no-replace link; invalid state moves to content-addressed quarantine only after
-the durable object is available.
+under that recovery's own workspace lock. An existing canonical state is replaced or
+finalized only when exact content or a hash-proven direct parent transition establishes
+its lineage; invalid state moves to content-addressed quarantine only after the durable
+object is available.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two

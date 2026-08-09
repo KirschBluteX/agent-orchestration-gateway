@@ -197,6 +197,15 @@ def _preflight_verification_budget() -> float:
     )
 
 
+def _bounded_lock_timeout(limit: float) -> float:
+    remaining = remaining_seconds()
+    return limit if remaining is None else min(limit, remaining)
+
+
+def _state_content_id(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Workspace adapters legitimately contain platform inode/device integers above
@@ -1298,7 +1307,7 @@ class ControlPlane:
         with acquire(
             self.root,
             STATE_ROOT_CAPACITY_LOCK,
-            timeout=self.lock_timeout,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
             matches = _session_state_paths(self.root, self.session_id)
         indexed = [path for path in matches if STATE_FILE_RE.fullmatch(path.name)]
@@ -1413,6 +1422,13 @@ class ControlPlane:
             raise ControlPlaneError("lifecycle plan identity is invalid")
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ControlPlaneError("lifecycle revision is invalid")
+        parent_state = normalized.get("parent_state_sha256")
+        if parent_state is not None and (
+            not isinstance(parent_state, str)
+            or SHA256_RE.fullmatch(parent_state) is None
+        ):
+            raise ControlPlaneError("lifecycle parent state identity is invalid")
+        normalized.setdefault("parent_state_sha256", None)
         lineage_id = _lifecycle_lineage_id(
             normalized["workspace_root"],
             session,
@@ -1437,6 +1453,17 @@ class ControlPlane:
                         and 1 <= int(fork_turns) <= 32
                     ):
                         dispatch["context_turns"] = int(fork_turns)
+                    elif (
+                        dispatch.get("tool_kind") == "continuation"
+                        and isinstance(native, Mapping)
+                        and isinstance(native.get("message"), str)
+                        and isinstance(native.get("target"), str)
+                    ):
+                        # Old cco.wave.v1 replaced spawn input with the follow-up
+                        # input, so context inheritance must be recovered from the
+                        # immutable wave rather than guessed from this record.
+                        dispatch["context_turns"] = 0
+                        dispatch["legacy_context_unknown"] = True
                     else:
                         raise ControlPlaneError(
                             "legacy lifecycle context inheritance is invalid"
@@ -1606,13 +1633,14 @@ class ControlPlane:
         with acquire(
             self.root,
             STATE_ROOT_CAPACITY_LOCK,
-            timeout=self.lock_timeout,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
             recovery_count = sum(
                 RECOVERY_FILE_RE.fullmatch(candidate.name) is not None
                 for candidate in _state_json_paths(self.root)
             )
-            if recovery_count >= MAX_RECOVERY_FILES:
+            source_is_recovery = RECOVERY_FILE_RE.fullmatch(path.name) is not None
+            if recovery_count - int(source_is_recovery) >= MAX_RECOVERY_FILES:
                 raise ControlPlaneUnavailable(
                     "lifecycle state directory exceeds the "
                     f"{MAX_RECOVERY_FILES} recovery file limit"
@@ -1709,7 +1737,7 @@ class ControlPlane:
         path: Path,
         state: dict[str, Any],
     ) -> tuple[Path, dict[str, Any]]:
-        """Publish one visible recovery state without an overwrite window."""
+        """Publish one recovery under its own workspace lock and direct-parent CAS."""
 
         canonical = _lifecycle_state_path(
             self.root,
@@ -1718,58 +1746,116 @@ class ControlPlane:
         )
         with acquire(
             self.root,
-            STATE_ROOT_CAPACITY_LOCK,
-            timeout=self.lock_timeout,
+            _workspace_lock_identity(state["workspace_root"]),
+            timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
-            if canonical.exists():
-                current = self._validate_lifecycle_state(
-                    _load_object(canonical, "recovered cco.v9 lifecycle state"),
+            with acquire(
+                self.root,
+                STATE_ROOT_CAPACITY_LOCK,
+                timeout=_bounded_lock_timeout(self.lock_timeout),
+            ):
+                recovery_raw = _read_bounded_bytes(
+                    path,
+                    "recoverable cco.v9 lifecycle state",
+                )
+                recovery = self._validate_lifecycle_state(
+                    _decode_object(
+                        recovery_raw,
+                        "recoverable cco.v9 lifecycle state",
+                    ),
                     expected_session=state["session_id"],
                 )
-                if current == state or (
-                    current["lineage_id"] == state["lineage_id"]
-                    and current["revision"] > state["revision"]
-                ):
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError as error:
-                        raise ControlPlaneUnavailable(
-                            "lifecycle recovery finalization failed"
-                        ) from error
-                    return canonical, current
                 if (
-                    current["lineage_id"] == state["lineage_id"]
-                    and state["revision"] > current["revision"]
+                    recovery["lineage_id"] != state["lineage_id"]
+                    or recovery["revision"] != state["revision"]
                 ):
-                    try:
-                        os.replace(path, canonical)
-                    except OSError as error:
-                        raise ControlPlaneUnavailable(
-                            "lifecycle recovery publication failed"
-                        ) from error
-                    return canonical, state
-                raise ControlPlaneError("conflicting lifecycle recovery")
-            if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
-                return path, state
-            try:
-                os.link(path, canonical)
-            except FileExistsError:
-                return path, state
-            except OSError as error:
-                raise ControlPlaneUnavailable(
-                    "valid legacy lifecycle state could not be restored"
-                ) from error
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as error:
+                    raise ControlPlaneError("lifecycle recovery changed during replay")
+                if canonical.exists():
+                    current_raw = _read_bounded_bytes(
+                        canonical,
+                        "recovered cco.v9 lifecycle state",
+                    )
+                    current = self._validate_lifecycle_state(
+                        _decode_object(
+                            current_raw,
+                            "recovered cco.v9 lifecycle state",
+                        ),
+                        expected_session=state["session_id"],
+                    )
+                    same_state = current == recovery
+                    current_is_child = (
+                        current["lineage_id"] == recovery["lineage_id"]
+                        and current["revision"] == recovery["revision"] + 1
+                        and current.get("parent_state_sha256")
+                        == _state_content_id(recovery_raw)
+                    )
+                    recovery_is_child = (
+                        current["lineage_id"] == recovery["lineage_id"]
+                        and recovery["revision"] == current["revision"] + 1
+                        and recovery.get("parent_state_sha256")
+                        == _state_content_id(current_raw)
+                    )
+                    if same_state or current_is_child:
+                        if _read_bounded_bytes(
+                            path,
+                            "recoverable cco.v9 lifecycle state",
+                        ) != recovery_raw:
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery changed during finalization"
+                            )
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as error:
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery finalization failed"
+                            ) from error
+                        return canonical, current
+                    if recovery_is_child:
+                        if (
+                            _read_bounded_bytes(
+                                canonical,
+                                "recovered cco.v9 lifecycle state",
+                            )
+                            != current_raw
+                            or _read_bounded_bytes(
+                                path,
+                                "recoverable cco.v9 lifecycle state",
+                            )
+                            != recovery_raw
+                        ):
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery changed during publication"
+                            )
+                        try:
+                            os.replace(path, canonical)
+                        except OSError as error:
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery publication failed"
+                            ) from error
+                        return canonical, recovery
+                    raise ControlPlaneError("conflicting lifecycle recovery")
+                if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
+                    return path, recovery
                 try:
-                    canonical.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise ControlPlaneUnavailable(
-                    "lifecycle recovery finalization failed"
-                ) from error
-            return canonical, state
+                    os.link(path, canonical)
+                except FileExistsError:
+                    return path, recovery
+                except OSError as error:
+                    raise ControlPlaneUnavailable(
+                        "valid legacy lifecycle state could not be restored"
+                    ) from error
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as error:
+                    try:
+                        if os.path.samefile(path, canonical):
+                            canonical.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise ControlPlaneUnavailable(
+                        "lifecycle recovery finalization failed"
+                    ) from error
+                return canonical, recovery
 
     def _workspace_state_candidates(
         self,
@@ -1816,12 +1902,12 @@ class ControlPlane:
                     if _workspace_digest(state["workspace_root"]) == workspace_digest:
                         candidates.append((path, state))
                 continue
-            if (
-                RECOVERY_FILE_RE.fullmatch(path.name) is not None
-                and self._state_root_is_marked()
-            ):
-                path, state = self._replay_recovery_state(path, state)
             if state_workspace_digest == workspace_digest:
+                if (
+                    RECOVERY_FILE_RE.fullmatch(path.name) is not None
+                    and self._state_root_is_marked()
+                ):
+                    path, state = self._replay_recovery_state(path, state)
                 candidates.append((path, state))
         return candidates
 
@@ -1874,12 +1960,36 @@ class ControlPlane:
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
 
     def _read_state(self) -> dict[str, Any]:
+        # A failed recovery finalization can leave both the cached canonical path
+        # and a later recovery path. Refresh only at the authoritative read point
+        # so an existing ControlPlane cannot advance past an unseen recovery.
+        if (
+            self._state_path is not None
+            and self._state_path.exists()
+            and STATE_FILE_RE.fullmatch(self._state_path.name) is not None
+        ):
+            with acquire(
+                self.root,
+                STATE_ROOT_CAPACITY_LOCK,
+                timeout=_bounded_lock_timeout(self.lock_timeout),
+            ):
+                matches = _session_state_paths(self.root, self.session_id)
+            recoveries = [
+                path for path in matches if RECOVERY_FILE_RE.fullmatch(path.name)
+            ]
+            if len(recoveries) > 1:
+                raise ControlPlaneError(
+                    "current task has multiple lifecycle recovery files"
+                )
+            if recoveries:
+                self._state_path = recoveries[0]
         source = self.state_path
         raw_state = _load_object(source, "cco.v9 lifecycle state")
         state = self._validate_lifecycle_state(
             raw_state,
             expected_session=self.session_id,
         )
+        state = self._restore_legacy_context_from_wave(state)
         canonical = _lifecycle_state_path(
             self.root,
             state["workspace_root"],
@@ -1891,7 +2001,8 @@ class ControlPlane:
         ):
             source, state = self._replay_recovery_state(source, state)
             self._state_path = source
-            raw_state = state
+            raw_state = deepcopy(state)
+            state = self._restore_legacy_context_from_wave(state)
             if source != canonical:
                 return state
         if STATE_FILE_RE.fullmatch(source.name) is not None and source != canonical:
@@ -1903,10 +2014,14 @@ class ControlPlane:
                 legacy_raw,
                 expected_session=self.session_id,
             )
+            legacy_state = self._restore_legacy_context_from_wave(legacy_state)
             canonical_revision = state.get("revision")
             legacy_revision = legacy_state.get("revision")
             comparable = deepcopy(legacy_state)
             comparable["revision"] = canonical_revision
+            # Older indexed migrations predate parent hashes. Equality of every
+            # other field plus the exact one-revision step remains their proof.
+            comparable["parent_state_sha256"] = state.get("parent_state_sha256")
             if (
                 isinstance(canonical_revision, bool)
                 or not isinstance(canonical_revision, int)
@@ -1951,6 +2066,20 @@ class ControlPlane:
         else:
             target = canonical
         self._state_path = target
+        if target.exists():
+            current_raw = _read_bounded_bytes(target, "current cco.v9 lifecycle state")
+            current = self._validate_lifecycle_state(
+                _decode_object(current_raw, "current cco.v9 lifecycle state"),
+                expected_session=self.session_id,
+            )
+            if (
+                current["lineage_id"] != state.get("lineage_id")
+                or current["revision"] != state.get("revision")
+            ):
+                raise ControlPlaneError("lifecycle state changed before persistence")
+            state["parent_state_sha256"] = _state_content_id(current_raw)
+        else:
+            state["parent_state_sha256"] = None
         state["revision"] = int(state.get("revision", 0)) + 1
         _atomic_write(target, state)
         artifacts = self.root / "artifacts"
@@ -2029,6 +2158,38 @@ class ControlPlane:
             raise ControlPlaneError("wave baseline scopes do not match its physical units")
         return wave
 
+    def _restore_legacy_context_from_wave(
+        self,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        unknown = [
+            dispatch
+            for dispatch in state["dispatches"].values()
+            if dispatch.get("legacy_context_unknown") is True
+        ]
+        if not unknown or not isinstance(state.get("active_wave_id"), str):
+            return state
+        wave = self._read_wave(state)
+        units = {
+            unit.get("id"): unit
+            for unit in wave["units"]
+            if isinstance(unit, Mapping) and isinstance(unit.get("id"), str)
+        }
+        for dispatch in unknown:
+            if dispatch.get("wave_id") != wave["wave_id"]:
+                continue
+            unit = units.get(dispatch.get("unit_id"))
+            context_turns = unit.get("context_turns") if isinstance(unit, Mapping) else None
+            if (
+                isinstance(context_turns, bool)
+                or not isinstance(context_turns, int)
+                or not 0 <= context_turns <= 32
+            ):
+                continue
+            dispatch["context_turns"] = context_turns
+            dispatch.pop("legacy_context_unknown", None)
+        return state
+
     def create_plan(
         self,
         repo: Path,
@@ -2047,8 +2208,8 @@ class ControlPlane:
         plan_id = _digest(b"cco.plan.v1\0", unsigned)
         plan = {**unsigned, "plan_id": plan_id}
         plan_path = self._artifact_path("plan", plan_id)
-        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
-            if self.state_path.exists():
+        if self.state_path.exists():
+            with self._coordinated():
                 state = self._read_state()
                 if (
                     resume_identical
@@ -2073,12 +2234,18 @@ class ControlPlane:
                         "workspace_root": str(workspace),
                     }
                 raise ControlPlaneError(
+                    "the current task already has CCO lifecycle proof; "
+                    "run explicit cleanup first"
+                )
+        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
+            if self.state_path.exists():
+                raise ControlPlaneError(
                     "the current task already has CCO lifecycle proof; run explicit cleanup first"
                 )
             with acquire(
                 self.root,
                 STATE_ROOT_CAPACITY_LOCK,
-                timeout=self.lock_timeout,
+                timeout=_bounded_lock_timeout(self.lock_timeout),
             ):
                 if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
                     raise ControlPlaneUnavailable(
@@ -2266,6 +2433,7 @@ class ControlPlane:
             and len(source["members"]) == 1
             and isinstance(owner, str)
             and TASK_PATH_RE.fullmatch(owner) is not None
+            and source.get("legacy_context_unknown") is not True
             and source.get("transient_retries") == 0
             and isinstance(result, Mapping)
             and result.get("status") == "complete"
@@ -3224,11 +3392,11 @@ class ControlPlane:
     def owner_is_managed(self, owner: str) -> bool:
         if not self.state_path.exists():
             return False
-        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
+        with self._coordinated():
             state = self._read_state()
             return any(item.get("owner") == owner for item in state["dispatches"].values())
 
-    def preflight_interrupt(self, payload: Mapping[str, Any]) -> None:
+    def preflight_interrupt(self, payload: Mapping[str, Any]) -> bool:
         tool_input = payload.get("tool_input")
         tool_use_id = payload.get("tool_use_id")
         if (
@@ -3239,6 +3407,8 @@ class ControlPlane:
         ):
             raise ControlPlaneError("interrupt input is incomplete")
         owner = tool_input["target"]
+        if not self.state_path.exists():
+            return False
         with self._coordinated():
             state = self._read_state()
             matches = [
@@ -3246,12 +3416,18 @@ class ControlPlane:
                 for item in state["dispatches"].values()
                 if item.get("owner") == owner and item["state"] in {"running", "paused"}
             ]
+            managed = any(
+                item.get("owner") == owner for item in state["dispatches"].values()
+            )
+            if not matches and not managed:
+                return False
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt target has no unique active dispatch")
             matches[0]["interrupt_tool_use_id"] = tool_use_id
             self._write_state(state)
+            return True
 
-    def postflight_interrupt(self, payload: Mapping[str, Any]) -> None:
+    def postflight_interrupt(self, payload: Mapping[str, Any]) -> bool:
         tool_use_id = payload.get("tool_use_id")
         if not isinstance(tool_use_id, str):
             raise ControlPlaneError("interrupt result has no call identity")
@@ -3265,6 +3441,8 @@ class ControlPlane:
         )
         if previous_status is None:
             raise ControlPlaneError("interrupt result has no previous native status")
+        if not self.state_path.exists():
+            return False
         with self._coordinated():
             state = self._read_state()
             matches = [
@@ -3274,7 +3452,10 @@ class ControlPlane:
                 and item.get("interrupt_tool_use_id") == tool_use_id
             ]
             if not matches:
-                return
+                return any(
+                    item.get("owner") == owner
+                    for item in state["dispatches"].values()
+                )
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt result has no unique prepared dispatch")
             dispatch = matches[0]
@@ -3287,6 +3468,7 @@ class ControlPlane:
                 self._fence_members(state, dispatch, "interrupted")
                 self._settle_wave(state)
             self._write_state(state)
+            return True
 
     def record_result(self, owner: str, raw_result: object) -> dict[str, Any]:
         result = parse_result(raw_result)
@@ -3737,7 +3919,7 @@ class ControlPlane:
     def terminal_proof(self, owner: str, result: Mapping[str, Any]) -> dict[str, Any]:
         """Return a proof-backed retired dispatch for explicit host maintenance."""
 
-        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
+        with self._coordinated():
             state = self._read_state()
             dispatch = self._find_dispatch(state, str(result.get("dispatch_id")))
             if (
