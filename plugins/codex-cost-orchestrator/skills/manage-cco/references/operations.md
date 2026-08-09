@@ -23,6 +23,7 @@ python -B scripts/control_plane.py abandon --node <node_id>
 python -B scripts/control_plane.py retry --node <node_id>
 python -B scripts/control_plane.py restart
 python -B scripts/control_plane.py cleanup
+python -B scripts/control_plane.py migrate-recoveries
 ```
 
 `continue` reads one non-empty JSON evidence delta from stdin. Its result contains
@@ -42,6 +43,12 @@ Temporary SubagentStop verification failures make the same child repeat its exac
 `cleanup` is current-task-only and refuses active or paused child work. It remains
 available when the shared lifecycle root is already over its admission limit. Run it
 only after host-card maintenance is no longer needed.
+
+`migrate-recoveries` is root-wide and does not require `CODEX_THREAD_ID`. Normal Hooks
+never parse old random recovery payloads; when they request migration, run this command
+once. It commits each valid file before reading the next. Invalid random recovery files
+are quarantined only when the state root has CCO's ownership sentinel; an unmarked shared
+root is left unchanged and fails closed.
 
 ## Static routes
 

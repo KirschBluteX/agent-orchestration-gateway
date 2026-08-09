@@ -1428,6 +1428,9 @@ class V9ControlPlaneTests(unittest.TestCase):
         recovery = self.state_root / ".cco-recovery-owned.json"
         os.replace(source.state_path, recovery)
 
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            resumed.status()
+        self.assertEqual(resumed.migrate_recoveries(), 1)
         self.assertEqual(resumed.status()["counts"]["running"], 1)
         self.assertTrue(resumed.owner_is_managed(owner))
         with self.assertRaisesRegex(ControlPlaneError, "already has CCO lifecycle proof"):
@@ -1435,6 +1438,35 @@ class V9ControlPlaneTests(unittest.TestCase):
                 self.repo,
                 self.brief([self.node("replacement", "A02", "b.txt")]),
             )
+
+    def test_recovery_migration_cli_does_not_require_a_task_session(self) -> None:
+        source = self.control("recovery-migration-cli-source")
+        source.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        random_recovery = self.state_root / ".cco-recovery-cli-random.json"
+        os.replace(source.state_path, random_recovery)
+        environment = os.environ.copy()
+        environment["CCO_STATE_DIR"] = str(self.state_root)
+        environment.pop("CODEX_THREAD_ID", None)
+
+        completed = subprocess.run(
+            [sys.executable, "-B", str(SCRIPTS / "control_plane.py"), "migrate-recoveries"],
+            cwd=self.repo,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"migrated": 1, "protocol": "cco.recovery-migration.v1"},
+        )
+        self.assertFalse(random_recovery.exists())
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
 
     def test_unrelated_high_revision_state_cannot_delete_active_recovery(self) -> None:
         source = self.control("recovery-lineage-writer")
@@ -1465,6 +1497,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             json.dumps(unrelated, separators=(",", ":"), sort_keys=True),
             encoding="utf-8",
         )
+        self.assertEqual(source.migrate_recoveries(), 1)
 
         contender = self.control("recovery-lineage-contender")
         contender.create_plan(self.repo, brief)
@@ -1585,10 +1618,8 @@ class V9ControlPlaneTests(unittest.TestCase):
             session,
         )
 
-        with self.assertRaisesRegex(
-            ControlPlaneError,
-            "multiple workspaces|unindexed lifecycle recovery requires reconciliation",
-        ):
+        self.assertEqual(active.migrate_recoveries(), 1)
+        with self.assertRaisesRegex(ControlPlaneError, "multiple workspaces"):
             active.owner_is_managed(owner)
 
         self.assertTrue(canonical_a.exists())
@@ -1682,15 +1713,11 @@ class V9ControlPlaneTests(unittest.TestCase):
         def block_authoritative_read(
             *,
             expected_workspace: object | None = None,
-            reconcile_recoveries: bool = True,
         ) -> dict[str, object]:
             read_entered.set()
             if not release_read.wait(timeout=5):
                 raise TimeoutError("test authoritative-read barrier timed out")
-            return original_read(
-                expected_workspace=expected_workspace,
-                reconcile_recoveries=reconcile_recoveries,
-            )
+            return original_read(expected_workspace=expected_workspace)
 
         def run_hook_decision() -> None:
             try:
@@ -1819,9 +1846,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             other_digest = control_plane_module._session_digest(
                 f"unrelated-recovery-session-{index}"
             )
-            recovery = self.state_root / (
-                f".cco-recovery-s{other_digest}-{index:064x}.json"
-            )
+            recovery = self.state_root / f".cco-recovery-s{other_digest}.json"
             recovery.write_text("{}", encoding="utf-8")
 
         original_load = control_plane_module._load_object
@@ -1847,6 +1872,157 @@ class V9ControlPlaneTests(unittest.TestCase):
             )
 
         self.assertEqual(interrupted.status()["counts"]["fenced"], 1)
+
+    def test_hook_fails_fast_on_random_recovery_without_loading_it(self) -> None:
+        interrupted = self.control("interrupt-random-recovery")
+        interrupted.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = interrupted.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(interrupted, native)
+        interrupted.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "random-interrupt"}
+        )
+        for index in range(control_plane_module.MAX_RECOVERY_FILES):
+            (self.state_root / f".cco-recovery-random-{index:02d}.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+        settler = self.control("interrupt-random-recovery")
+
+        original_read = control_plane_module._read_bounded_bytes
+
+        def reject_random_recovery_read(
+            path: Path,
+            label: str,
+            **kwargs: object,
+        ) -> bytes:
+            if path.name.startswith(".cco-recovery-random-"):
+                raise AssertionError("Hook parsed a random legacy recovery")
+            return original_read(path, label, **kwargs)
+
+        with (
+            patch.object(
+                control_plane_module,
+                "_read_bounded_bytes",
+                side_effect=reject_random_recovery_read,
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"),
+        ):
+            settler.postflight_interrupt(
+                {
+                    "tool_input": {"target": owner},
+                    "tool_response": {"previous_status": "running"},
+                    "tool_use_id": "random-interrupt",
+                }
+            )
+
+    def test_recovery_update_keeps_identity_and_discards_its_direct_parent(self) -> None:
+        control = self.control("mutable-recovery-identity")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(control, native)
+        parent_raw = control.state_path.read_bytes()
+        random_parent = self.state_root / ".cco-recovery-random-parent.json"
+        os.replace(control.state_path, random_parent)
+        control._state_path = None
+
+        with patch.object(control_plane_module, "MAX_STATE_FILES", 0):
+            self.assertEqual(control.migrate_recoveries(), 1)
+            recovery = next(self.state_root.glob(".cco-recovery-*.json"))
+            control._state_path = None
+            self.assertEqual(control.restart(), 1)
+            self.assertEqual(
+                list(self.state_root.glob(".cco-recovery-*.json")),
+                [recovery],
+            )
+            self.assertNotEqual(recovery.read_bytes(), parent_raw)
+
+            duplicate_parent = self.state_root / ".cco-recovery-random-duplicate.json"
+            duplicate_parent.write_bytes(parent_raw)
+            self.assertEqual(control.migrate_recoveries(), 1)
+
+        self.assertFalse(duplicate_parent.exists())
+        self.assertEqual(list(self.state_root.glob(".cco-recovery-*.json")), [recovery])
+        control._state_path = None
+        self.assertEqual(control.status()["counts"]["fenced"], 1)
+
+    def test_unmarked_invalid_random_recovery_remains_in_place(self) -> None:
+        unmarked_root = self.root / "unmarked-random-recovery"
+        unmarked_root.mkdir()
+        random_recovery = unmarked_root / ".cco-recovery-unrelated.json"
+        random_recovery.write_text('{"not":"cco"}', encoding="utf-8")
+        control = ControlPlane("unmarked-random-migration", root=unmarked_root)
+
+        with self.assertRaisesRegex(ControlPlaneError, "unmarked state root"):
+            control.migrate_recoveries()
+
+        self.assertTrue(random_recovery.exists())
+        self.assertFalse((unmarked_root / "quarantine").exists())
+
+    def test_marked_root_explicitly_quarantines_invalid_random_recovery(self) -> None:
+        owner = self.control("marked-random-recovery")
+        owner.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        self.assertGreaterEqual(owner.cleanup(), 1)
+        random_recovery = self.state_root / ".cco-recovery-invalid-random.json"
+        random_recovery.write_text('{"not":"cco"}', encoding="utf-8")
+
+        self.assertEqual(owner.migrate_recoveries(), 1)
+
+        self.assertFalse(random_recovery.exists())
+        quarantined = list((self.state_root / "quarantine").glob("*.json"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text(encoding="utf-8"), '{"not":"cco"}')
+
+    def test_explicit_recovery_migration_persists_each_completed_file(self) -> None:
+        first = self.control("incremental-recovery-first")
+        second = self.control("incremental-recovery-second")
+        for control in (first, second):
+            control.create_plan(
+                self.repo,
+                self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+            )
+        first_random = self.state_root / ".cco-recovery-a-first.json"
+        second_random = self.state_root / ".cco-recovery-z-second.json"
+        os.replace(first.state_path, first_random)
+        os.replace(second.state_path, second_random)
+        migrator = self.control("incremental-recovery-migrator")
+        original_read = control_plane_module._read_bounded_bytes
+
+        def fail_second(path: Path, label: str, **kwargs: object) -> bytes:
+            if path == second_random:
+                raise ControlPlaneUnavailable("simulated unavailable recovery")
+            return original_read(path, label, **kwargs)
+
+        with (
+            patch.object(
+                control_plane_module,
+                "_read_bounded_bytes",
+                side_effect=fail_second,
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "simulated unavailable"),
+        ):
+            migrator.migrate_recoveries()
+
+        self.assertFalse(first_random.exists())
+        self.assertTrue(second_random.exists())
+        first_digest = control_plane_module._session_digest(first.session_id)
+        self.assertTrue(
+            (self.state_root / f".cco-recovery-s{first_digest}.json").exists()
+        )
 
     def test_workspace_switch_is_rejected_before_foreign_recovery_replay(self) -> None:
         session = "workspace-switch-before-replay"
@@ -1887,7 +2063,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             self.assertRaisesRegex(
                 ControlPlaneError,
                 "lifecycle workspace changed during coordination|"
-                "unindexed lifecycle recovery requires reconciliation",
+                "legacy lifecycle recovery requires explicit migrate-recoveries",
             ),
         ):
             local.status()
@@ -1918,6 +2094,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         recovered = ControlPlane(session, root=unmarked_root)
 
         with patch.object(control_plane_module, "MAX_STATE_FILES", 1):
+            self.assertEqual(recovered.migrate_recoveries(), 1)
             self.assertEqual(recovered.status()["state"], "ready")
 
         self.assertEqual(len(list(unmarked_root.glob(".cco-recovery-*.json"))), 1)

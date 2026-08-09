@@ -60,9 +60,10 @@ interrupt ownership and settlement share one workspace-coordinated transaction i
 of consuming separate lock budgets.
 Authoritative lifecycle decisions hold the workspace and session locks. The shared
 state-root lock covers only the final path rescan and selected state load. Recovery filenames
-carry a session digest, so that scan never parses unrelated recovery payloads; older random names
-are reconciled before the authoritative lock. Recovery staging cannot appear inside that
-linearization point while unrelated workspaces remain parallel.
+carry a session digest, so that scan never parses unrelated recovery payloads. Older random
+names make Hooks fail closed without opening their payloads and require the explicit
+`migrate-recoveries` cold path. Recovery staging cannot appear inside that linearization
+point while unrelated workspaces remain parallel.
 A changed workspace identity is rejected before recovery replay. Workspace verification
 also remains outside the lifecycle locks.
 Lifecycle roots are limited to 4,096 JSON files; Git output is limited to 64 MiB and
@@ -94,8 +95,10 @@ permit only the known sibling writer scope and must show no read-scope delta.
 Legacy state migration is scanned from one directory snapshot. A duplicate left between
 the canonical write and legacy unlink is removed only when its normalized state and
 revision prove it is the same migration. The state-root ownership marker authorizes
-quarantine of arbitrary legacy JSON names; the reserved `.cco-recovery-*` namespace is
-already CCO-owned. Valid legacy lifecycle files retain lease authority without the marker.
+all invalid-file quarantine. An invalid random `.cco-recovery-*` file in an unmarked
+shared root remains in place and fails closed; a valid legacy lifecycle file retains
+lease authority without the marker. Stable recovery names bind the session, while exact
+content or a hash-proven direct-parent transition controls deduplication.
 Quarantine atomically stages the exact pathname object before validation and finalization,
 so it never performs a validation-then-unlink against a replaceable original pathname.
 

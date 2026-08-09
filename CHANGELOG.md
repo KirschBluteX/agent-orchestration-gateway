@@ -2,6 +2,16 @@
 
 The project follows semantic versioning.
 
+## 4.0.7 - 2026-08-09
+
+- Keep normal Hook paths independent of legacy random recovery payload size. Hooks fail
+  fast with one explicit maintenance command instead of parsing up to 32 old 32 MiB files.
+- Give each validated recovery one stable session-addressed pathname. Lifecycle updates
+  no longer invalidate a filename content hash, while direct-parent hashes still prove
+  safe deduplication of an older recovery.
+- Preserve invalid random recovery files in unmarked shared roots. Only an explicit
+  migration in a CCO-owned root may quarantine them.
+
 ## 4.0.6 - 2026-08-09
 
 - Give validated recovery files stable session- and content-addressed names, so a task

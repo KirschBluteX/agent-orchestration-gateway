@@ -103,6 +103,7 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py abandon --node <node_id>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py retry --node <node_id>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py restart
 python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
+python -B <PLUGIN_ROOT>/scripts/control_plane.py migrate-recoveries
 ```
 
 - `continue` reads a non-empty JSON evidence delta from stdin and returns
@@ -121,6 +122,9 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
   workspace before retrying.
 - `cleanup` deletes only the current task's inactive state and artifacts. It refuses
   active or paused child work; retain state until host-card maintenance is unnecessary.
+- `migrate-recoveries` is a root-wide, cold-path upgrade operation and does not require
+  `CODEX_THREAD_ID`. Run it only when a Hook reports an old random recovery name. It
+  persists each migrated file before reading the next, so interrupted runs make progress.
 - `status` includes compact counts and direct identities for paused, fenced, and
   owner-pending dispatches.
 
@@ -152,15 +156,17 @@ and shares one 100,000-entry budget across every Git control-directory and resol
 target. These are admission limits: CCO blocks instead of truncating evidence.
 Legacy quarantine first atomically moves the pathname to top-level recovery staging and
 validates the object actually moved. A concurrent replacement at the original path is never
-deleted. Valid recovery state receives a stable session- and content-addressed filename, remains
+deleted. Valid recovery state receives one stable session-addressed filename, remains
 lease-visible, and is replayed to its canonical pathname under that recovery's own workspace lock.
-Older random recovery names are validated and renamed outside the shared state-root lock; the
-final locked scan uses filenames only and fails closed if a new unindexed recovery appears. An
-existing canonical state is replaced or
+Normal Hooks inspect recovery filenames only. A pre-4.0.7 random recovery name causes an
+immediate fail-closed request for `migrate-recoveries`; the explicit command validates and
+renames one durable file at a time without a Hook deadline. An existing canonical state is replaced or
 finalized only when exact content or a hash-proven direct parent transition establishes
 its lineage; invalid state moves to content-addressed quarantine only after the durable
-object is available. The ownership sentinel authorizes quarantine of arbitrary legacy
-JSON names; the reserved `.cco-recovery-*` namespace is already CCO-owned. Recovery state
+object is available. The ownership sentinel authorizes every invalid-file quarantine,
+including old `.cco-recovery-*` names. An invalid random recovery in an unmarked shared
+root remains untouched and blocks migration. Valid recovery state does not require the
+sentinel to preserve its lease. Recovery state
 from another workspace or plan can never replace the
 current session's canonical state; the operation preserves both and fails closed. The
 sentinel never controls valid recovery replay.

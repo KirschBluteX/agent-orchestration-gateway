@@ -26,7 +26,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertRegex(manifest["version"], r"^4\.0\.6\+codex\.[a-z0-9.-]+$")
+        self.assertRegex(manifest["version"], r"^4\.0\.7\+codex\.[a-z0-9.-]+$")
         self.assertEqual(manifest["author"]["name"], "KirschQAQ")
         self.assertEqual(
             manifest["repository"],
@@ -39,9 +39,9 @@ class ProjectContractTests(unittest.TestCase):
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
         installer = text(PLUGIN / "scripts" / "install_agents.py")
         changelog = text(ROOT / "CHANGELOG.md")
-        self.assertIn('PLUGIN_VERSION = "4.0.6"', installer)
-        self.assertRegex(manifest["version"], r"^4\.0\.6\+")
-        self.assertRegex(changelog, r"(?m)^## 4\.0\.6 - ")
+        self.assertIn('PLUGIN_VERSION = "4.0.7"', installer)
+        self.assertRegex(manifest["version"], r"^4\.0\.7\+")
+        self.assertRegex(changelog, r"(?m)^## 4\.0\.7 - ")
 
     def test_two_thin_skills_use_progressive_disclosure(self) -> None:
         hot = text(ORCHESTRATE / "SKILL.md")
@@ -53,7 +53,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("one long `wait_agent`", hot)
         self.assertIn("$codex-cost-orchestrator:manage-cco", hot)
         self.assertNotIn("repair_host_edges", hot)
-        self.assertNotIn("migration", cold.casefold())
+        self.assertIn("migrate-recoveries", cold)
         self.assertIn("allow_implicit_invocation: true", text(ORCHESTRATE / "agents" / "openai.yaml"))
         self.assertIn("allow_implicit_invocation: false", text(MANAGE / "agents" / "openai.yaml"))
 

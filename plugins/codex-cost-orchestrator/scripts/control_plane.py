@@ -108,7 +108,7 @@ EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{64})\.json$")
 RECOVERY_FILE_RE = re.compile(r"^\.cco-recovery-[A-Za-z0-9_-]+\.json$")
 SESSION_RECOVERY_FILE_RE = re.compile(
-    r"^\.cco-recovery-s(?P<session>[0-9a-f]{64})-(?P<content>[0-9a-f]{64})\.json$"
+    r"^\.cco-recovery-s(?P<session>[0-9a-f]{64})\.json$"
 )
 STATE_ROOT_SENTINEL = ".cco-state-root-v1"
 STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
@@ -178,11 +178,8 @@ def _lifecycle_state_path(root: Path, workspace: object, session_id: str) -> Pat
     return root / f"{_workspace_digest(workspace)}--{_session_digest(session_id)}.json"
 
 
-def _lifecycle_recovery_path(root: Path, session_id: str, raw: bytes) -> Path:
-    return root / (
-        f".cco-recovery-s{_session_digest(session_id)}-"
-        f"{hashlib.sha256(raw).hexdigest()}.json"
-    )
+def _lifecycle_recovery_path(root: Path, session_id: str) -> Path:
+    return root / f".cco-recovery-s{_session_digest(session_id)}.json"
 
 
 def _lifecycle_lineage_id(
@@ -231,6 +228,29 @@ def _path_identity(path: Path, label: str) -> tuple[int, int, int, int, int, int
         stat.st_mtime_ns,
         stat.st_ctime_ns,
     )
+
+
+def _lineage_relation(
+    current: Mapping[str, Any],
+    current_raw: bytes,
+    candidate: Mapping[str, Any],
+    candidate_raw: bytes,
+) -> str:
+    if current == candidate:
+        return "same"
+    if (
+        current.get("lineage_id") == candidate.get("lineage_id")
+        and current.get("revision") == candidate.get("revision", -2) + 1
+        and current.get("parent_state_sha256") == _state_content_id(candidate_raw)
+    ):
+        return "current_child"
+    if (
+        current.get("lineage_id") == candidate.get("lineage_id")
+        and candidate.get("revision") == current.get("revision", -2) + 1
+        and candidate.get("parent_state_sha256") == _state_content_id(current_raw)
+    ):
+        return "candidate_child"
+    return "conflict"
 
 
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -1310,28 +1330,36 @@ class ControlPlane:
     def _publish_session_recovery(
         self,
         path: Path,
-        state: Mapping[str, Any],
+        state: dict[str, Any],
         raw: bytes,
-    ) -> Path:
+    ) -> tuple[Path, dict[str, Any]]:
         """Give a validated recovery a stable session-addressable name."""
 
-        target = _lifecycle_recovery_path(self.root, str(state["session_id"]), raw)
+        target = _lifecycle_recovery_path(self.root, str(state["session_id"]))
         if path == target:
-            return path
+            return path, state
         identity = _path_identity(path, "lifecycle recovery")
+        current: dict[str, Any] | None = None
+        current_raw: bytes | None = None
         target_identity: tuple[int, int, int, int, int, int] | None = None
         if target.exists():
-            if _read_bounded_bytes(target, "indexed lifecycle recovery") != raw:
-                raise ControlPlaneError("lifecycle recovery identity collision")
+            current_raw = _read_bounded_bytes(target, "indexed lifecycle recovery")
+            current = self._validate_lifecycle_state(
+                _decode_object(current_raw, "indexed lifecycle recovery"),
+                expected_session=str(state["session_id"]),
+            )
             target_identity = _path_identity(target, "indexed lifecycle recovery")
+        relation = (
+            _lineage_relation(current, current_raw, state, raw)
+            if current is not None and current_raw is not None
+            else None
+        )
         with acquire(
             self.root,
             STATE_ROOT_LOCK,
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
             if not path.exists():
-                if target.exists():
-                    return target
                 raise ControlPlaneUnavailable("lifecycle recovery disappeared during indexing")
             if _path_identity(path, "lifecycle recovery") != identity:
                 raise ControlPlaneUnavailable("lifecycle recovery changed during indexing")
@@ -1344,24 +1372,47 @@ class ControlPlane:
                     raise ControlPlaneUnavailable(
                         "indexed lifecycle recovery changed during deduplication"
                     )
+                if relation == "conflict":
+                    raise ControlPlaneError("conflicting lifecycle recovery")
                 try:
+                    if relation == "candidate_child":
+                        os.replace(path, target)
+                        return target, state
                     path.unlink()
                 except OSError as error:
                     raise ControlPlaneUnavailable(
                         "lifecycle recovery indexing finalization failed"
                     ) from error
-                return target
+                if current is None:
+                    raise ControlPlaneUnavailable("indexed lifecycle recovery is unavailable")
+                return target, current
+            if target_identity is not None:
+                raise ControlPlaneUnavailable(
+                    "indexed lifecycle recovery disappeared during deduplication"
+                )
             try:
                 os.replace(path, target)
             except OSError as error:
                 raise ControlPlaneUnavailable(
                     "lifecycle recovery indexing failed"
                 ) from error
-        return target
+        return target, state
 
-    def _normalize_recovery_names(self, legacy_recoveries: list[Path]) -> None:
-        """Migrate old random recovery names without parsing under the root lock."""
+    def migrate_recoveries(self) -> int:
+        """Explicitly migrate legacy recovery names one durable file at a time."""
 
+        with acquire(
+            self.root,
+            STATE_ROOT_LOCK,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
+        ):
+            legacy_recoveries = [
+                path
+                for path in _state_json_paths(self.root)
+                if RECOVERY_FILE_RE.fullmatch(path.name) is not None
+                and SESSION_RECOVERY_FILE_RE.fullmatch(path.name) is None
+            ]
+        migrated = 0
         for path in legacy_recoveries:
             try:
                 raw = _read_bounded_bytes(path, "legacy lifecycle recovery")
@@ -1371,11 +1422,18 @@ class ControlPlane:
             except ControlPlaneUnavailable:
                 raise
             except ControlPlaneError:
+                if not self._state_root_is_marked():
+                    raise ControlPlaneError(
+                        "unmarked state root contains invalid legacy recovery"
+                    )
                 self._quarantine_legacy_state(path)
+                migrated += 1
                 continue
             self._publish_session_recovery(path, state, raw)
+            migrated += 1
+        return migrated
 
-    def _resolve_state_path(self, *, reconcile_recoveries: bool) -> Path:
+    def _resolve_state_path(self) -> Path:
         if self._state_path is not None and self._state_path.exists():
             return self._state_path
         self._state_path = None
@@ -1387,21 +1445,9 @@ class ControlPlane:
         ):
             matches, unindexed = _session_state_paths(self.root, self.session_id)
         if unindexed:
-            if not reconcile_recoveries:
-                raise ControlPlaneUnavailable(
-                    "unindexed lifecycle recovery requires reconciliation"
-                )
-            self._normalize_recovery_names(unindexed)
-            with acquire(
-                self.root,
-                STATE_ROOT_LOCK,
-                timeout=_bounded_lock_timeout(self.lock_timeout),
-            ):
-                matches, unindexed = _session_state_paths(self.root, self.session_id)
-            if unindexed:
-                raise ControlPlaneUnavailable(
-                    "unindexed lifecycle recovery requires reconciliation"
-                )
+            raise ControlPlaneUnavailable(
+                "legacy lifecycle recovery requires explicit migrate-recoveries"
+            )
         indexed = [path for path in matches if STATE_FILE_RE.fullmatch(path.name)]
         recovery = [path for path in matches if RECOVERY_FILE_RE.fullmatch(path.name)]
         if len(indexed) > 1:
@@ -1453,7 +1499,7 @@ class ControlPlane:
     def state_path(self) -> Path:
         """Resolve this task's state without parsing another task's recovery."""
 
-        return self._resolve_state_path(reconcile_recoveries=True)
+        return self._resolve_state_path()
 
     @staticmethod
     def _validate_lifecycle_state(
@@ -1655,10 +1701,7 @@ class ControlPlane:
                     # publication, then release the root-wide lock before any
                     # workspace-local computation or persistence.
                     self._state_path = None
-                    state = self._read_state(
-                        expected_workspace=workspace_key,
-                        reconcile_recoveries=False,
-                    )
+                    state = self._read_state(expected_workspace=workspace_key)
                 yield state
 
     @staticmethod
@@ -1775,12 +1818,7 @@ class ControlPlane:
     ) -> list[tuple[Path, dict[str, Any]]]:
         """Atomically isolate invalid legacy state inside a marked CCO root."""
 
-        # The sentinel protects arbitrary JSON in a shared custom directory.
-        # The reserved recovery namespace is itself proof that CCO created the file.
-        if (
-            not self._state_root_is_marked()
-            and RECOVERY_FILE_RE.fullmatch(path.name) is None
-        ):
+        if not self._state_root_is_marked():
             return []
         reservation: Path | None = None
         with acquire(
@@ -1835,7 +1873,11 @@ class ControlPlane:
             staged_state = None
 
         if staged_state is not None:
-            staging = self._publish_session_recovery(staging, staged_state, raw)
+            staging, staged_state = self._publish_session_recovery(
+                staging,
+                staged_state,
+                raw,
+            )
             recovered = [(staging, staged_state)]
             if path.exists():
                 try:
@@ -1932,20 +1974,13 @@ class ControlPlane:
                         ),
                         expected_session=state["session_id"],
                     )
-                    same_state = current == recovery
-                    current_is_child = (
-                        current["lineage_id"] == recovery["lineage_id"]
-                        and current["revision"] == recovery["revision"] + 1
-                        and current.get("parent_state_sha256")
-                        == _state_content_id(recovery_raw)
+                    relation = _lineage_relation(
+                        current,
+                        current_raw,
+                        recovery,
+                        recovery_raw,
                     )
-                    recovery_is_child = (
-                        current["lineage_id"] == recovery["lineage_id"]
-                        and recovery["revision"] == current["revision"] + 1
-                        and recovery.get("parent_state_sha256")
-                        == _state_content_id(current_raw)
-                    )
-                    if same_state or current_is_child:
+                    if relation in {"same", "current_child"}:
                         if _read_bounded_bytes(
                             path,
                             "recoverable cco.v9 lifecycle state",
@@ -1960,7 +1995,7 @@ class ControlPlane:
                                 "lifecycle recovery finalization failed"
                             ) from error
                         return canonical, current
-                    if recovery_is_child:
+                    if relation == "candidate_child":
                         if (
                             _read_bounded_bytes(
                                 canonical,
@@ -2115,11 +2150,8 @@ class ControlPlane:
         self,
         *,
         expected_workspace: object | None = None,
-        reconcile_recoveries: bool = True,
     ) -> dict[str, Any]:
-        source = self._resolve_state_path(
-            reconcile_recoveries=reconcile_recoveries,
-        )
+        source = self._resolve_state_path()
         raw_state = _load_object(source, "cco.v9 lifecycle state")
         state = self._validate_lifecycle_state(
             raw_state,
@@ -4121,13 +4153,18 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("status")
     sub.add_parser("restart")
     sub.add_parser("cleanup")
+    sub.add_parser("migrate-recoveries")
     return root
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
-        control = ControlPlane(_session_arg())
+        if args.command == "migrate-recoveries":
+            session = os.environ.get("CODEX_THREAD_ID") or "cco-recovery-migration"
+        else:
+            session = _session_arg()
+        control = ControlPlane(session)
         if args.command == "prepare":
             if args.capacity < 1:
                 raise ControlPlaneError("native capacity must be a positive integer")
@@ -4159,6 +4196,11 @@ def main() -> int:
             result = {"interrupted": control.restart(), "protocol": "cco.restart.v1"}
         elif args.command == "cleanup":
             result = {"protocol": "cco.cleanup.v1", "removed": control.cleanup()}
+        elif args.command == "migrate-recoveries":
+            result = {
+                "migrated": control.migrate_recoveries(),
+                "protocol": "cco.recovery-migration.v1",
+            }
         else:
             result = control.status()
     except (
