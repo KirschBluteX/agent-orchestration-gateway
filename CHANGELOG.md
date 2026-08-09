@@ -2,6 +2,15 @@
 
 The project follows semantic versioning.
 
+## 4.0.4 - 2026-08-09
+
+- Serialize recovery publication with the complete authoritative lifecycle decision,
+  preventing a repaired foreign lifecycle from appearing after the locked rescan but
+  before a Hook uses the selected state.
+- Merge coordination and authoritative state loading into one context, removing repeated
+  lock-and-read boilerplate across lifecycle operations.
+- Remove the duplicate scope-overlap implementation so one helper owns that rule.
+
 ## 4.0.3 - 2026-08-09
 
 - Fail closed when one Codex session has indexed and recovery state from different

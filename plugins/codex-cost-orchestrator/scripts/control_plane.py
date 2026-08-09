@@ -109,7 +109,9 @@ STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{
 RECOVERY_FILE_RE = re.compile(r"^\.cco-recovery-[A-Za-z0-9_-]+\.json$")
 STATE_ROOT_SENTINEL = ".cco-state-root-v1"
 STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
-STATE_ROOT_CAPACITY_LOCK = "state-root-capacity"
+# Capacity reservation and recovery publication share this existing root lock.
+# Keep its persisted identity stable across plugin upgrades.
+STATE_ROOT_LOCK = "state-root-capacity"
 MAX_STATE_FILE_BYTES = 32 * 1024 * 1024
 MAX_STATE_FILES = 4_096
 MAX_RECOVERY_FILES = 32
@@ -1213,17 +1215,6 @@ def _reader_active(dispatch: Mapping[str, Any], *, now: int | None = None) -> bo
     )
 
 
-def _scopes_overlap(
-    left: list[Mapping[str, str]],
-    right: list[Mapping[str, str]],
-) -> bool:
-    return any(
-        repository_scopes_overlap(left_scope, right_scope)
-        for left_scope in left
-        for right_scope in right
-    )
-
-
 class ControlPlane:
     """One deep interface for cco.v9 plan, wave, and lifecycle behavior."""
 
@@ -1306,7 +1297,7 @@ class ControlPlane:
         legacy = self.root / f"{self.session_id}.json"
         with acquire(
             self.root,
-            STATE_ROOT_CAPACITY_LOCK,
+            STATE_ROOT_LOCK,
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
             matches = _session_state_paths(self.root, self.session_id)
@@ -1527,8 +1518,11 @@ class ControlPlane:
         return str(state["workspace_root"])
 
     @contextmanager
-    def _coordinated(self, workspace_root: object | None = None) -> Iterator[None]:
-        """Serialize lease-affecting state changes for one canonical workspace."""
+    def _coordinated_state(
+        self,
+        workspace_root: object | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Load state while its workspace, session, and publication stay stable."""
 
         workspace = self._workspace_hint() if workspace_root is None else workspace_root
         workspace_key = _workspace_key(workspace)
@@ -1545,16 +1539,21 @@ class ControlPlane:
             timeout=remaining(),
         ):
             with acquire(self.root, self.session_id, timeout=remaining()):
-                # Resolve again only after both locks are held. A newly visible
-                # recovery may fail closed, but it cannot switch this operation to
-                # another workspace after admission locking was chosen.
-                self._state_path = None
-                locked_workspace = self._workspace_hint()
-                if _workspace_key(locked_workspace) != workspace_key:
-                    raise ControlPlaneError(
-                        "lifecycle workspace changed during coordination"
-                    )
-                yield
+                with acquire(
+                    self.root,
+                    STATE_ROOT_LOCK,
+                    timeout=remaining(),
+                ):
+                    # The root lock also serializes recovery publication. Keep it
+                    # through the authoritative decision so a repaired lifecycle
+                    # cannot appear between the locked rescan and state use.
+                    self._state_path = None
+                    state = self._read_state()
+                    if _workspace_key(state["workspace_root"]) != workspace_key:
+                        raise ControlPlaneError(
+                            "lifecycle workspace changed during coordination"
+                        )
+                    yield state
 
     @staticmethod
     def _reconcile_expired_claims(state: dict[str, Any], *, now: int | None = None) -> bool:
@@ -1589,8 +1588,7 @@ class ControlPlane:
             state["logical"][member]["state"] = "starting"
 
     def _rollback_native_claim(self, dispatch_id: str, tool_use_id: str) -> None:
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, dispatch_id)
             if (
                 dispatch.get("state") != "starting"
@@ -1612,8 +1610,7 @@ class ControlPlane:
     def _discard_stale_unstarted_wave(self, dispatch_id: str, tool_use_id: str) -> bool:
         """Discard a baseline that never reached a native child and can be recaptured."""
 
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, dispatch_id)
             if (
                 dispatch.get("state") != "starting"
@@ -1677,7 +1674,7 @@ class ControlPlane:
         reservation: Path | None = None
         with acquire(
             self.root,
-            STATE_ROOT_CAPACITY_LOCK,
+            STATE_ROOT_LOCK,
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
             recovery_count = sum(
@@ -1792,7 +1789,7 @@ class ControlPlane:
         ):
             with acquire(
                 self.root,
-                STATE_ROOT_CAPACITY_LOCK,
+                STATE_ROOT_LOCK,
                 timeout=_bounded_lock_timeout(self.lock_timeout),
             ):
                 recovery_raw = _read_bounded_bytes(
@@ -2226,8 +2223,7 @@ class ControlPlane:
         plan = {**unsigned, "plan_id": plan_id}
         plan_path = self._artifact_path("plan", plan_id)
         if self.state_path.exists():
-            with self._coordinated():
-                state = self._read_state()
+            with self._coordinated_state() as state:
                 if (
                     resume_identical
                     and state.get("plan_id") == plan_id
@@ -2261,7 +2257,7 @@ class ControlPlane:
                 )
             with acquire(
                 self.root,
-                STATE_ROOT_CAPACITY_LOCK,
+                STATE_ROOT_LOCK,
                 timeout=_bounded_lock_timeout(self.lock_timeout),
             ):
                 if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
@@ -2654,8 +2650,7 @@ class ControlPlane:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
             raise ControlPlaneError("native capacity must be a positive integer")
         catalog = load_native_catalog() if native_catalog is None else native_catalog
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             reconciled = self._reconcile_expired_claims(state)
             plan = self._read_plan(state)
             if state["active_wave_id"] is not None:
@@ -2815,8 +2810,7 @@ class ControlPlane:
             writable=any(unit["role"] == "worker" for unit in selected),
         )
 
-        with self._coordinated(workspace_root):
-            state = self._read_state()
+        with self._coordinated_state(workspace_root) as state:
             if self._reconcile_expired_claims(state):
                 self._write_state(state)
                 raise ControlPlaneError(
@@ -2946,8 +2940,7 @@ class ControlPlane:
     ) -> None:
         """Run the shared two-phase admission around lock-free workspace verification."""
 
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             if self._reconcile_expired_claims(state):
                 self._write_state(state)
             dispatch, wave, allowed = claim(state)
@@ -2993,8 +2986,7 @@ class ControlPlane:
             self._rollback_native_claim(dispatch_id, tool_use_id)
             raise ControlPlaneError(str(error)) from error
         try:
-            with self._coordinated():
-                state = self._read_state()
+            with self._coordinated_state() as state:
                 if state["revision"] != claim_revision:
                     raise ControlPlaneError(
                         "lifecycle changed while verifying the native admission"
@@ -3320,8 +3312,7 @@ class ControlPlane:
             dispatch_id = parse_continue_message(message)["dispatch_id"]
         else:
             raise ControlPlaneError("native tool result is not CCO-owned")
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, dispatch_id)
             if dispatch["state"] == "retired":
                 return
@@ -3376,8 +3367,7 @@ class ControlPlane:
     def prepare_continuation(self, dispatch_id: str, evidence_delta: object) -> dict[str, Any]:
         if not isinstance(evidence_delta, Mapping) or not evidence_delta:
             raise ControlPlaneError("continuation requires a non-empty evidence object")
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, dispatch_id)
             if dispatch["state"] != "paused" or not isinstance(dispatch.get("owner"), str):
                 raise ControlPlaneError("dispatch is not continuable")
@@ -3409,8 +3399,7 @@ class ControlPlane:
     def owner_is_managed(self, owner: str) -> bool:
         if not self.state_path.exists():
             return False
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             return any(item.get("owner") == owner for item in state["dispatches"].values())
 
     def preflight_interrupt(self, payload: Mapping[str, Any]) -> bool:
@@ -3426,8 +3415,7 @@ class ControlPlane:
         owner = tool_input["target"]
         if not self.state_path.exists():
             return False
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             matches = [
                 item
                 for item in state["dispatches"].values()
@@ -3460,8 +3448,7 @@ class ControlPlane:
             raise ControlPlaneError("interrupt result has no previous native status")
         if not self.state_path.exists():
             return False
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             matches = [
                 item
                 for item in state["dispatches"].values()
@@ -3560,8 +3547,7 @@ class ControlPlane:
             )
             return dispatch, plan, nodes, wave, allowed
 
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             owner_was_pending = self._find_dispatch(
                 state, result["dispatch_id"]
             ).get("owner") is None
@@ -3591,8 +3577,7 @@ class ControlPlane:
         if role != "worker" and actual:
             raise ControlPlaneError("read-only child changed its declared scope")
 
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch, plan, nodes, _wave, _allowed = claim(state)
             if dispatch.get("pending_cursor") is not None:
                 dispatch["cursor"] = dispatch["pending_cursor"]
@@ -3748,8 +3733,7 @@ class ControlPlane:
 
         if kind not in NATIVE_FAILURE_KINDS:
             raise ControlPlaneError("native failure kind is invalid")
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, dispatch_id)
             if dispatch["state"] == "paused":
                 raise ControlPlaneError("native failure has no unsettled native call")
@@ -3772,8 +3756,7 @@ class ControlPlane:
             return result
 
     def fence_invalid_result(self, owner: str, reason: str = "invalid_result") -> None:
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             matches = [
                 item
                 for item in state["dispatches"].values()
@@ -3796,8 +3779,7 @@ class ControlPlane:
     def restart(self) -> int:
         if not self.state_path.exists():
             return 0
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             count = 0
             for dispatch in state["dispatches"].values():
                 if dispatch["state"] in ACTIVE_STATES or _native_claim_active(dispatch):
@@ -3809,8 +3791,7 @@ class ControlPlane:
             return count
 
     def abandon(self, node_id: str) -> None:
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             logical = state["logical"].get(node_id)
             if not isinstance(logical, dict) or logical["state"] != "paused":
                 raise ControlPlaneError("only a paused node can be abandoned")
@@ -3820,8 +3801,7 @@ class ControlPlane:
             self._write_state(state)
 
     def retry(self, node_id: str) -> None:
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             plan = self._read_plan(state)
             logical = state["logical"].get(node_id)
             if not isinstance(logical, dict) or logical["state"] != "fenced":
@@ -3842,8 +3822,7 @@ class ControlPlane:
             self._write_state(state)
 
     def status(self) -> dict[str, Any]:
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             if self._reconcile_expired_claims(state):
                 self._write_state(state)
             plan = self._read_plan(state)
@@ -3902,15 +3881,21 @@ class ControlPlane:
     def cleanup(self) -> int:
         """Remove only this task's inactive v9 state and immutable artifacts."""
 
-        removed = 0
-        coordination = (
-            self._coordinated()
-            if self.state_path.exists()
-            else acquire(self.root, self.session_id, timeout=self.lock_timeout)
-        )
-        with coordination:
-            if self.state_path.exists():
-                state = self._read_state()
+        def remove_artifacts() -> int:
+            removed = 0
+            artifacts = self.root / "artifacts"
+            if artifacts.is_dir():
+                for kind in ("plan", "wave"):
+                    for path in artifacts.glob(f"{self.session_id}-{kind}-*.json"):
+                        try:
+                            path.unlink()
+                            removed += 1
+                        except FileNotFoundError:
+                            pass
+            return removed
+
+        if self.state_path.exists():
+            with self._coordinated_state() as state:
                 if self._reconcile_expired_claims(state):
                     self._write_state(state)
                 if any(
@@ -3921,23 +3906,20 @@ class ControlPlane:
                         "active or paused child work must settle or be abandoned before cleanup"
                     )
                 self.state_path.unlink()
-                removed += 1
-            artifacts = self.root / "artifacts"
-            if artifacts.is_dir():
-                for kind in ("plan", "wave"):
-                    for path in artifacts.glob(f"{self.session_id}-{kind}-*.json"):
-                        try:
-                            path.unlink()
-                            removed += 1
-                        except FileNotFoundError:
-                            pass
-        return removed
+                return 1 + remove_artifacts()
+
+        with acquire(self.root, self.session_id, timeout=self.lock_timeout):
+            self._state_path = None
+            if self.state_path.exists():
+                raise ControlPlaneUnavailable(
+                    "lifecycle appeared during cleanup; retry the operation"
+                )
+            return remove_artifacts()
 
     def terminal_proof(self, owner: str, result: Mapping[str, Any]) -> dict[str, Any]:
         """Return a proof-backed retired dispatch for explicit host maintenance."""
 
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, str(result.get("dispatch_id")))
             if (
                 dispatch.get("owner") != owner
@@ -3958,8 +3940,7 @@ class ControlPlane:
     def stop_reason(self) -> str | None:
         if not self.state_path.exists():
             return None
-        with self._coordinated():
-            state = self._read_state()
+        with self._coordinated_state() as state:
             if self._reconcile_expired_claims(state):
                 self._write_state(state)
             if any(

@@ -1633,6 +1633,85 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(candidates, [])
         self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
 
+    def test_recovery_publication_waits_for_authoritative_hook_decision(self) -> None:
+        session = "recovery-publication-linearized"
+        local = self.control(session)
+        local.create_plan(
+            self.repo,
+            self.brief([self.node("local", "A01", "a.txt", role="explorer")]),
+        )
+
+        other_repo = self.root / "publication-other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        foreign = ControlPlane(session, root=self.root / "publication-foreign-root")
+        foreign.create_plan(
+            other_repo,
+            self.brief([self.node("foreign", "A02", "other.txt")]),
+        )
+        foreign_native = foreign.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, foreign_owner = self.start_dispatch(foreign, foreign_native)
+        repaired = foreign.state_path.read_bytes()
+
+        hook_control = self.control(session)
+        publisher = self.control("recovery-publication-scanner")
+        legacy = self.state_root / f"{session}.json"
+        read_entered = threading.Event()
+        release_read = threading.Event()
+        published = threading.Event()
+        errors: list[BaseException] = []
+        managed: list[bool] = []
+        original_read = hook_control._read_state
+
+        def block_authoritative_read() -> dict[str, object]:
+            read_entered.set()
+            if not release_read.wait(timeout=5):
+                raise TimeoutError("test authoritative-read barrier timed out")
+            return original_read()
+
+        def run_hook_decision() -> None:
+            try:
+                managed.append(hook_control.owner_is_managed(foreign_owner))
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        def publish_recovery() -> None:
+            try:
+                legacy.write_bytes(repaired)
+                publisher._quarantine_legacy_state(legacy)
+                published.set()
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        with patch.object(hook_control, "_read_state", side_effect=block_authoritative_read):
+            hook_thread = threading.Thread(target=run_hook_decision)
+            hook_thread.start()
+            self.assertTrue(read_entered.wait(timeout=5))
+            publication_thread = threading.Thread(target=publish_recovery)
+            publication_thread.start()
+            try:
+                self.assertFalse(
+                    published.wait(timeout=0.2),
+                    "recovery publication overtook the authoritative Hook decision",
+                )
+            finally:
+                release_read.set()
+            hook_thread.join(timeout=5)
+            publication_thread.join(timeout=5)
+
+        self.assertFalse(hook_thread.is_alive())
+        self.assertFalse(publication_thread.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ControlPlaneError)
+        self.assertIn("conflicting lifecycle state", str(errors[0]))
+        self.assertEqual(managed, [])
+        self.assertTrue(published.is_set())
+
     def test_unmarked_full_root_keeps_valid_recovery_in_its_existing_slot(self) -> None:
         other_repo = self.root / "unmarked-recovery-repo"
         other_repo.mkdir()
@@ -1708,8 +1787,7 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         def update_owner() -> None:
             try:
-                with writer._coordinated():
-                    state = writer._read_state()
+                with writer._coordinated_state() as state:
                     state["epoch"] = 99
                     writer._write_state(state)
                 writer_done.set()

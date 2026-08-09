@@ -159,6 +159,10 @@ its lineage; invalid state moves to content-addressed quarantine only after the 
 object is available. Recovery state from another workspace or plan can never replace the
 current session's canonical state; the operation preserves both and fails closed. The
 ownership sentinel authorizes invalid-file quarantine only, not valid recovery replay.
+The same state-root lock serializes capacity changes and recovery publication. An
+authoritative lifecycle operation holds it together with the canonical workspace and
+session locks from its final state reload through its decision or state update; bounded
+workspace verification still runs outside these locks.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
