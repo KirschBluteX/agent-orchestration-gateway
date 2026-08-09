@@ -170,6 +170,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         environment = os.environ.copy()
         environment["CCO_STATE_DIR"] = str(self.state_root)
         environment["CODEX_THREAD_ID"] = "duplicate-input"
+        environment["PATH"] = ""
         command = SCRIPTS / "control_plane.py"
         duplicate = (
             '{"goal":"first","goal":"second","acceptance":{"A01":"criterion"},'

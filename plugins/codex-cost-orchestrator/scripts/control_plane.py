@@ -3146,12 +3146,12 @@ def main() -> int:
         if args.command == "prepare":
             if args.capacity < 1:
                 raise ControlPlaneError("native capacity must be a positive integer")
+            brief = _prepare_brief(_stdin_json())
             catalog = (
                 _load_object(args.catalog, "native catalogue")
                 if args.catalog
                 else load_native_catalog()
             )
-            brief = _prepare_brief(_stdin_json())
             control.create_plan(args.repo, brief, resume_identical=True)
             result = control.next_wave(
                 capacity=args.capacity,
