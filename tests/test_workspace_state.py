@@ -8,6 +8,19 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
+
+
+SCRIPTS = (
+    Path(__file__).resolve().parents[1]
+    / "plugins"
+    / "codex-cost-orchestrator"
+    / "scripts"
+)
+sys.path.insert(0, str(SCRIPTS))
+
+import workspace_state as workspace_state_module  # noqa: E402
+from workspace_state import StateUnavailable  # noqa: E402
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -21,6 +34,42 @@ STATE_TOOL = (
 
 
 class WorkspaceStateBehaviorTests(unittest.TestCase):
+    def test_head_oid_rejects_an_unexpected_git_failure(self) -> None:
+        failed = subprocess.CompletedProcess(
+            ["git", "rev-parse"],
+            128,
+            stdout=b"",
+            stderr=b"fatal: temporary failure",
+        )
+        with (
+            mock.patch.object(workspace_state_module, "_run_git", return_value=failed),
+            self.assertRaises(StateUnavailable),
+        ):
+            workspace_state_module.head_oid(Path("unused"))
+
+    def test_head_oid_accepts_only_an_explicit_unborn_symbolic_ref(self) -> None:
+        results = [
+            subprocess.CompletedProcess(["git"], 1, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(
+                ["git"], 0, stdout=b"refs/heads/main\n", stderr=b""
+            ),
+            subprocess.CompletedProcess(["git"], 1, stdout=b"", stderr=b""),
+        ]
+        with mock.patch.object(
+            workspace_state_module,
+            "_run_git",
+            side_effect=results,
+        ):
+            self.assertIsNone(workspace_state_module.head_oid(Path("unused")))
+
+    def test_head_oid_accepts_a_real_unborn_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir) / "unborn"
+            repo.mkdir()
+            self.assertEqual(self.git(repo, "init").returncode, 0)
+
+            self.assertIsNone(workspace_state_module.head_oid(repo))
+
     def git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args],

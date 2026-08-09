@@ -237,8 +237,7 @@ def _read_bounded_bytes(
     return bytes(raw)
 
 
-def _load_object(path: Path, label: str) -> dict[str, Any]:
-    raw = _read_bounded_bytes(path, label)
+def _decode_object(raw: bytes, label: str) -> dict[str, Any]:
     checkpoint()
     try:
         value = json.loads(
@@ -258,6 +257,24 @@ def _load_object(path: Path, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ControlPlaneError(f"{label} is malformed")
     return value
+
+
+def _load_object(path: Path, label: str) -> dict[str, Any]:
+    return _decode_object(_read_bounded_bytes(path, label), label)
+
+
+def _same_file_version(left: os.stat_result, right: os.stat_result) -> bool:
+    return os.path.samestat(left, right) and (
+        left.st_mode,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_mode,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1131,7 +1148,9 @@ class ControlPlane:
                     self._validate_lifecycle_state(
                         _load_object(path, "legacy cco.v9 lifecycle state")
                     )
-                except (ControlPlaneError, ControlPlaneUnavailable):
+                except ControlPlaneUnavailable:
+                    raise
+                except ControlPlaneError:
                     return
         try:
             descriptor = os.open(
@@ -1413,7 +1432,29 @@ class ControlPlane:
 
         if not self._state_root_is_marked():
             return
+        try:
+            before = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
         raw = _read_bounded_bytes(path, "legacy lifecycle state")
+        try:
+            after_read = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
+        if not _same_file_version(before, after_read):
+            return
+        try:
+            self._validate_lifecycle_state(
+                _decode_object(raw, "legacy cco.v9 lifecycle state")
+            )
+        except ControlPlaneError:
+            pass
+        else:
+            return
         quarantine = self.root / "quarantine"
         quarantine.mkdir(parents=True, exist_ok=True)
         name_identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
@@ -1440,6 +1481,35 @@ class ControlPlane:
                 destination.unlink(missing_ok=True)
                 raise
         try:
+            before_unlink = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
+        if not _same_file_version(before, before_unlink):
+            return
+        current = _read_bounded_bytes(path, "legacy lifecycle state")
+        try:
+            after_reread = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
+        if (
+            current != raw
+            or not _same_file_version(before_unlink, after_reread)
+            or not _same_file_version(before, after_reread)
+        ):
+            return
+        try:
+            self._validate_lifecycle_state(
+                _decode_object(current, "legacy cco.v9 lifecycle state")
+            )
+        except ControlPlaneError:
+            pass
+        else:
+            return
+        try:
             path.unlink()
         except FileNotFoundError:
             pass
@@ -1458,13 +1528,11 @@ class ControlPlane:
                 "lifecycle state directory is unavailable"
             ) from error
         indexed: list[Path] = []
-        marked = self._state_root_is_marked()
         legacy: list[Path] = []
         for path in snapshot:
             match = STATE_FILE_RE.fullmatch(path.name)
             if match is None:
-                if marked:
-                    legacy.append(path)
+                legacy.append(path)
                 continue
             if match.group("workspace") == workspace_digest:
                 indexed.append(path)

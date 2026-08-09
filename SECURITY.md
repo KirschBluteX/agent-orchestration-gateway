@@ -77,7 +77,8 @@ leaves may run beside a non-overlapping writer; their results
 permit only the known sibling writer scope and must show no read-scope delta.
 Legacy state migration is scanned from one directory snapshot. A duplicate left between
 the canonical write and legacy unlink is removed only when its normalized state and
-revision prove it is the same migration.
+revision prove it is the same migration. The state-root ownership marker authorizes
+quarantine only; valid legacy lifecycle files retain lease authority without it.
 
 ## Host maintenance
 

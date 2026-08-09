@@ -29,7 +29,12 @@ from operation_deadline import (  # noqa: E402
     checkpoint,
     deadline_after,
 )
-from rollout_io import RolloutError, first_record, is_rollout_path  # noqa: E402
+from rollout_io import (  # noqa: E402
+    RolloutError,
+    RolloutUnavailable,
+    first_record,
+    is_rollout_path,
+)
 from state_lock import StateLockBusy  # noqa: E402
 
 
@@ -152,9 +157,13 @@ def _sessions_root() -> Path:
     configured = os.environ.get("CODEX_HOME")
     home = Path(configured).expanduser() if configured else Path.home() / ".codex"
     try:
-        return host_path(home / "sessions").resolve()
-    except (HostPathError, OSError) as error:
-        raise ControlPlaneError("Codex sessions root is unavailable") from error
+        sessions = host_path(home / "sessions")
+    except HostPathError as error:
+        raise ControlPlaneError("Codex sessions root is invalid") from error
+    try:
+        return sessions.resolve()
+    except OSError as error:
+        raise ControlPlaneUnavailable("Codex sessions root is unavailable") from error
 
 
 def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
@@ -162,9 +171,13 @@ def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
     if not isinstance(transcript_value, str) or not transcript_value:
         raise ControlPlaneError("native child has no transcript identity")
     try:
-        transcript = host_path(transcript_value).resolve(strict=True)
-    except (HostPathError, OSError) as error:
-        raise ControlPlaneError("native child transcript is unavailable") from error
+        transcript_path = host_path(transcript_value)
+    except HostPathError as error:
+        raise ControlPlaneError("native child transcript path is invalid") from error
+    try:
+        transcript = transcript_path.resolve(strict=True)
+    except OSError as error:
+        raise ControlPlaneUnavailable("native child transcript is unavailable") from error
     if not is_within(_sessions_root(), transcript) or not is_rollout_path(transcript):
         raise ControlPlaneError("native child transcript is outside its trusted root")
     if not (
@@ -174,6 +187,8 @@ def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
         raise ControlPlaneError("native child transcript does not match its UUID")
     try:
         record = first_record(transcript)
+    except RolloutUnavailable as error:
+        raise ControlPlaneUnavailable("native child transcript is unavailable") from error
     except RolloutError as error:
         raise ControlPlaneError("native child session metadata is invalid") from error
     metadata = record.get("payload") if isinstance(record, Mapping) else None

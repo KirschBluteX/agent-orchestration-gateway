@@ -15,6 +15,7 @@ sys.path.insert(0, str(HOOKS))
 sys.path.insert(0, str(SCRIPTS))
 
 import cco_hook  # noqa: E402
+from rollout_io import RolloutUnavailable  # noqa: E402
 from state_lock import StateLockBusy  # noqa: E402
 
 
@@ -50,6 +51,30 @@ class V9HookTests(unittest.TestCase):
                     ),
                     "/root/worker_n01",
                 )
+
+    def test_uuid_owner_mapping_replays_after_temporary_rollout_io_failure(self) -> None:
+        agent_id = "00000000-0000-4000-8000-000000000002"
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir()
+            rollout = sessions / f"rollout-test-{agent_id}.jsonl"
+            rollout.write_text("{}\n", encoding="utf-8")
+            payload = {
+                "agent_id": agent_id,
+                "agent_transcript_path": str(rollout),
+                "session_id": "parent-task",
+            }
+
+            with (
+                patch.object(cco_hook, "_sessions_root", return_value=sessions.resolve()),
+                patch.object(
+                    cco_hook,
+                    "first_record",
+                    side_effect=RolloutUnavailable("rollout is temporarily unavailable"),
+                ),
+                self.assertRaises(cco_hook.ControlPlaneUnavailable),
+            ):
+                cco_hook._owner(payload)
 
     def test_protected_payload_guard_handles_nested_host_reasoning(self) -> None:
         protected = {

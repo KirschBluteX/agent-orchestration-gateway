@@ -90,11 +90,11 @@ class StateUnavailable(StateError):
     """Git or filesystem inspection was temporarily unavailable."""
 
 
-def git(repo: Path, *args: str, allow_failure: bool = False) -> bytes:
+def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        result = subprocess.run(
+        return subprocess.run(
             ["git", *args],
             cwd=repo,
             env=environment,
@@ -107,7 +107,13 @@ def git(repo: Path, *args: str, allow_failure: bool = False) -> bytes:
         raise OperationDeadlineExceeded(
             "Git workspace inspection exceeded the CCO Hook deadline"
         ) from error
-    if result.returncode and not allow_failure:
+    except OSError as error:
+        raise StateUnavailable("Git repository inspection is unavailable") from error
+
+
+def git(repo: Path, *args: str) -> bytes:
+    result = _run_git(repo, *args)
+    if result.returncode:
         raise StateUnavailable("Git repository inspection failed")
     return result.stdout
 
@@ -722,27 +728,45 @@ def index_digest(root: Path) -> str | None:
 
 
 def head_oid(root: Path) -> str | None:
-    output = git(root, "rev-parse", "--verify", "HEAD", allow_failure=True).strip()
-    return output.decode("ascii") if output else None
+    result = _run_git(root, "rev-parse", "--verify", "--quiet", "HEAD")
+    if result.returncode == 0:
+        output = result.stdout.strip()
+        try:
+            oid = output.decode("ascii")
+        except UnicodeDecodeError as error:
+            raise StateUnavailable("Git HEAD inspection returned a non-ASCII OID") from error
+        if len(oid) not in {40, 64} or any(
+            character not in "0123456789abcdefABCDEF" for character in oid
+        ):
+            raise StateUnavailable("Git HEAD inspection returned an invalid OID")
+        return oid.lower()
+    if result.returncode != 1:
+        raise StateUnavailable("Git HEAD inspection failed")
+
+    symbolic = _run_git(root, "symbolic-ref", "-q", "HEAD")
+    if symbolic.returncode != 0:
+        raise StateUnavailable("Git HEAD is neither a valid object nor an unborn branch")
+    reference = symbolic.stdout.rstrip(b"\r\n")
+    if not reference:
+        raise StateUnavailable("Git symbolic HEAD inspection returned an empty reference")
+    try:
+        reference_text = reference.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise StateUnavailable("Git symbolic HEAD inspection returned invalid UTF-8") from error
+    target = _run_git(
+        root,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        reference_text,
+    )
+    if target.returncode == 1:
+        return None
+    raise StateUnavailable("Git HEAD reference inspection failed")
 
 
 def symbolic_head(root: Path) -> str | None:
-    environment = os.environ.copy()
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
-    try:
-        result = subprocess.run(
-            ["git", "symbolic-ref", "-q", "HEAD"],
-            cwd=root,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=remaining_seconds(),
-        )
-    except subprocess.TimeoutExpired as error:
-        raise OperationDeadlineExceeded(
-            "Git symbolic HEAD inspection exceeded the CCO Hook deadline"
-        ) from error
+    result = _run_git(root, "symbolic-ref", "-q", "HEAD")
     if result.returncode == 1:
         return None
     if result.returncode != 0:

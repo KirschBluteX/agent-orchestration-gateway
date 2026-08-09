@@ -19,6 +19,10 @@ class RolloutError(ValueError):
     """A rollout cannot be read safely with the available local runtime."""
 
 
+class RolloutUnavailable(RolloutError):
+    """A rollout could not be read because local I/O is temporarily unavailable."""
+
+
 def is_rollout_path(path: Path) -> bool:
     return path.name.endswith(".jsonl") or path.name.endswith(".jsonl.zst")
 
@@ -32,7 +36,7 @@ def open_rollout(path: Path) -> Iterator[BinaryIO]:
             with path.open("rb") as stream:
                 yield stream
         except OSError as error:
-            raise RolloutError("rollout is unavailable") from error
+            raise RolloutUnavailable("rollout is unavailable") from error
         return
     if not path.name.endswith(".jsonl.zst"):
         raise RolloutError("rollout has an unsupported suffix")
@@ -50,14 +54,18 @@ def open_rollout(path: Path) -> Iterator[BinaryIO]:
                 with zstandard.ZstdDecompressor().stream_reader(source) as raw:
                     with io.BufferedReader(raw) as stream:
                         yield stream
-        except (OSError, zstandard.ZstdError) as error:
-            raise RolloutError("compressed rollout is unavailable or invalid") from error
+        except OSError as error:
+            raise RolloutUnavailable("compressed rollout is unavailable") from error
+        except zstandard.ZstdError as error:
+            raise RolloutError("compressed rollout is invalid") from error
         return
     try:
         with zstd.open(path, "rb") as stream:
             yield stream
-    except (OSError, ValueError, zstd.ZstdError) as error:
-        raise RolloutError("compressed rollout is unavailable or invalid") from error
+    except OSError as error:
+        raise RolloutUnavailable("compressed rollout is unavailable") from error
+    except (ValueError, zstd.ZstdError) as error:
+        raise RolloutError("compressed rollout is invalid") from error
 
 
 def _parse_record(line: bytes) -> Mapping[str, Any] | None:
@@ -135,7 +143,7 @@ def iter_tail_records(
                 stream.seek(start)
                 data = stream.read(size - start)
         except OSError as error:
-            raise RolloutError("rollout is unavailable") from error
+            raise RolloutUnavailable("rollout is unavailable") from error
         if start and previous != b"\n":
             boundary = data.find(b"\n")
             if boundary < 0:

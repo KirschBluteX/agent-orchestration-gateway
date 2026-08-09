@@ -18,6 +18,14 @@ The project follows semantic versioning.
 - Recaptured stale fallback waves without retrying an already rejected route, and limited
   malformed legacy quarantine to marked CCO-owned roots with content-addressed no-replace
   files.
+- Kept valid legacy reader/writer leases visible in unmarked mixed state directories;
+  ownership sentinels now authorize quarantine only and never suppress lease discovery.
+- Classified temporary Codex transcript and compressed-rollout I/O failures as replayable
+  SubagentStop infrastructure failures instead of invalid child identity.
+- Made Git HEAD capture accept only an explicitly confirmed unborn symbolic branch and
+  bounded non-Git child enumeration before a directory can be fully materialized.
+- Revalidated legacy state identity, metadata, bytes, and lifecycle validity immediately
+  before quarantine deletion so a concurrently repaired replacement is preserved.
 
 ## 2.0.4 - 2026-08-09
 

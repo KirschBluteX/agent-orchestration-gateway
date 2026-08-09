@@ -22,6 +22,38 @@ import directory_state as directory_state_module  # noqa: E402
 
 
 class DirectoryStateTests(unittest.TestCase):
+    def test_child_enumeration_stops_at_the_entry_budget(self) -> None:
+        class Entry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class Entries:
+            def __init__(self) -> None:
+                self.items = iter(Entry(str(index)) for index in range(100))
+                self.yielded = 0
+
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __next__(self):  # type: ignore[no-untyped-def]
+                item = next(self.items)
+                self.yielded += 1
+                return item
+
+        entries = Entries()
+        with (
+            mock.patch.object(directory_state_module.os, "scandir", return_value=entries),
+            self.assertRaisesRegex(DirectoryStateError, "entry.*budget"),
+        ):
+            directory_state_module._child_names(Path("unused"), max_names=2)
+        self.assertEqual(entries.yielded, 3)
+
     def test_directory_enumeration_checks_deadline_between_entries(self) -> None:
         class Entry:
             def __init__(self, name: str) -> None:
@@ -57,7 +89,10 @@ class DirectoryStateTests(unittest.TestCase):
             mock.patch.object(directory_state_module, "checkpoint", side_effect=checkpoint),
             self.assertRaisesRegex(RuntimeError, "deadline"),
         ):
-            directory_state_module._child_names(Path("unused"))
+            directory_state_module._child_names(
+                Path("unused"),
+                max_names=directory_state_module.DEFAULT_MAX_ENTRIES,
+            )
         self.assertEqual(entries.yielded, 1)
 
     def test_scope_snapshot_detects_any_explorer_or_reviewer_change(self) -> None:

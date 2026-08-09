@@ -731,6 +731,46 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertTrue(unrelated.exists())
         self.assertFalse((self.state_root / "quarantine").exists())
 
+    def test_unmarked_shared_state_still_honors_a_valid_legacy_writer(self) -> None:
+        legacy = self.control("legacy-writer-in-shared-root")
+        brief = self.brief([self.node("writer", "A01", "a.txt")])
+        legacy.create_plan(self.repo, brief)
+        native = legacy.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        self.start_dispatch(legacy, native)
+        legacy.state_path.replace(self.state_root / "legacy-writer.json")
+        (self.state_root / ".cco-state-root-v1").unlink()
+        unrelated = self.state_root / "notes.json"
+        unrelated.write_text('{"not":"cco"}', encoding="utf-8")
+
+        contender = self.control("indexed-contender-in-shared-root")
+        contender.create_plan(self.repo, brief)
+
+        with self.assertRaisesRegex(ControlPlaneError, "writer lease"):
+            contender.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-terra"),
+            )
+        self.assertTrue(unrelated.exists())
+        self.assertFalse((self.state_root / ".cco-state-root-v1").exists())
+
+    def test_marker_probe_does_not_hide_temporary_legacy_io_failure(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / "legacy.json").write_text("{}", encoding="utf-8")
+        control = self.control("unavailable-marker-probe")
+
+        with (
+            patch.object(
+                control_plane_module,
+                "_load_object",
+                side_effect=ControlPlaneUnavailable("temporarily unavailable"),
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "temporarily unavailable"),
+        ):
+            control._mark_state_root_if_safe()
+
     def test_quarantine_never_overwrites_an_earlier_payload(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
         (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
@@ -743,6 +783,44 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         quarantined = list((self.state_root / "quarantine").glob("*.json"))
         self.assertEqual(len(quarantined), 2)
+
+    def test_quarantine_does_not_delete_a_repaired_replacement(self) -> None:
+        source = self.control("quarantine-replacement-source")
+        source.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        repaired = source.state_path.read_bytes()
+        legacy = self.state_root / "replace-during-quarantine.json"
+        legacy.write_text('{"broken":', encoding="utf-8")
+        original_read = control_plane_module._read_bounded_bytes
+        target_reads = 0
+
+        def replace_after_read(
+            path: Path,
+            label: str,
+            *,
+            limit: int = control_plane_module.MAX_STATE_FILE_BYTES,
+        ) -> bytes:
+            nonlocal target_reads
+            raw = original_read(path, label, limit=limit)
+            if path == legacy:
+                target_reads += 1
+                if target_reads == 2:
+                    legacy.unlink()
+                    legacy.write_bytes(repaired)
+            return raw
+
+        with patch.object(
+            control_plane_module,
+            "_read_bounded_bytes",
+            side_effect=replace_after_read,
+        ):
+            source._workspace_state_candidates(self.repo)
+
+        self.assertEqual(target_reads, 2)
+        self.assertTrue(legacy.exists())
+        self.assertEqual(legacy.read_bytes(), repaired)
 
     def test_invalid_indexed_same_workspace_state_blocks_admission(self) -> None:
         control = self.control("indexed-corruption")

@@ -11,10 +11,22 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from rollout_io import RolloutError, iter_records, iter_tail_records  # noqa: E402
+from rollout_io import (  # noqa: E402
+    RolloutError,
+    RolloutUnavailable,
+    iter_records,
+    iter_tail_records,
+)
 
 
 class RolloutIoTests(unittest.TestCase):
+    def test_missing_rollout_is_temporary_unavailability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.jsonl"
+
+            with self.assertRaises(RolloutUnavailable):
+                list(iter_records(path))
+
     def test_oversized_line_is_rejected_with_a_bounded_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rollout.jsonl"

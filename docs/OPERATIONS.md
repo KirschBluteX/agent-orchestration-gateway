@@ -132,7 +132,8 @@ or explicit interrupt settlement. New lifecycle filenames carry canonical worksp
 task digests, so an invalid indexed state blocks only its workspace. Unindexable malformed
 legacy files move to content-addressed, no-replace files under `quarantine` only when the
 state root carries CCO's ownership marker. Unmarked shared directories are never used to
-quarantine unrelated JSON.
+quarantine unrelated JSON, but every valid legacy lifecycle file still participates in
+reader/writer lease checks.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two

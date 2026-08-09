@@ -113,13 +113,23 @@ def _canonical_child_path(relative: str) -> str:
         raise DirectoryStateError(str(error)) from error
 
 
-def _child_names(path: Path) -> list[str]:
+def _child_names(path: Path, *, max_names: int) -> list[str]:
+    if (
+        isinstance(max_names, bool)
+        or not isinstance(max_names, int)
+        or max_names < 0
+    ):
+        raise DirectoryStateError("directory entry budget is invalid")
     checkpoint()
     names: list[str] = []
     try:
         with os.scandir(path) as entries:
             for entry in entries:
                 checkpoint()
+                if len(names) >= max_names:
+                    raise DirectoryBudgetError(
+                        "directory snapshot exceeds the configured entry budget"
+                    )
                 names.append(entry.name)
     except OSError as error:
         raise DirectoryStateUnavailable(
@@ -139,20 +149,31 @@ def _child_names(path: Path) -> list[str]:
     return ordered
 
 
-def normalize_directory_scope(root: Path, value: object) -> dict[str, str]:
+def normalize_directory_scope(
+    root: Path,
+    value: object,
+    *,
+    max_entries: int = DEFAULT_MAX_ENTRIES,
+) -> dict[str, str]:
     """Bind a protocol scope to the observed spelling under a directory root."""
 
     try:
         scope = require_repository_scope(value, "directory scope")
     except ProtocolHashError as error:
         raise DirectoryStateError(str(error)) from error
+    if (
+        isinstance(max_entries, bool)
+        or not isinstance(max_entries, int)
+        or max_entries < 1
+    ):
+        raise DirectoryStateError("directory entry budget is invalid")
     workspace = directory_root(root)
     current = workspace
     spelling: list[str] = []
     segments = scope["path"].split("/")
     for index, segment in enumerate(segments):
         checkpoint()
-        names = _child_names(current)
+        names = _child_names(current, max_names=max_entries)
         matches = [name for name in names if name.casefold() == segment.casefold()]
         if len(matches) > 1:
             raise DirectoryStateError("directory scope has an ambiguous path spelling")
@@ -252,7 +273,10 @@ def _walk_tree(
         checkpoint()
         current, prefix = stack.pop()
         directories: list[tuple[Path, str]] = []
-        for name in _child_names(current):
+        for name in _child_names(
+            current,
+            max_names=max_entries - totals["entries"],
+        ):
             checkpoint()
             child = current / name
             child_relative = _canonical_child_path(f"{prefix}/{name}" if prefix else name)
@@ -282,7 +306,7 @@ def _enumerate(
     found: list[tuple[dict[str, Any], tuple[Any, ...], Path | None]] = []
     totals = {"bytes": 0, "entries": 0}
     if capture_mode == "full":
-        for name in _child_names(root):
+        for name in _child_names(root, max_names=max_entries):
             checkpoint()
             child = root / name
             relative = _canonical_child_path(name)
@@ -403,11 +427,18 @@ def capture_directory_state(
         raise DirectoryStateError("directory snapshot mode is invalid")
     if not isinstance(scopes, list):
         raise DirectoryStateError("directory snapshot scopes must be a list")
-    normalized = [normalize_directory_scope(workspace, scope) for scope in scopes]
+    limits = _limits(max_entries, max_bytes)
+    normalized = [
+        normalize_directory_scope(
+            workspace,
+            scope,
+            max_entries=limits["max_entries"],
+        )
+        for scope in scopes
+    ]
     normalized.sort(key=lambda item: (item["kind"], item["path"]))
     if len({(item["kind"], _case_key(item["path"])) for item in normalized}) != len(normalized):
         raise DirectoryStateError("directory snapshot scopes are duplicated")
-    limits = _limits(max_entries, max_bytes)
     root_before = _root_metadata(workspace)
     first = _enumerate(
         workspace,
@@ -578,7 +609,14 @@ def verify_directory_state(
         raise DirectoryStateError("directory snapshot root does not match workspace")
     if not isinstance(allowed_scopes, list):
         raise DirectoryStateError("directory verification scopes must be a list")
-    allowed = [normalize_directory_scope(workspace, scope) for scope in allowed_scopes]
+    allowed = [
+        normalize_directory_scope(
+            workspace,
+            scope,
+            max_entries=baseline["limits"]["max_entries"],
+        )
+        for scope in allowed_scopes
+    ]
     current = capture_directory_state(
         workspace,
         scopes=baseline["scopes"],
@@ -626,8 +664,22 @@ def verify_directory_pre_spawn(
     workspace = directory_root(root)
     if not isinstance(active_scopes, list) or not isinstance(graph_scopes, list):
         raise DirectoryStateError("directory pre-spawn scopes must be lists")
-    active = [normalize_directory_scope(workspace, scope) for scope in active_scopes]
-    graph = [normalize_directory_scope(workspace, scope) for scope in graph_scopes]
+    active = [
+        normalize_directory_scope(
+            workspace,
+            scope,
+            max_entries=baseline["limits"]["max_entries"],
+        )
+        for scope in active_scopes
+    ]
+    graph = [
+        normalize_directory_scope(
+            workspace,
+            scope,
+            max_entries=baseline["limits"]["max_entries"],
+        )
+        for scope in graph_scopes
+    ]
     current = capture_directory_state(
         workspace,
         scopes=baseline["scopes"],
