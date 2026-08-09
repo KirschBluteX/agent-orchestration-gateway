@@ -1305,14 +1305,20 @@ class V9ControlPlaneTests(unittest.TestCase):
             candidates = source._workspace_state_candidates(self.repo)
 
         self.assertFalse(legacy.exists())
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            _ = source.state_path
+        self.assertEqual(len(list(self.state_root.glob(".cco-staging-*.pending"))), 1)
+        self.control("quarantine-race-migrator").migrate_recoveries()
         self.assertTrue(source.state_path.exists())
         self.assertEqual(source.state_path.read_bytes(), repaired)
         self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
 
     def test_quarantine_failure_keeps_a_recovered_writer_visible(self) -> None:
         source = self.control("quarantine-crash-safe-writer")
+        contender = self.control("quarantine-crash-safe-contender")
         brief = self.brief([self.node("writer", "A01", "a.txt")])
         source.create_plan(self.repo, brief)
+        contender.create_plan(self.repo, brief)
         native = source.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
@@ -1329,41 +1335,25 @@ class V9ControlPlaneTests(unittest.TestCase):
                 legacy.write_bytes(repaired)
             original_replace(source_path, destination)
 
-        with (
-            patch.object(
-                control_plane_module.os,
-                "replace",
-                side_effect=repair_then_replace,
-            ),
-            patch.object(
-                control_plane_module.os,
-                "link",
-                side_effect=OSError("simulated publication failure"),
-                create=True,
-            ),
-            self.assertRaisesRegex(ControlPlaneUnavailable, "could not be restored"),
+        with patch.object(
+            control_plane_module.os,
+            "replace",
+            side_effect=repair_then_replace,
         ):
-            source._workspace_state_candidates(self.repo)
+            candidates = source._workspace_state_candidates(self.repo)
 
-        recovery_files = list(self.state_root.glob(".cco-recovery-*.json"))
-        self.assertEqual(len(recovery_files), 1)
-        recovery_match = control_plane_module.SESSION_RECOVERY_FILE_RE.fullmatch(
-            recovery_files[0].name
-        )
-        self.assertIsNotNone(recovery_match)
-        self.assertEqual(
-            recovery_match.group("session"),
-            control_plane_module._session_digest(source.session_id),
-        )
-        contender = self.control("quarantine-crash-safe-contender")
-        contender.create_plan(self.repo, brief)
-        with self.assertRaisesRegex(ControlPlaneError, "writer lease"):
+        self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
+        self.assertEqual(len(list(self.state_root.glob(".cco-staging-*.pending"))), 1)
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
             contender.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
             )
+        self.control("quarantine-crash-safe-migrator").migrate_recoveries()
+        with self.assertRaisesRegex(ControlPlaneError, "writer lease"):
+            contender.next_wave(capacity=1, native_catalog=catalog("gpt-5.6-terra"))
 
-    def test_recovery_publication_replays_after_finalization_failure(self) -> None:
+    def test_repaired_state_stays_fail_closed_until_atomic_publication(self) -> None:
         source = self.control("quarantine-replay-writer")
         source.create_plan(
             self.repo,
@@ -1379,38 +1369,25 @@ class V9ControlPlaneTests(unittest.TestCase):
         legacy = self.state_root / "repair-before-finalize.json"
         legacy.write_text('{"broken":', encoding="utf-8")
         original_replace = os.replace
-        original_unlink = Path.unlink
-        failed = False
 
         def repair_then_replace(source_path: object, destination: object) -> None:
             if Path(source_path) == legacy:
                 legacy.write_bytes(repaired)
             original_replace(source_path, destination)
 
-        def fail_recovery_unlink(path: Path, *args: object, **kwargs: object) -> None:
-            nonlocal failed
-            if path.name.startswith(".cco-recovery-") and path.suffix == ".json" and not failed:
-                failed = True
-                raise OSError("simulated finalization failure")
-            original_unlink(path, *args, **kwargs)
-
-        with (
-            patch.object(
-                control_plane_module.os,
-                "replace",
-                side_effect=repair_then_replace,
-            ),
-            patch.object(Path, "unlink", new=fail_recovery_unlink),
-            self.assertRaisesRegex(ControlPlaneUnavailable, "finalization failed"),
+        with patch.object(
+            control_plane_module.os,
+            "replace",
+            side_effect=repair_then_replace,
         ):
-            source._workspace_state_candidates(self.repo)
+            candidates = source._workspace_state_candidates(self.repo)
 
-        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
-        recovered = self.control("recovery-reader")
-        candidates = recovered._workspace_state_candidates(self.repo)
         self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            self.control("recovery-reader")._workspace_state_candidates(self.repo)
+        self.control("recovery-reader").migrate_recoveries()
         self.assertTrue(source.state_path.exists())
-        self.assertEqual(list(self.state_root.glob(".cco-recovery-*.json")), [])
+        self.assertEqual(list(self.state_root.glob(".cco-staging-*.pending")), [])
 
     def test_current_session_discovers_an_active_recovery_state(self) -> None:
         resumed = self.control("recovery-owned-writer")
@@ -1497,46 +1474,31 @@ class V9ControlPlaneTests(unittest.TestCase):
             json.dumps(unrelated, separators=(",", ":"), sort_keys=True),
             encoding="utf-8",
         )
-        self.assertEqual(source.migrate_recoveries(), 1)
+        with self.assertRaisesRegex(ControlPlaneError, "workspace or plan lineage"):
+            source.migrate_recoveries()
 
         contender = self.control("recovery-lineage-contender")
-        contender.create_plan(self.repo, brief)
-        with self.assertRaisesRegex(ControlPlaneError, "conflicting lifecycle recovery"):
-            contender.next_wave(
-                capacity=1,
-                native_catalog=catalog("gpt-5.6-terra"),
-            )
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            contender.create_plan(self.repo, brief)
         self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
 
     def test_recovery_capacity_is_reserved_before_quarantine_move(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
         (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
-        (self.state_root / ".cco-recovery-existing.json").write_text(
+        (self.state_root / ".cco-staging-existing.pending").write_text(
             "{}", encoding="utf-8"
         )
         legacy = self.state_root / "legacy-invalid.json"
         legacy.write_text('{"broken":', encoding="utf-8")
         control = self.control("recovery-capacity")
-        original_read = control_plane_module._read_bounded_bytes
-
-        def fail_staged_read(path: Path, label: str, **kwargs: object) -> bytes:
-            if path.name.startswith(".cco-recovery-") and path.suffix == ".json":
-                raise ControlPlaneUnavailable("simulated staged read failure")
-            return original_read(path, label, **kwargs)
-
         with (
-            patch.object(control_plane_module, "MAX_RECOVERY_FILES", 1),
-            patch.object(
-                control_plane_module,
-                "_read_bounded_bytes",
-                side_effect=fail_staged_read,
-            ),
+            patch.object(control_plane_module, "MAX_RECOVERY_STAGING_FILES", 1),
             self.assertRaises(ControlPlaneUnavailable),
         ):
             control._quarantine_legacy_state(legacy)
 
         self.assertTrue(legacy.exists())
-        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+        self.assertEqual(len(list(self.state_root.glob(".cco-staging-*.pending"))), 1)
 
     def test_quarantining_a_recovery_at_the_exact_limit_needs_no_new_slot(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -1552,6 +1514,7 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         self.assertFalse(source.exists())
         self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+        self.assertEqual(list(self.state_root.glob(".cco-staging-*.pending")), [])
         self.assertEqual(len(list((self.state_root / "quarantine").glob("*.json"))), 1)
 
     def test_foreign_workspace_scan_does_not_replay_recovery(self) -> None:
@@ -1673,7 +1636,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             candidates = control._workspace_state_candidates(self.repo)
 
         self.assertEqual(candidates, [])
-        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+        self.assertEqual(len(list(self.state_root.glob(".cco-staging-*.pending"))), 1)
 
     def test_recovery_publication_waits_for_authoritative_hook_decision(self) -> None:
         session = "recovery-publication-linearized"
@@ -1987,7 +1950,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(len(quarantined), 1)
         self.assertEqual(quarantined[0].read_text(encoding="utf-8"), '{"not":"cco"}')
 
-    def test_explicit_recovery_migration_persists_each_completed_file(self) -> None:
+    def test_explicit_recovery_discovery_is_atomic_before_publication(self) -> None:
         first = self.control("incremental-recovery-first")
         second = self.control("incremental-recovery-second")
         for control in (first, second):
@@ -2000,9 +1963,9 @@ class V9ControlPlaneTests(unittest.TestCase):
         os.replace(first.state_path, first_random)
         os.replace(second.state_path, second_random)
         migrator = self.control("incremental-recovery-migrator")
-        original_read = control_plane_module._read_bounded_bytes
+        original_read = control_plane_module._read_stable_bytes
 
-        def fail_second(path: Path, label: str, **kwargs: object) -> bytes:
+        def fail_second(path: Path, label: str, **kwargs: object) -> object:
             if path == second_random:
                 raise ControlPlaneUnavailable("simulated unavailable recovery")
             return original_read(path, label, **kwargs)
@@ -2010,19 +1973,16 @@ class V9ControlPlaneTests(unittest.TestCase):
         with (
             patch.object(
                 control_plane_module,
-                "_read_bounded_bytes",
+                "_read_stable_bytes",
                 side_effect=fail_second,
             ),
             self.assertRaisesRegex(ControlPlaneUnavailable, "simulated unavailable"),
         ):
             migrator.migrate_recoveries()
 
-        self.assertFalse(first_random.exists())
+        self.assertTrue(first_random.exists())
         self.assertTrue(second_random.exists())
-        first_digest = control_plane_module._session_digest(first.session_id)
-        self.assertTrue(
-            (self.state_root / f".cco-recovery-s{first_digest}.json").exists()
-        )
+        self.assertEqual(list(self.state_root.glob(".cco-recovery-s*.json")), [])
 
     def test_workspace_switch_is_rejected_before_foreign_recovery_replay(self) -> None:
         session = "workspace-switch-before-replay"
@@ -3226,6 +3186,478 @@ class V9ControlPlaneTests(unittest.TestCase):
                     deviations=["changed the contract"],
                 )
             )
+
+    def test_pending_restart_event_replays_after_recovery_migration(self) -> None:
+        session = "pending-restart-replay"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(control, native)
+        random_recovery = self.state_root / ".cco-recovery-pending-restart.json"
+        os.replace(control.state_path, random_recovery)
+        control._state_path = None
+
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            control.process_restart_event("resume")
+
+        self.assertEqual(len(list(self.state_root.glob(".cco-pending-*.event"))), 1)
+        self.control("recovery-migrator").migrate_recoveries()
+        resumed = self.control(session)
+        self.assertEqual(resumed.status()["counts"]["fenced"], 1)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_pending_interrupt_event_replays_after_recovery_migration(self) -> None:
+        session = "pending-interrupt-replay"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(control, native)
+        control.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "pending-interrupt"}
+        )
+        random_recovery = self.state_root / ".cco-recovery-pending-interrupt.json"
+        os.replace(control.state_path, random_recovery)
+        control._state_path = None
+        payload = {
+            "tool_input": {"target": owner},
+            "tool_response": {"previous_status": "running"},
+            "tool_use_id": "pending-interrupt",
+        }
+
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            control.process_postflight_event(payload)
+
+        self.control("recovery-migrator").migrate_recoveries()
+        self.assertEqual(self.control(session).status()["counts"]["fenced"], 1)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_pending_spawn_event_replays_owner_binding_after_migration(self) -> None:
+        session = "pending-spawn-replay"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "pending-spawn"})
+        random_recovery = self.state_root / ".cco-recovery-pending-spawn.json"
+        os.replace(control.state_path, random_recovery)
+        control._state_path = None
+        owner = "/root/" + str(native["task_name"])
+        payload = {
+            "tool_input": native,
+            "tool_response": {"task_name": owner},
+            "tool_use_id": "pending-spawn",
+        }
+
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            control.process_postflight_event(payload)
+
+        self.control("recovery-migrator").migrate_recoveries()
+        state = json.loads(self.control(session).state_path.read_text(encoding="utf-8"))
+        dispatch = next(iter(state["dispatches"].values()))
+        self.assertEqual(dispatch["state"], "running")
+        self.assertEqual(dispatch["owner"], owner)
+
+    def test_three_generation_recovery_chain_is_order_independent(self) -> None:
+        session = "three-generation-recovery"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        raw_a = control.state_path.read_bytes()
+        control.restart()
+        raw_b = control.state_path.read_bytes()
+        control.restart()
+        raw_c = control.state_path.read_bytes()
+        control.state_path.unlink()
+        control._state_path = None
+        (self.state_root / ".cco-recovery-a-tip.json").write_bytes(raw_c)
+        (self.state_root / ".cco-recovery-b-ancestor.json").write_bytes(raw_a)
+        (self.state_root / ".cco-recovery-c-middle.json").write_bytes(raw_b)
+
+        self.assertEqual(control.migrate_recoveries(), 3)
+
+        self.assertEqual(control.status()["epoch"], 3)
+        self.assertEqual(
+            len(list(self.state_root.glob(".cco-recovery-s*.json"))),
+            1,
+        )
+        self.assertEqual(
+            list(self.state_root.glob(".cco-recovery-[abc]-*.json")),
+            [],
+        )
+
+    def test_raw_parent_hash_wins_over_semantic_json_equality(self) -> None:
+        session = "raw-parent-recovery"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        canonical_raw = control.state_path.read_bytes()
+        parent = json.loads(canonical_raw)
+        alternate_parent = json.dumps(parent, indent=2, sort_keys=True).encode("utf-8")
+        child = dict(parent)
+        child["epoch"] += 1
+        child["revision"] += 1
+        child["parent_state_sha256"] = (
+            "sha256:" + hashlib.sha256(alternate_parent).hexdigest()
+        )
+        child_raw = (
+            json.dumps(child, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            + b"\n"
+        )
+        control.state_path.unlink()
+        control._state_path = None
+        stable = control_plane_module._lifecycle_recovery_path(
+            self.state_root,
+            session,
+        )
+        stable.write_bytes(canonical_raw)
+        (self.state_root / ".cco-recovery-a-semantic-parent.json").write_bytes(
+            alternate_parent
+        )
+        (self.state_root / ".cco-recovery-b-raw-child.json").write_bytes(child_raw)
+
+        self.assertEqual(control.migrate_recoveries(), 2)
+
+        self.assertEqual(control.status()["epoch"], child["epoch"])
+        self.assertEqual(stable.read_bytes(), child_raw)
+
+    def test_oversize_random_recovery_streams_to_quarantine(self) -> None:
+        owner = self.control("oversize-recovery-owner")
+        owner.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        owner.cleanup()
+        source = self.state_root / ".cco-recovery-oversize.json"
+        with source.open("wb") as handle:
+            handle.seek(control_plane_module.MAX_STATE_FILE_BYTES)
+            handle.write(b"x")
+
+        self.assertEqual(owner.migrate_recoveries(), 1)
+
+        self.assertFalse(source.exists())
+        self.assertEqual(list(self.state_root.glob(".cco-recovery-*.json")), [])
+        quarantined = list((self.state_root / "quarantine").glob("*.json"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(
+            quarantined[0].stat().st_size,
+            control_plane_module.MAX_STATE_FILE_BYTES + 1,
+        )
+
+    def test_valid_staging_reserves_an_authoritative_state_slot(self) -> None:
+        first = self.control("stable-capacity-first")
+        second = self.control("stable-capacity-second")
+        brief = self.brief([self.node("reader", "A01", "a.txt", role="explorer")])
+        first.create_plan(self.repo, brief)
+        second.create_plan(self.repo, brief)
+        stable = control_plane_module._lifecycle_recovery_path(
+            self.state_root,
+            first.session_id,
+        )
+        staging = self.state_root / ".cco-staging-capacity.pending"
+        os.replace(first.state_path, stable)
+        os.replace(second.state_path, staging)
+
+        with (
+            patch.object(control_plane_module, "MAX_RECOVERY_FILES", 1),
+            self.assertRaisesRegex(
+                ControlPlaneUnavailable,
+                "recovery capacity is exhausted",
+            ),
+        ):
+            self.control("capacity-migrator").migrate_recoveries()
+
+        self.assertTrue(stable.exists())
+        self.assertTrue(staging.exists())
+
+    def test_recovery_source_replacement_after_read_is_rejected(self) -> None:
+        session = "recovery-source-snapshot"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        raw_a = control.state_path.read_bytes()
+        control.restart()
+        raw_b = control.state_path.read_bytes()
+        control.state_path.unlink()
+        control._state_path = None
+        source = self.state_root / ".cco-recovery-source-snapshot.json"
+        source.write_bytes(raw_a)
+        original_identity = control_plane_module._path_identity
+        swapped = False
+
+        def replace_before_identity(path: Path, label: str) -> tuple[int, ...]:
+            nonlocal swapped
+            if path == source and not swapped:
+                swapped = True
+                replacement = self.state_root / ".replacement-state.json"
+                replacement.write_bytes(raw_b)
+                os.replace(replacement, source)
+            return original_identity(path, label)
+
+        with (
+            patch.object(
+                control_plane_module,
+                "_path_identity",
+                side_effect=replace_before_identity,
+            ),
+            self.assertRaises(ControlPlaneUnavailable),
+        ):
+            control.migrate_recoveries()
+
+        self.assertEqual(source.read_bytes(), raw_b)
+
+    def test_cleanup_does_not_match_a_longer_session_artifact_prefix(self) -> None:
+        short = self.control("artifact")
+        longer = self.control("artifact-plan")
+        brief = self.brief([self.node("reader", "A01", "a.txt", role="explorer")])
+        short.create_plan(self.repo, brief)
+        longer.create_plan(self.repo, brief)
+        longer_state = json.loads(longer.state_path.read_text(encoding="utf-8"))
+        longer_plan = Path(longer_state["plan_path"])
+
+        short.cleanup()
+
+        self.assertTrue(longer_plan.exists())
+        self.assertEqual(longer.status()["state"], "ready")
+
+    def test_forged_indexed_filename_cannot_authorize_state_root_marker(self) -> None:
+        root = self.root / "forged-indexed-root"
+        root.mkdir()
+        forged = root / (("a" * 64) + "--" + ("b" * 64) + ".json")
+        forged.write_text("{}", encoding="utf-8")
+        control = ControlPlane("forged-indexed-marker", root=root)
+
+        control._mark_state_root_if_safe()
+
+        self.assertFalse((root / ".cco-state-root-v1").exists())
+        unrelated = root / ".cco-recovery-unrelated.json"
+        unrelated.write_text('{"not":"cco"}', encoding="utf-8")
+        with self.assertRaisesRegex(ControlPlaneError, "unmarked state root"):
+            control.migrate_recoveries()
+        self.assertTrue(unrelated.exists())
+
+    def test_exact_paused_result_replay_is_idempotent(self) -> None:
+        control = self.control("paused-result-replay")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        result = result_text(
+            dispatch_id,
+            status="blocked",
+            outcome="pause",
+            blockers=["need one fact"],
+            failure_signature="missing_fact",
+        )
+        control.record_result(owner, result)
+
+        replay = control.record_result(owner, result)
+
+        self.assertEqual(replay["state"], "paused")
+        self.assertEqual(control.status()["counts"]["paused"], 1)
+
+    def test_pending_event_replay_is_idempotent_after_clear_failure(self) -> None:
+        control = self.control("pending-clear-replay")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        epoch_before = control.status()["epoch"]
+        with (
+            patch.object(
+                control,
+                "_clear_pending_event",
+                side_effect=ControlPlaneUnavailable("simulated clear failure"),
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "clear failure"),
+        ):
+            control.process_restart_event("resume")
+
+        epoch_after_settlement = control.status()["epoch"]
+        self.assertEqual(epoch_after_settlement, epoch_before + 1)
+        self.assertEqual(len(list(self.state_root.glob(".cco-pending-*.event"))), 1)
+        with self.assertRaisesRegex(ControlPlaneError, "migrate-recoveries"):
+            control.cleanup()
+        control.replay_pending_events()
+        self.assertEqual(control.status()["epoch"], epoch_after_settlement)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_new_event_can_queue_behind_an_older_unfinalized_receipt(self) -> None:
+        control = self.control("pending-event-order")
+        first = control._pending_event(
+            "session_restart",
+            occurrence="a" * 32,
+            source="resume",
+        )
+        second = control._pending_event(
+            "session_restart",
+            occurrence="b" * 32,
+            source="clear",
+        )
+        control._stage_pending_event(first)
+        control._stage_pending_event(second)
+
+        self.assertEqual(len(list(self.state_root.glob(".cco-pending-*.event"))), 2)
+
+    def test_two_real_resume_events_have_distinct_settlement_identity(self) -> None:
+        control = self.control("distinct-restart-events")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        epoch = control.status()["epoch"]
+
+        control.process_restart_event("resume")
+        control.process_restart_event("resume")
+
+        self.assertEqual(control.status()["epoch"], epoch + 2)
+
+    def test_pending_receipt_blocks_a_replacement_plan_without_state(self) -> None:
+        control = self.control("pending-without-state")
+        event = control._pending_event(
+            "session_restart",
+            occurrence="c" * 32,
+            source="resume",
+        )
+        control._stage_pending_event(event)
+
+        with self.assertRaisesRegex(ControlPlaneError, "migrate-recoveries"):
+            control.create_plan(
+                self.repo,
+                self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+            )
+
+    def test_late_spawn_postflight_cannot_undo_a_paused_result(self) -> None:
+        control = self.control("late-postflight-after-pause")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        control.preflight_spawn(
+            {"tool_input": native, "tool_use_id": "late-spawn-call"}
+        )
+        dispatch_id = json.loads(native["message"].split("\n", 1)[1])["dispatch_id"]
+        owner = "/root/" + native["task_name"]
+        control.record_result(
+            owner,
+            result_text(
+                dispatch_id,
+                status="blocked",
+                outcome="pause",
+                blockers=["need one fact"],
+                failure_signature="missing_fact",
+            ),
+        )
+
+        control.process_postflight_event(
+            {
+                "tool_input": native,
+                "tool_response": {"task_name": owner},
+                "tool_use_id": "late-spawn-call",
+            }
+        )
+
+        self.assertEqual(control.status()["counts"]["paused"], 1)
+
+    def test_child_result_receipt_survives_transient_settlement_failure(self) -> None:
+        control = self.control("durable-child-result")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        result = result_text(dispatch_id, evidence={"A01": "verified"})
+        with (
+            patch.object(
+                control,
+                "record_result",
+                side_effect=ControlPlaneUnavailable("simulated state outage"),
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "state outage"),
+        ):
+            control.process_result_event(owner, result)
+
+        self.assertEqual(len(list(self.state_root.glob(".cco-pending-*.event"))), 1)
+        self.assertIn("migrate-recoveries", control.pending_event_reason())
+        control.process_result_event(owner, result)
+        self.assertEqual(control.status()["counts"]["retired"], 1)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_replay_settles_child_result_before_a_queued_restart(self) -> None:
+        control = self.control("result-before-restart")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        result_event = control._pending_event(
+            "child_result",
+            owner=owner,
+            result=result_text(dispatch_id, evidence={"A01": "verified"}),
+        )
+        control._stage_pending_event(result_event)
+
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"):
+            control.process_restart_event("resume")
+
+        self.control("result-restart-migrator").migrate_recoveries()
+        self.assertEqual(control.status()["counts"]["retired"], 1)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_staging_file_blocks_without_parsing_its_payload(self) -> None:
+        control = self.control("staging-fail-closed")
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        staging = self.state_root / ".cco-staging-broken.pending"
+        staging.write_bytes(b"x" * 1024)
+
+        with (
+            patch.object(
+                control_plane_module,
+                "_load_object",
+                side_effect=AssertionError("staging payload must not be parsed by a Hook"),
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "migrate-recoveries"),
+        ):
+            _ = control.state_path
 
 
 if __name__ == "__main__":

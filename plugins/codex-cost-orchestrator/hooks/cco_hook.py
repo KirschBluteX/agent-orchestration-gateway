@@ -61,6 +61,8 @@ MAX_PROTECTED_NODES = 10_000
 MAX_PROTECTED_BYTES = 1024 * 1024
 PRETOOL_INTERNAL_BUDGET_SECONDS = 24.0
 POSTTOOL_INTERNAL_BUDGET_SECONDS = 3.5
+SESSION_START_INTERNAL_BUDGET_SECONDS = 3.5
+STOP_INTERNAL_BUDGET_SECONDS = 3.5
 SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS = 100.0
 
 
@@ -85,6 +87,16 @@ def _block(error: Exception | str) -> dict[str, str]:
 
 def _event_error(event: object, error: Exception) -> dict[str, Any]:
     message = f"CCO: {error}"
+    if "migrate-recoveries" in str(error):
+        instruction = (
+            f"{message}. Run `python -B <PLUGIN_ROOT>/scripts/control_plane.py "
+            "migrate-recoveries`; it will replay this pending lifecycle event."
+        )
+        if event == "SessionStart":
+            return {"systemMessage": instruction}
+        if event in {"Stop", "SubagentStop"}:
+            return {"decision": "block", "reason": instruction}
+        return {"decision": "block", "reason": instruction}
     if isinstance(
         error,
         (ControlPlaneUnavailable, OperationDeadlineExceeded, StateLockBusy, OSError),
@@ -234,7 +246,10 @@ def evaluate(value: object) -> dict[str, Any]:
         if event == "SessionStart":
             if value.get("source") not in {"resume", "clear"}:
                 return {}
-            interrupted = _control(value).restart()
+            with deadline_after(SESSION_START_INTERNAL_BUDGET_SECONDS):
+                interrupted = _control(value).process_restart_event(
+                    str(value["source"])
+                )
             if interrupted:
                 return {
                     "hookSpecificOutput": {
@@ -308,7 +323,7 @@ def evaluate(value: object) -> dict[str, Any]:
         if event == "PostToolUse":
             with deadline_after(POSTTOOL_INTERNAL_BUDGET_SECONDS):
                 if value.get("tool_name") in INTERRUPT_TOOLS:
-                    _control(value).postflight_interrupt(value)
+                    _control(value).process_postflight_event(value)
                     return {}
                 tool_input = value.get("tool_input")
                 message = (
@@ -319,12 +334,14 @@ def evaluate(value: object) -> dict[str, Any]:
                 if isinstance(message, str) and message.startswith(
                     (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
                 ):
-                    _control(value).postflight_tool(value)
+                    _control(value).process_postflight_event(value)
                 return {}
         if event == "Stop":
             if value.get("stop_hook_active") is True:
                 return {}
-            reason = _control(value).stop_reason()
+            with deadline_after(STOP_INTERNAL_BUDGET_SECONDS):
+                control = _control(value)
+                reason = control.pending_event_reason() or control.stop_reason()
             return _block(reason) if reason else {}
         if event == "SubagentStop":
             with deadline_after(SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS):
@@ -347,7 +364,7 @@ def evaluate(value: object) -> dict[str, Any]:
                     }
                 message = value.get("last_assistant_message")
                 try:
-                    control.record_result(owner, message)
+                    control.process_result_event(owner, message)
                 except (
                     ControlPlaneUnavailable,
                     OperationDeadlineExceeded,

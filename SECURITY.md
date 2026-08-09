@@ -58,6 +58,11 @@ made fail-closed by a plugin and remains part of the trusted-host boundary.
 PostToolUse uses one 3.5-second internal deadline within the host's five-second timeout;
 interrupt ownership and settlement share one workspace-coordinated transaction instead
 of consuming separate lock budgets.
+SessionStart and Stop also use 3.5-second internal deadlines. One-shot SessionStart,
+successful PostToolUse, and SubagentStop payloads are written to bounded receipt files
+before lifecycle settlement. Receipts are not a second authority: lifecycle JSON remains
+authoritative, successful receipts are deleted immediately, and exact replay is
+idempotent. An unresolved receipt prevents cleanup or a replacement plan.
 Authoritative lifecycle decisions hold the workspace and session locks. The shared
 state-root lock covers only the final path rescan and selected state load. Recovery filenames
 carry a session digest, so that scan never parses unrelated recovery payloads. Older random
@@ -66,9 +71,10 @@ names make Hooks fail closed without opening their payloads and require the expl
 point while unrelated workspaces remain parallel.
 A changed workspace identity is rejected before recovery replay. Workspace verification
 also remains outside the lifecycle locks.
-Lifecycle roots are limited to 4,096 JSON files; Git output is limited to 64 MiB and
-200,000 records; each Git control-directory digest is limited to 100,000 entries. Limit
-violations block admission and never authorize truncated evidence.
+Lifecycle roots are limited to 4,096 ordinary JSON files, 32 recovery files, 32 visible
+migration staging files, and 128 pending event receipts. Git output is limited to 64 MiB
+and 200,000 records; each Git control-directory digest is limited to 100,000 entries.
+Limit violations block admission and never authorize truncated evidence.
 SubagentStop has a separate internal budget below its manifest timeout. Git, filesystem,
 deadline, and state-lock unavailability request an exact result replay; they do not fence
 the owner as though it violated scope.

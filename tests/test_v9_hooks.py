@@ -168,10 +168,18 @@ class V9HookTests(unittest.TestCase):
         )
         self.assertLessEqual(control.lock_timeout, 10)
 
+    def test_session_and_stop_budgets_are_below_host_timeouts(self) -> None:
+        manifest = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+        session_timeout = manifest["hooks"]["SessionStart"][0]["hooks"][0]["timeout"]
+        stop_timeout = manifest["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+
+        self.assertLess(cco_hook.SESSION_START_INTERNAL_BUDGET_SECONDS, session_timeout)
+        self.assertLess(cco_hook.STOP_INTERNAL_BUDGET_SECONDS, stop_timeout)
+
     def test_postflight_delegates_only_success_settlement(self) -> None:
         class Control:
             @staticmethod
-            def postflight_tool(_payload: object) -> None:
+            def process_postflight_event(_payload: object) -> None:
                 return None
 
         with patch.object(cco_hook, "_control", return_value=Control()):
@@ -214,6 +222,10 @@ class V9HookTests(unittest.TestCase):
     def test_stop_blocks_only_the_first_stop_event_while_work_is_active(self) -> None:
         class Control:
             @staticmethod
+            def pending_event_reason() -> None:
+                return None
+
+            @staticmethod
             def stop_reason() -> str:
                 return "wait for the native terminal event"
 
@@ -230,7 +242,7 @@ class V9HookTests(unittest.TestCase):
     def test_session_compaction_does_not_fence_live_children(self) -> None:
         class Control:
             @staticmethod
-            def restart() -> int:
+            def process_restart_event(_source: str) -> int:
                 raise AssertionError("compact must not run restart recovery")
 
         with patch.object(cco_hook, "_control", return_value=Control()):
@@ -242,7 +254,7 @@ class V9HookTests(unittest.TestCase):
     def test_session_resume_fences_native_work_lost_by_restart(self) -> None:
         class Control:
             @staticmethod
-            def restart() -> int:
+            def process_restart_event(_source: str) -> int:
                 return 2
 
         with patch.object(cco_hook, "_control", return_value=Control()):
@@ -257,7 +269,7 @@ class V9HookTests(unittest.TestCase):
 
         class Control:
             @staticmethod
-            def record_result(owner: str, result: object) -> None:
+            def process_result_event(owner: str, result: object) -> None:
                 calls.append((owner, result))
 
         with (
@@ -278,7 +290,7 @@ class V9HookTests(unittest.TestCase):
         calls: list[tuple[str, object]] = []
         class Control:
             @staticmethod
-            def record_result(owner: str, result: object) -> None:
+            def process_result_event(owner: str, result: object) -> None:
                 calls.append((owner, result))
                 raise ValueError("not a CCO result")
 
@@ -307,7 +319,7 @@ class V9HookTests(unittest.TestCase):
     def test_subagent_stop_lock_contention_retries_without_fencing_result(self) -> None:
         class Control:
             @staticmethod
-            def record_result(_owner: str, _result: object) -> None:
+            def process_result_event(_owner: str, _result: object) -> None:
                 raise StateLockBusy("busy")
 
             @staticmethod
@@ -338,7 +350,7 @@ class V9HookTests(unittest.TestCase):
                 return True
 
             @staticmethod
-            def postflight_interrupt(payload: object) -> bool:
+            def process_postflight_event(payload: object) -> bool:
                 calls.append(("post", payload))
                 return True
 
@@ -409,6 +421,51 @@ class V9HookTests(unittest.TestCase):
 
         self.assertEqual(outcome["decision"], "block")
         self.assertIn("multiple workspaces", outcome["reason"])
+
+    def test_migration_instruction_is_preserved_for_one_shot_hook_events(self) -> None:
+        class Control:
+            @staticmethod
+            def process_restart_event(_source: str) -> int:
+                raise cco_hook.ControlPlaneUnavailable(
+                    "legacy lifecycle recovery requires explicit migrate-recoveries"
+                )
+
+            @staticmethod
+            def process_postflight_event(_payload: object) -> bool:
+                raise cco_hook.ControlPlaneUnavailable(
+                    "legacy lifecycle recovery requires explicit migrate-recoveries"
+                )
+
+            @staticmethod
+            def process_result_event(_owner: str, _result: object) -> None:
+                raise cco_hook.ControlPlaneUnavailable(
+                    "legacy lifecycle recovery requires explicit migrate-recoveries"
+                )
+
+        with (
+            patch.object(cco_hook, "_control", return_value=Control()),
+            patch.object(cco_hook, "_owner", return_value="/root/worker_n01"),
+        ):
+            session = cco_hook.evaluate(
+                {"hook_event_name": "SessionStart", "source": "resume"}
+            )
+            post = cco_hook.evaluate(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_input": {"message": "CCO_TASK cco.v9\n{}"},
+                    "tool_name": "spawn_agent",
+                }
+            )
+            result = cco_hook.evaluate(
+                {
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "CCO_RESULT cco.v9\n{}",
+                }
+            )
+
+        self.assertIn("migrate-recoveries", session["systemMessage"])
+        self.assertIn("replay this pending lifecycle event", post["reason"])
+        self.assertIn("migrate-recoveries", result["reason"])
 
 
 if __name__ == "__main__":

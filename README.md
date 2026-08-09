@@ -130,6 +130,10 @@ One Codex task owns one plan until explicit inactive cleanup. `status` reports c
 counts plus actionable paused, fenced, or owner-pending dispatch identities. A spawn
 response that omits the owner remains pending until trusted SubagentStop rollout evidence
 binds it; missing response metadata alone is not treated as worker failure.
+SessionStart, successful native PostToolUse, and SubagentStop first write a bounded
+one-shot receipt. A completed receipt is deleted immediately; if settlement is
+interrupted, `migrate-recoveries` replays it idempotently before cleanup or plan
+replacement can discard its lifecycle proof.
 An expired `wait_agent` window is not a child timeout: Primary starts another long wait
 without retrying the child or performing overlapping work.
 
@@ -185,7 +189,9 @@ Codex currently treats a crashed or host-timed-out PreToolUse command as fail-op
 uses a shorter internal deadline and returns an explicit block before the host deadline,
 but it cannot turn a killed Hook process into an OS-level fail-closed boundary.
 SubagentStop also settles within its own shorter budget; temporary Git, filesystem, or
-state-lock failures ask the child to repeat the exact same result rather than fencing it.
+state-lock failures preserve the exact result receipt and ask the child to repeat the
+same result rather than fencing it. SessionStart, Stop, and PostToolUse likewise keep
+their internal deadlines below their five-second host timeouts.
 Lifecycle discovery, Git output and records, and Git control-directory inspection have
 explicit fail-closed size limits; exceeding one blocks admission instead of sampling.
 

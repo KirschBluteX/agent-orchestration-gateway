@@ -2,6 +2,25 @@
 
 The project follows semantic versioning.
 
+## 4.1.0 - 2026-08-09
+
+- Treat Primary wakeups, compact capsule isolation, compatible owner reuse, safe
+  parallelism, and probe isolation as structural delegation value. Route eligible
+  mechanical work to the cheapest supported leaf and never repeat successful evidence
+  in the high-cost Primary.
+- Persist bounded one-shot Hook receipts before SessionStart, successful PostToolUse,
+  and SubagentStop settlement. Exact replay is idempotent, distinct restart events keep
+  distinct identities, and unresolved receipts block cleanup or plan replacement.
+- Replace filename-ordered recovery migration with per-session exact-hash lineage
+  merging under workspace, session, and state-root locks. Linear ancestors merge in
+  revision order; sibling branches and cross-plan state remain fail-closed.
+- Use visible non-JSON staging and streaming quarantine for oversized invalid recovery
+  files. Normal Hooks inspect only bounded filenames, while the explicit cold path
+  replays pending events and completes migration.
+- Preserve recovery capacity across staging publication, bind reads to the opened file
+  identity, and keep SessionStart, Stop, PostToolUse, and SubagentStop work inside their
+  declared internal budgets.
+
 ## 4.0.7 - 2026-08-09
 
 - Keep normal Hook paths independent of legacy random recovery payload size. Hooks fail

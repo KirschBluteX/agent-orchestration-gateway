@@ -122,9 +122,10 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py migrate-recoveries
   workspace before retrying.
 - `cleanup` deletes only the current task's inactive state and artifacts. It refuses
   active or paused child work; retain state until host-card maintenance is unnecessary.
-- `migrate-recoveries` is a root-wide, cold-path upgrade operation and does not require
-  `CODEX_THREAD_ID`. Run it only when a Hook reports an old random recovery name. It
-  persists each migrated file before reading the next, so interrupted runs make progress.
+- `migrate-recoveries` is a root-wide, cold-path recovery operation and does not require
+  `CODEX_THREAD_ID`. Run it when a Hook reports random recovery, visible staging, or an
+  unsettled one-shot event. It merges each session's exact parent-hash chain, publishes
+  only its unique tip, then replays pending events in safe lifecycle order.
 - `status` includes compact counts and direct identities for paused, fenced, and
   owner-pending dispatches.
 
@@ -149,27 +150,22 @@ quarantine unrelated JSON, but every valid legacy lifecycle file still participa
 reader/writer lease checks.
 
 Lifecycle discovery uses incremental `scandir` and admits no new task after 4,096 ordinary
-root-level lifecycle JSON files. Slot creation is serialized across tasks; an already
-over-capacity root still permits current-task `status` and inactive `cleanup`. Git inspection
-spools output outside process memory, refuses more than 64 MiB or 200,000 parsed records,
-and shares one 100,000-entry budget across every Git control-directory and resolved reparse
-target. These are admission limits: CCO blocks instead of truncating evidence.
+root-level lifecycle JSON files. It separately limits recovery files to 32, visible
+migration staging to 32, and pending one-shot event receipts to 128. Slot creation is
+serialized across tasks. Git inspection spools output outside process memory, refuses
+more than 64 MiB or 200,000 parsed records, and shares one 100,000-entry budget across
+every Git control-directory and resolved reparse target. These are admission limits: CCO
+blocks instead of truncating evidence.
 Legacy quarantine first atomically moves the pathname to top-level recovery staging and
 validates the object actually moved. A concurrent replacement at the original path is never
-deleted. Valid recovery state receives one stable session-addressed filename, remains
-lease-visible, and is replayed to its canonical pathname under that recovery's own workspace lock.
-Normal Hooks inspect recovery filenames only. A pre-4.0.7 random recovery name causes an
-immediate fail-closed request for `migrate-recoveries`; the explicit command validates and
-renames one durable file at a time without a Hook deadline. An existing canonical state is replaced or
-finalized only when exact content or a hash-proven direct parent transition establishes
-its lineage; invalid state moves to content-addressed quarantine only after the durable
-object is available. The ownership sentinel authorizes every invalid-file quarantine,
-including old `.cco-recovery-*` names. An invalid random recovery in an unmarked shared
-root remains untouched and blocks migration. Valid recovery state does not require the
-sentinel to preserve its lease. Recovery state
-from another workspace or plan can never replace the
-current session's canonical state; the operation preserves both and fails closed. The
-sentinel never controls valid recovery replay.
+deleted. Staging uses a non-JSON filename, so normal Hooks fail closed from its bounded
+name without parsing the payload. The explicit cold path reads one file at a time, keeps
+only compact lineage metadata, validates full exact-parent chains independently of
+filename order, and rejects sibling branches or cross-plan state. Oversized invalid files
+are content-hashed as a stream before no-replace quarantine. A unique valid tip receives
+one stable session-addressed filename under workspace, session, and state-root locks.
+Invalid recovery in an unmarked shared root remains untouched and fail-closed; the
+ownership sentinel authorizes quarantine, never valid lease discovery.
 The same state-root lock serializes capacity changes and recovery publication. An
 authoritative lifecycle operation holds it only for its final path rescan and state load,
 then releases it before plan/wave work, state calculation, persistence, or artifact cleanup.
@@ -186,14 +182,24 @@ error; never infer a retry from arbitrary assistant prose. A successful spawn re
 without a canonical owner stays running as owner-pending; trusted UUID/rollout evidence may
 bind it when the result stops.
 
+SessionStart, successful PostToolUse, and SubagentStop write a bounded receipt before
+settlement. A successful receipt is deleted immediately. Exact replay is idempotent;
+distinct resume/clear occurrences have distinct identities, and unresolved receipts
+block cleanup or plan replacement. If a restart arrives while an older receipt remains,
+both are preserved and the Hook requests `migrate-recoveries`; the cold path settles
+child results and native successes before restart fencing.
+
 CCO PreToolUse work uses a shared internal deadline, bounded Git subprocesses, and short
 lock waits with rollback reserve below the 30-second manifest timeout. Current Codex logs
 a Hook command crash or timeout but still allows the native tool; this host-level
 fail-open behavior is outside a plugin's enforcement authority. Treat CCO as a workflow
 guardrail, keep Hooks trusted, and inspect host Hook failures.
-SubagentStop uses its own budget below the 120-second host timeout. Temporary workspace or
-state infrastructure failures return `decision:block`, so the child repeats the exact same
-`CCO_RESULT`; only a verified scope or result-contract violation is fenced.
+SessionStart, Stop, and PostToolUse each use a 3.5-second internal deadline below their
+five-second host timeout. SubagentStop uses its own budget below the 120-second host
+timeout. Temporary workspace or state infrastructure failures preserve the exact receipt
+and return `decision:block`, so the child repeats the same `CCO_RESULT`; only a verified
+scope or result-contract violation is fenced. Stop detects a retained receipt without
+running heavy workspace verification and directs the user to the cold path.
 
 Wave artifacts contain the fresh baseline and are deleted as soon as every physical
 dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,

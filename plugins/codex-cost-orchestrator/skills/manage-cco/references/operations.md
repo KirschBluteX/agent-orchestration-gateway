@@ -38,15 +38,18 @@ or paused turn; inspect the workspace before `retry`.
 wait; do not settle it as a native timeout.
 An exact `prepare` retry resumes an identical plan only before its first wave exists.
 Temporary SubagentStop verification failures make the same child repeat its exact
-`CCO_RESULT`; do not create a replacement child.
+`CCO_RESULT`; the bounded result receipt remains available for idempotent cold-path
+replay. Do not create a replacement child.
 
 `cleanup` is current-task-only and refuses active or paused child work. It remains
 available when the shared lifecycle root is already over its admission limit. Run it
 only after host-card maintenance is no longer needed.
 
 `migrate-recoveries` is root-wide and does not require `CODEX_THREAD_ID`. Normal Hooks
-never parse old random recovery payloads; when they request migration, run this command
-once. It commits each valid file before reading the next. Invalid random recovery files
+never parse old random recovery or staging payloads; when they request migration, run
+this command once. It groups each session's exact parent-hash chain, rejects branches,
+publishes the unique tip under workspace/session/root locks, streams oversized invalid
+files to quarantine, and replays pending one-shot Hook receipts. Invalid recovery files
 are quarantined only when the state root has CCO's ownership sentinel; an unmarked shared
 root is left unchanged and fails closed.
 

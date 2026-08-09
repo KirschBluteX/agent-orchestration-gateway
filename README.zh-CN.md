@@ -118,6 +118,9 @@ CCO 源码。后续依赖波次只调用 `next`。只有多个节点必须共享
 一个 Codex 任务在显式清理非活动状态前只拥有一份 plan。`status` 除紧凑计数外，
 还会直接列出暂停、fenced 或等待 owner 绑定的 dispatch。spawn 即时返回缺少 owner
 不会再被当成 worker 失败；SubagentStop 会用受信 rollout 证据完成迟绑定。
+SessionStart、成功的原生 PostToolUse 与 SubagentStop 会先写入有界的一次性事件收据，
+再结算生命周期。成功后收据立即删除；若结算被中断，`migrate-recoveries` 会进行幂等
+重放，cleanup 或新 plan 不能提前丢弃相关生命周期证据。
 `wait_agent` 的等待窗口到期不代表子 Agent 超时或失败；Primary 会继续一次长等待，
 不会重试子 Agent，也不会开始重叠工作。
 
@@ -165,7 +168,8 @@ CCO 是工作流护栏，不是操作系统安全边界。Primary 仍是可信�
 Codex 当前会在 PreToolUse 命令崩溃或被宿主超时终止时 fail-open。CCO 使用明显更短的
 内部期限并在宿主期限前显式阻止调用，但无法把被杀死的 Hook 进程变成操作系统级
 fail-closed 边界。SubagentStop 同样使用短于宿主的内部期限；临时 Git、文件系统或状态锁
-故障只会要求子 Agent 原样重复同一份结果，不会 fencing 合法结果。
+故障会保留精确结果收据，并要求子 Agent 原样重复同一份结果，不会 fencing 合法结果。
+SessionStart、Stop 和 PostToolUse 的内部期限也均短于各自五秒的宿主期限。
 生命周期文件发现、Git 输出与记录、Git 控制目录检查均有明确的 fail-closed 大小上限；
 超限时会阻止 admission，而不是截断或抽样后继续。
 

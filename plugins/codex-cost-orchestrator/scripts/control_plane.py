@@ -58,6 +58,7 @@ WAVE_PROTOCOL = "cco.wave.v2"
 LEGACY_WAVE_PROTOCOL = "cco.wave.v1"
 BATCH_PROTOCOL = "cco.wave-batch.v2"
 LIFECYCLE_PROTOCOL = "cco.lifecycle.v1"
+PENDING_EVENT_PROTOCOL = "cco.pending-event.v1"
 TASK_HEADER = "CCO_TASK cco.v9"
 CONTINUE_HEADER = "CCO_CONTINUE cco.v9"
 RESULT_HEADER = "CCO_RESULT cco.v9"
@@ -110,6 +111,12 @@ RECOVERY_FILE_RE = re.compile(r"^\.cco-recovery-[A-Za-z0-9_-]+\.json$")
 SESSION_RECOVERY_FILE_RE = re.compile(
     r"^\.cco-recovery-s(?P<session>[0-9a-f]{64})\.json$"
 )
+RECOVERY_STAGING_FILE_RE = re.compile(
+    r"^\.cco-staging-[A-Za-z0-9_-]+\.pending$"
+)
+PENDING_EVENT_FILE_RE = re.compile(
+    r"^\.cco-pending-s(?P<session>[0-9a-f]{64})-(?P<event>[0-9a-f]{64})\.event$"
+)
 STATE_ROOT_SENTINEL = ".cco-state-root-v1"
 STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
 # Capacity reservation and recovery publication share this existing root lock.
@@ -118,6 +125,10 @@ STATE_ROOT_LOCK = "state-root-capacity"
 MAX_STATE_FILE_BYTES = 32 * 1024 * 1024
 MAX_STATE_FILES = 4_096
 MAX_RECOVERY_FILES = 32
+MAX_RECOVERY_STAGING_FILES = 32
+MAX_PENDING_EVENT_FILES = 128
+MAX_PENDING_EVENT_BYTES = MAX_INPUT_BYTES + 128 * 1024
+MAX_SETTLED_EVENTS = 128
 STATE_READ_CHUNK_BYTES = 1024 * 1024
 
 
@@ -182,6 +193,14 @@ def _lifecycle_recovery_path(root: Path, session_id: str) -> Path:
     return root / f".cco-recovery-s{_session_digest(session_id)}.json"
 
 
+def _pending_event_path(root: Path, session_id: str, event_id: str) -> Path:
+    if SHA256_RE.fullmatch(event_id) is None:
+        raise ControlPlaneError("pending event identity is invalid")
+    return root / (
+        f".cco-pending-s{_session_digest(session_id)}-{event_id[7:]}.event"
+    )
+
+
 def _lifecycle_lineage_id(
     workspace: object,
     session_id: str,
@@ -215,6 +234,16 @@ def _state_content_id(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
+def _semantic_state_id(state: Mapping[str, Any]) -> str:
+    serialized = json.dumps(
+        dict(state),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(serialized).hexdigest()
+
+
 def _path_identity(path: Path, label: str) -> tuple[int, int, int, int, int, int]:
     try:
         stat = path.stat()
@@ -228,6 +257,78 @@ def _path_identity(path: Path, label: str) -> tuple[int, int, int, int, int, int
         stat.st_mtime_ns,
         stat.st_ctime_ns,
     )
+
+
+def _metadata_identity(stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_mode,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+
+
+def _read_stable_bytes(
+    path: Path,
+    label: str,
+    *,
+    limit: int = MAX_STATE_FILE_BYTES,
+) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+    """Read one pathname-bound snapshot and reject replacement during the read."""
+
+    checkpoint()
+    raw = bytearray()
+    try:
+        with path.open("rb") as handle:
+            opened = _metadata_identity(os.fstat(handle.fileno()))
+            while True:
+                checkpoint()
+                chunk = handle.read(min(STATE_READ_CHUNK_BYTES, limit - len(raw) + 1))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > limit:
+                    raise ControlPlaneError(f"{label} is too large")
+            if _metadata_identity(os.fstat(handle.fileno())) != opened:
+                raise ControlPlaneUnavailable(f"{label} changed while being read")
+    except OSError as error:
+        raise ControlPlaneUnavailable(f"{label} is unavailable") from error
+    # Deliberately check the pathname after reading the open descriptor.  This
+    # binds the bytes used for lineage decisions to the object still published
+    # at that name and detects an atomic replacement after the read.
+    if _path_identity(path, label)[:4] != opened[:4]:
+        raise ControlPlaneUnavailable(f"{label} changed while being read")
+    return bytes(raw), opened
+
+
+def _streaming_file_identity(
+    path: Path,
+    label: str,
+) -> tuple[str, int, tuple[int, int, int, int, int, int]]:
+    """Hash an arbitrarily large quarantine source without materializing it."""
+
+    checkpoint()
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as handle:
+            opened = _metadata_identity(os.fstat(handle.fileno()))
+            while True:
+                checkpoint()
+                chunk = handle.read(STATE_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+            if _metadata_identity(os.fstat(handle.fileno())) != opened:
+                raise ControlPlaneUnavailable(f"{label} changed while being hashed")
+    except OSError as error:
+        raise ControlPlaneUnavailable(f"{label} is unavailable") from error
+    if _path_identity(path, label)[:4] != opened[:4]:
+        raise ControlPlaneUnavailable(f"{label} changed while being hashed")
+    return digest.hexdigest(), size, opened
 
 
 def _lineage_relation(
@@ -358,6 +459,10 @@ def _state_json_paths(root: Path) -> list[Path]:
         with os.scandir(root) as entries:
             for entry in entries:
                 checkpoint()
+                if RECOVERY_STAGING_FILE_RE.fullmatch(entry.name) is not None:
+                    raise ControlPlaneUnavailable(
+                        "staged lifecycle recovery requires explicit migrate-recoveries"
+                    )
                 if not entry.name.endswith(".json"):
                     continue
                 if RECOVERY_FILE_RE.fullmatch(entry.name) is not None:
@@ -390,6 +495,29 @@ def _state_capacity_used(paths: list[Path]) -> int:
     return sum(RECOVERY_FILE_RE.fullmatch(path.name) is None for path in paths)
 
 
+def _recovery_file_count(root: Path) -> int:
+    count = 0
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                checkpoint()
+                if RECOVERY_FILE_RE.fullmatch(entry.name) is None:
+                    continue
+                count += 1
+                if count > MAX_RECOVERY_FILES:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle state directory exceeds the "
+                        f"{MAX_RECOVERY_FILES} recovery file limit"
+                    )
+    except FileNotFoundError:
+        return 0
+    except OSError as error:
+        raise ControlPlaneUnavailable(
+            "lifecycle state directory is unavailable"
+        ) from error
+    return count
+
+
 def _session_state_paths(root: Path, session_id: str) -> tuple[list[Path], list[Path]]:
     """Find one task's state without reading another task's recovery payload."""
 
@@ -403,6 +531,10 @@ def _session_state_paths(root: Path, session_id: str) -> tuple[list[Path], list[
         with os.scandir(root) as entries:
             for entry in entries:
                 checkpoint()
+                if RECOVERY_STAGING_FILE_RE.fullmatch(entry.name) is not None:
+                    raise ControlPlaneUnavailable(
+                        "staged lifecycle recovery requires explicit migrate-recoveries"
+                    )
                 if entry.name == legacy_name or entry.name.endswith(suffix):
                     matches.append(Path(entry.path))
                 elif RECOVERY_FILE_RE.fullmatch(entry.name) is not None:
@@ -426,6 +558,70 @@ def _session_state_paths(root: Path, session_id: str) -> tuple[list[Path], list[
     matches.sort(key=lambda item: item.name)
     unindexed_recoveries.sort(key=lambda item: item.name)
     return matches, unindexed_recoveries
+
+
+def _migration_source_paths(root: Path) -> list[Path]:
+    """Return bounded legacy recovery and interrupted-staging paths."""
+
+    paths: list[Path] = []
+    recovery_count = 0
+    staging_count = 0
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                checkpoint()
+                if RECOVERY_STAGING_FILE_RE.fullmatch(entry.name) is not None:
+                    if staging_count >= MAX_RECOVERY_STAGING_FILES:
+                        raise ControlPlaneUnavailable(
+                            "lifecycle state directory exceeds the "
+                            f"{MAX_RECOVERY_STAGING_FILES} staging file limit"
+                        )
+                    staging_count += 1
+                    paths.append(Path(entry.path))
+                    continue
+                if (
+                    RECOVERY_FILE_RE.fullmatch(entry.name) is not None
+                    and SESSION_RECOVERY_FILE_RE.fullmatch(entry.name) is None
+                ):
+                    if recovery_count >= MAX_RECOVERY_FILES:
+                        raise ControlPlaneUnavailable(
+                            "lifecycle state directory exceeds the "
+                            f"{MAX_RECOVERY_FILES} recovery file limit"
+                        )
+                    recovery_count += 1
+                    paths.append(Path(entry.path))
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise ControlPlaneUnavailable(
+            "lifecycle state directory is unavailable"
+        ) from error
+    paths.sort(key=lambda item: item.name)
+    return paths
+
+
+def _pending_event_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                checkpoint()
+                if PENDING_EVENT_FILE_RE.fullmatch(entry.name) is None:
+                    continue
+                if len(paths) >= MAX_PENDING_EVENT_FILES:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle state directory exceeds the "
+                        f"{MAX_PENDING_EVENT_FILES} pending event limit"
+                    )
+                paths.append(Path(entry.path))
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise ControlPlaneUnavailable(
+            "lifecycle pending event directory is unavailable"
+        ) from error
+    paths.sort(key=lambda item: item.name)
+    return paths
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1298,15 +1494,21 @@ class ControlPlane:
         json_files = _state_json_paths(self.root)
         if json_files and not self._uses_default_root:
             for path in json_files:
-                if STATE_FILE_RE.fullmatch(path.name) is not None:
-                    continue
                 try:
-                    self._validate_lifecycle_state(
+                    state = self._validate_lifecycle_state(
                         _load_object(path, "legacy cco.v9 lifecycle state")
                     )
                 except ControlPlaneUnavailable:
                     raise
                 except ControlPlaneError:
+                    return
+                indexed = STATE_FILE_RE.fullmatch(path.name)
+                if indexed is not None and (
+                    indexed.group("workspace")
+                    != _workspace_digest(state["workspace_root"])
+                    or indexed.group("session")
+                    != _session_digest(state["session_id"])
+                ):
                     return
         try:
             descriptor = os.open(
@@ -1327,32 +1529,220 @@ class ControlPlane:
             self._state_root_sentinel.unlink(missing_ok=True)
             raise
 
-    def _publish_session_recovery(
-        self,
-        path: Path,
-        state: dict[str, Any],
-        raw: bytes,
-    ) -> tuple[Path, dict[str, Any]]:
-        """Give a validated recovery a stable session-addressable name."""
+    @staticmethod
+    def _validate_pending_event(
+        value: Mapping[str, Any],
+        *,
+        expected_session: str | None = None,
+    ) -> dict[str, Any]:
+        event = dict(value)
+        event_id = event.get("event_id")
+        session = event.get("session_id")
+        kind = event.get("kind")
+        if event.get("protocol") != PENDING_EVENT_PROTOCOL:
+            raise ControlPlaneError("pending event protocol is invalid")
+        if not isinstance(session, str) or SESSION_RE.fullmatch(session) is None:
+            raise ControlPlaneError("pending event session is invalid")
+        if expected_session is not None and session != expected_session:
+            raise ControlPlaneError("pending event session does not match")
+        if kind == "session_restart":
+            if set(event) != {
+                "event_id",
+                "kind",
+                "occurrence",
+                "protocol",
+                "session_id",
+                "source",
+            } or (
+                event.get("source") not in {"resume", "clear"}
+                or not isinstance(event.get("occurrence"), str)
+                or re.fullmatch(r"[0-9a-f]{32}", event["occurrence"]) is None
+            ):
+                raise ControlPlaneError("pending restart event is invalid")
+        elif kind == "native_success":
+            owners = event.get("owners")
+            if (
+                set(event)
+                != {
+                    "dispatch_id",
+                    "event_id",
+                    "kind",
+                    "owners",
+                    "protocol",
+                    "session_id",
+                    "tool_input_sha256",
+                    "tool_use_id",
+                }
+                or not isinstance(event.get("dispatch_id"), str)
+                or SHA256_RE.fullmatch(event["dispatch_id"]) is None
+                or not isinstance(event.get("tool_input_sha256"), str)
+                or SHA256_RE.fullmatch(event["tool_input_sha256"]) is None
+                or not isinstance(event.get("tool_use_id"), str)
+                or not event["tool_use_id"]
+                or not isinstance(owners, list)
+                or len(owners) > 2
+                or len(set(owners)) != len(owners)
+                or any(
+                    not isinstance(owner, str)
+                    or TASK_PATH_RE.fullmatch(owner) is None
+                    for owner in owners
+                )
+            ):
+                raise ControlPlaneError("pending native success event is invalid")
+        elif kind == "interrupt_success":
+            if (
+                set(event)
+                != {
+                    "event_id",
+                    "kind",
+                    "owner",
+                    "previous_status",
+                    "protocol",
+                    "session_id",
+                    "tool_use_id",
+                }
+                or not isinstance(event.get("owner"), str)
+                or TASK_PATH_RE.fullmatch(event["owner"]) is None
+                or not isinstance(event.get("previous_status"), str)
+                or not event["previous_status"]
+                or not isinstance(event.get("tool_use_id"), str)
+                or not event["tool_use_id"]
+            ):
+                raise ControlPlaneError("pending interrupt event is invalid")
+        elif kind == "child_result":
+            result = event.get("result")
+            if (
+                set(event)
+                != {
+                    "event_id",
+                    "kind",
+                    "owner",
+                    "protocol",
+                    "result",
+                    "session_id",
+                }
+                or not isinstance(event.get("owner"), str)
+                or TASK_PATH_RE.fullmatch(event["owner"]) is None
+                or not isinstance(result, str)
+                or not result
+                or len(result.encode("utf-8")) > MAX_INPUT_BYTES
+            ):
+                raise ControlPlaneError("pending child result event is invalid")
+        else:
+            raise ControlPlaneError("pending event kind is invalid")
+        unsigned = {key: item for key, item in event.items() if key != "event_id"}
+        expected_id = _digest(b"cco.pending-event.v1\0", unsigned)
+        if not isinstance(event_id, str) or event_id != expected_id:
+            raise ControlPlaneError("pending event identity is invalid")
+        return event
 
-        target = _lifecycle_recovery_path(self.root, str(state["session_id"]))
-        if path == target:
-            return path, state
-        identity = _path_identity(path, "lifecycle recovery")
-        current: dict[str, Any] | None = None
-        current_raw: bytes | None = None
-        target_identity: tuple[int, int, int, int, int, int] | None = None
-        if target.exists():
-            current_raw = _read_bounded_bytes(target, "indexed lifecycle recovery")
-            current = self._validate_lifecycle_state(
-                _decode_object(current_raw, "indexed lifecycle recovery"),
-                expected_session=str(state["session_id"]),
+    def _pending_event(self, kind: str, **fields: Any) -> dict[str, Any]:
+        unsigned = {
+            "kind": kind,
+            "protocol": PENDING_EVENT_PROTOCOL,
+            "session_id": self.session_id,
+            **fields,
+        }
+        event = {
+            **unsigned,
+            "event_id": _digest(b"cco.pending-event.v1\0", unsigned),
+        }
+        return self._validate_pending_event(event, expected_session=self.session_id)
+
+    def _pending_postflight_event(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        tool_use_id = payload.get("tool_use_id")
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            raise ControlPlaneError("native tool result has no call identity")
+        if not isinstance(tool_input, Mapping):
+            raise ControlPlaneError("native tool result has no input identity")
+        message = tool_input.get("message")
+        if isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
+            dispatch_id = parse_task_message(message)["dispatch_id"]
+        elif isinstance(message, str) and message.startswith(CONTINUE_HEADER + "\n"):
+            dispatch_id = parse_continue_message(message)["dispatch_id"]
+        else:
+            owner = tool_input.get("target")
+            response = payload.get("tool_response")
+            previous_status = (
+                response.get("previous_status")
+                if isinstance(response, Mapping)
+                else None
             )
-            target_identity = _path_identity(target, "indexed lifecycle recovery")
-        relation = (
-            _lineage_relation(current, current_raw, state, raw)
-            if current is not None and current_raw is not None
-            else None
+            if not isinstance(owner, str):
+                raise ControlPlaneError("native tool result is not CCO-owned")
+            if not isinstance(previous_status, str) or not previous_status:
+                previous_status = "unknown"
+            return self._pending_event(
+                "interrupt_success",
+                owner=owner,
+                previous_status=previous_status,
+                tool_use_id=tool_use_id,
+            )
+        response = payload.get("tool_response")
+        if _native_response_failed(response):
+            raise ControlPlaneError(
+                "failure-side PostToolUse is not a settlement event; use native-failure"
+            )
+        owners = sorted(_task_paths(response))[:2]
+        return self._pending_event(
+            "native_success",
+            dispatch_id=dispatch_id,
+            owners=owners,
+            tool_input_sha256=_digest(b"cco.native-input.v1\0", dict(tool_input)),
+            tool_use_id=tool_use_id,
+        )
+
+    def _stage_pending_event(self, event: Mapping[str, Any]) -> Path:
+        normalized = self._validate_pending_event(
+            event,
+            expected_session=self.session_id,
+        )
+        path = _pending_event_path(
+            self.root,
+            self.session_id,
+            normalized["event_id"],
+        )
+        self.root.mkdir(parents=True, exist_ok=True)
+        with acquire(
+            self.root,
+            STATE_ROOT_LOCK,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
+        ):
+            existing = _pending_event_paths(self.root)
+            if not path.exists() and len(existing) >= MAX_PENDING_EVENT_FILES:
+                raise ControlPlaneUnavailable(
+                    "lifecycle pending event capacity is exhausted"
+                )
+            if path.exists():
+                current = self._validate_pending_event(
+                    _decode_object(
+                        _read_bounded_bytes(
+                            path,
+                            "pending lifecycle event",
+                            limit=MAX_PENDING_EVENT_BYTES,
+                        ),
+                        "pending lifecycle event",
+                    ),
+                    expected_session=self.session_id,
+                )
+                if current != normalized:
+                    raise ControlPlaneError(
+                        "pending lifecycle event identity collision"
+                    )
+            else:
+                _atomic_write(path, normalized)
+        return path
+
+    def _clear_pending_event(self, event: Mapping[str, Any]) -> None:
+        normalized = self._validate_pending_event(
+            event,
+            expected_session=self.session_id,
+        )
+        path = _pending_event_path(
+            self.root,
+            self.session_id,
+            normalized["event_id"],
         )
         with acquire(
             self.root,
@@ -1360,62 +1750,419 @@ class ControlPlane:
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
             if not path.exists():
-                raise ControlPlaneUnavailable("lifecycle recovery disappeared during indexing")
-            if _path_identity(path, "lifecycle recovery") != identity:
-                raise ControlPlaneUnavailable("lifecycle recovery changed during indexing")
-            if target.exists():
-                if (
-                    target_identity is None
-                    or _path_identity(target, "indexed lifecycle recovery")
-                    != target_identity
-                ):
-                    raise ControlPlaneUnavailable(
-                        "indexed lifecycle recovery changed during deduplication"
-                    )
-                if relation == "conflict":
-                    raise ControlPlaneError("conflicting lifecycle recovery")
-                try:
-                    if relation == "candidate_child":
-                        os.replace(path, target)
-                        return target, state
-                    path.unlink()
-                except OSError as error:
-                    raise ControlPlaneUnavailable(
-                        "lifecycle recovery indexing finalization failed"
-                    ) from error
-                if current is None:
-                    raise ControlPlaneUnavailable("indexed lifecycle recovery is unavailable")
-                return target, current
-            if target_identity is not None:
+                return
+            current = self._validate_pending_event(
+                _decode_object(
+                    _read_bounded_bytes(
+                        path,
+                        "pending lifecycle event",
+                        limit=MAX_PENDING_EVENT_BYTES,
+                    ),
+                    "pending lifecycle event",
+                ),
+                expected_session=self.session_id,
+            )
+            if current != normalized:
                 raise ControlPlaneUnavailable(
-                    "indexed lifecycle recovery disappeared during deduplication"
+                    "pending lifecycle event changed before finalization"
                 )
             try:
-                os.replace(path, target)
+                path.unlink()
+            except FileNotFoundError:
+                pass
             except OSError as error:
                 raise ControlPlaneUnavailable(
-                    "lifecycle recovery indexing failed"
+                    "pending lifecycle event finalization failed"
                 ) from error
-        return target, state
+
+    @staticmethod
+    def _remember_settled_event(state: dict[str, Any], event_id: str) -> None:
+        settled = state.setdefault("settled_events", [])
+        if event_id in settled:
+            return
+        settled.append(event_id)
+        del settled[:-MAX_SETTLED_EVENTS]
+
+    def process_restart_event(self, source: str) -> int:
+        event = self._pending_event(
+            "session_restart",
+            occurrence=os.urandom(16).hex(),
+            source=source,
+        )
+        self._stage_pending_event(event)
+        session_prefix = f".cco-pending-s{_session_digest(self.session_id)}-"
+        with acquire(
+            self.root,
+            STATE_ROOT_LOCK,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
+        ):
+            pending = [
+                path
+                for path in _pending_event_paths(self.root)
+                if path.name.startswith(session_prefix)
+            ]
+        if len(pending) > 1:
+            raise ControlPlaneUnavailable(
+                "pending lifecycle events require explicit migrate-recoveries"
+            )
+        return int(self._process_pending_event(event))
+
+    def process_postflight_event(self, payload: Mapping[str, Any]) -> bool:
+        event = self._pending_postflight_event(payload)
+        return bool(self._process_pending_event(event))
+
+    def process_result_event(self, owner: str, raw_result: object) -> dict[str, Any]:
+        if not isinstance(raw_result, str):
+            raise ControlPlaneError("native child result is not text")
+        event = self._pending_event(
+            "child_result",
+            owner=owner,
+            result=raw_result,
+        )
+        try:
+            result = self._process_pending_event(event)
+        except ControlPlaneUnavailable:
+            raise
+        except ControlPlaneError:
+            self._clear_pending_event(event)
+            raise
+        if not isinstance(result, dict):
+            raise ControlPlaneError("native child result settlement is invalid")
+        return result
+
+    def _process_pending_event(self, event: Mapping[str, Any]) -> Any:
+        """Durably stage, settle, and finalize one one-shot Hook event."""
+
+        self._stage_pending_event(event)
+        settled = self._settle_pending_event(event)
+        self._clear_pending_event(event)
+        return settled
+
+    def replay_pending_events(self, *, all_sessions: bool = False) -> int:
+        with acquire(
+            self.root,
+            STATE_ROOT_LOCK,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
+        ):
+            paths = _pending_event_paths(self.root)
+        if not all_sessions:
+            prefix = f".cco-pending-s{_session_digest(self.session_id)}-"
+            paths = [path for path in paths if path.name.startswith(prefix)]
+        events: list[tuple[Path, dict[str, Any]]] = []
+        for path in paths:
+            event = self._validate_pending_event(
+                _decode_object(
+                    _read_bounded_bytes(
+                        path,
+                        "pending lifecycle event",
+                        limit=MAX_PENDING_EVENT_BYTES,
+                    ),
+                    "pending lifecycle event",
+                )
+            )
+            match = PENDING_EVENT_FILE_RE.fullmatch(path.name)
+            if match is None or (
+                match.group("session") != _session_digest(event["session_id"])
+                or match.group("event") != event["event_id"][7:]
+            ):
+                raise ControlPlaneError(
+                    "pending lifecycle event filename does not match its payload"
+                )
+            events.append((path, event))
+        priority = {
+            "child_result": 0,
+            "native_success": 1,
+            "interrupt_success": 2,
+            "session_restart": 3,
+        }
+        events.sort(key=lambda item: (priority[item[1]["kind"]], item[0].name))
+        replayed = 0
+        for _path, event in events:
+            control = ControlPlane(
+                event["session_id"],
+                root=self.root,
+                lock_timeout=self.lock_timeout,
+            )
+            control._settle_pending_event(event)
+            control._clear_pending_event(event)
+            replayed += 1
+        return replayed
+
+    def _settle_pending_event(self, event: Mapping[str, Any]) -> Any:
+        normalized = self._validate_pending_event(
+            event,
+            expected_session=self.session_id,
+        )
+        if normalized["kind"] == "session_restart":
+            return self._settle_restart_event(normalized)
+        if normalized["kind"] == "native_success":
+            return self._settle_native_success_event(normalized)
+        if normalized["kind"] == "interrupt_success":
+            return self._settle_interrupt_event(normalized)
+        return self.record_result(normalized["owner"], normalized["result"])
+
+    @staticmethod
+    def _select_recovery_tip(
+        records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Select one exact-hash lineage tip and reject branches or gaps."""
+
+        if not records:
+            raise ControlPlaneError("lifecycle recovery group is empty")
+        session = records[0]["session_id"]
+        workspace = _workspace_key(records[0]["workspace_root"])
+        lineage = records[0]["lineage_id"]
+        by_content: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if (
+                record["session_id"] != session
+                or _workspace_key(record["workspace_root"]) != workspace
+                or record["lineage_id"] != lineage
+            ):
+                raise ControlPlaneError(
+                    "lifecycle recovery group crosses a workspace or plan lineage"
+                )
+            existing = by_content.get(record["content_id"])
+            if existing is None:
+                by_content[record["content_id"]] = record
+
+        highest = max(record["revision"] for record in by_content.values())
+        tips = [
+            record
+            for record in by_content.values()
+            if record["revision"] == highest
+        ]
+        if any(record["semantic_id"] != tips[0]["semantic_id"] for record in tips[1:]):
+            raise ControlPlaneError("lifecycle recovery has sibling branches")
+        tips.sort(
+            key=lambda record: (
+                0 if record.get("authority") == "canonical" else
+                1 if record.get("authority") == "stable" else
+                2,
+                record["path"].name,
+            )
+        )
+        tip = tips[0]
+        chain: dict[int, dict[str, Any]] = {}
+        current = tip
+        while True:
+            revision = current["revision"]
+            prior = chain.get(revision)
+            if prior is not None and prior["semantic_id"] != current["semantic_id"]:
+                raise ControlPlaneError("lifecycle recovery has sibling branches")
+            chain[revision] = current
+            parent_id = current["parent_state_sha256"]
+            parent = by_content.get(parent_id)
+            if parent is None:
+                break
+            if parent["revision"] + 1 != revision:
+                raise ControlPlaneError("lifecycle recovery revision chain is invalid")
+            current = parent
+
+        for record in by_content.values():
+            expected = chain.get(record["revision"])
+            if expected is None or record["semantic_id"] != expected["semantic_id"]:
+                raise ControlPlaneError(
+                    "lifecycle recovery is not on the unique exact-hash chain"
+                )
+        return tip
+
+    def _merge_recovery_group(self, snapshots: list[dict[str, Any]]) -> None:
+        """Publish one session's validated recovery chain under canonical locks."""
+
+        first = snapshots[0]
+        session = str(first["session_id"])
+        workspace = first["workspace_root"]
+        deadline = time.monotonic() + self.lock_timeout
+
+        def remaining() -> float:
+            local = max(0.0, deadline - time.monotonic())
+            operation = remaining_seconds()
+            return local if operation is None else min(local, operation)
+
+        with acquire(
+            self.root,
+            _workspace_lock_identity(workspace),
+            timeout=remaining(),
+        ):
+            with acquire(self.root, session, timeout=remaining()):
+                with acquire(self.root, STATE_ROOT_LOCK, timeout=remaining()):
+                    records: list[dict[str, Any]] = []
+                    source_paths = {record["path"] for record in snapshots}
+                    for snapshot in snapshots:
+                        raw, identity = _read_stable_bytes(
+                            snapshot["path"],
+                            "legacy lifecycle recovery",
+                        )
+                        if (
+                            identity != snapshot["identity"]
+                            or _state_content_id(raw) != snapshot["content_id"]
+                        ):
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery changed before publication"
+                            )
+                        state = self._validate_lifecycle_state(
+                            _decode_object(raw, "legacy lifecycle recovery"),
+                            expected_session=session,
+                        )
+                        records.append(
+                            {
+                                "authority": "source",
+                                "content_id": _state_content_id(raw),
+                                "identity": identity,
+                                "lineage_id": state["lineage_id"],
+                                "parent_state_sha256": state["parent_state_sha256"],
+                                "path": snapshot["path"],
+                                "revision": state["revision"],
+                                "semantic_id": _semantic_state_id(state),
+                                "session_id": state["session_id"],
+                                "workspace_root": state["workspace_root"],
+                            }
+                        )
+
+                    canonical = _lifecycle_state_path(self.root, workspace, session)
+                    stable = _lifecycle_recovery_path(self.root, session)
+                    for authority, path in (("canonical", canonical), ("stable", stable)):
+                        if path in source_paths or not path.exists():
+                            continue
+                        raw, identity = _read_stable_bytes(
+                            path,
+                            f"{authority} lifecycle state",
+                        )
+                        state = self._validate_lifecycle_state(
+                            _decode_object(raw, f"{authority} lifecycle state"),
+                            expected_session=session,
+                        )
+                        records.append(
+                            {
+                                "authority": authority,
+                                "content_id": _state_content_id(raw),
+                                "identity": identity,
+                                "lineage_id": state["lineage_id"],
+                                "parent_state_sha256": state["parent_state_sha256"],
+                                "path": path,
+                                "revision": state["revision"],
+                                "semantic_id": _semantic_state_id(state),
+                                "session_id": state["session_id"],
+                                "workspace_root": state["workspace_root"],
+                            }
+                        )
+
+                    tip = self._select_recovery_tip(records)
+                    destination = canonical if canonical.exists() else stable
+                    carrier = next(
+                        (
+                            record["path"]
+                            for record in records
+                            if record["path"] != tip["path"]
+                            and RECOVERY_FILE_RE.fullmatch(record["path"].name)
+                            is not None
+                        ),
+                        None,
+                    )
+                    if (
+                        destination == stable
+                        and not stable.exists()
+                        and RECOVERY_FILE_RE.fullmatch(tip["path"].name) is None
+                    ):
+                        if carrier is None and _recovery_file_count(
+                            self.root
+                        ) >= MAX_RECOVERY_FILES:
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery capacity is exhausted"
+                            )
+                        if carrier is not None:
+                            try:
+                                os.replace(carrier, stable)
+                            except OSError as error:
+                                raise ControlPlaneUnavailable(
+                                    "lifecycle recovery capacity reservation failed"
+                                ) from error
+                    if tip["path"] != destination:
+                        try:
+                            os.replace(tip["path"], destination)
+                        except OSError as error:
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery publication failed"
+                            ) from error
+                    published, _identity = _read_stable_bytes(
+                        destination,
+                        "published lifecycle recovery",
+                    )
+                    if _state_content_id(published) != tip["content_id"]:
+                        raise ControlPlaneUnavailable(
+                            "published lifecycle recovery identity changed"
+                        )
+
+                    removable = {
+                        record["path"]: record["content_id"] for record in records
+                    }
+                    removable.update(
+                        {
+                            snapshot["path"]: snapshot["content_id"]
+                            for snapshot in snapshots
+                        }
+                    )
+                    for path, content_id in removable.items():
+                        if path == destination or not path.exists():
+                            continue
+                        raw, _identity = _read_stable_bytes(
+                            path,
+                            "superseded lifecycle recovery",
+                        )
+                        if _state_content_id(raw) != content_id:
+                            raise ControlPlaneUnavailable(
+                                "superseded lifecycle recovery changed before cleanup"
+                            )
+                        try:
+                            path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as error:
+                            raise ControlPlaneUnavailable(
+                                "lifecycle recovery cleanup failed"
+                            ) from error
 
     def migrate_recoveries(self) -> int:
-        """Explicitly migrate legacy recovery names one durable file at a time."""
+        """Atomically merge legacy recoveries, then replay one-shot Hook receipts."""
 
         with acquire(
             self.root,
             STATE_ROOT_LOCK,
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
-            legacy_recoveries = [
-                path
-                for path in _state_json_paths(self.root)
-                if RECOVERY_FILE_RE.fullmatch(path.name) is not None
-                and SESSION_RECOVERY_FILE_RE.fullmatch(path.name) is None
-            ]
-        migrated = 0
-        for path in legacy_recoveries:
+            sources = _migration_source_paths(self.root)
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        migrated = len(sources)
+
+        def remember(
+            path: Path,
+            raw: bytes,
+            identity: tuple[int, int, int, int, int, int],
+            state: dict[str, Any],
+        ) -> None:
+            key = (
+                str(state["session_id"]),
+                _workspace_key(state["workspace_root"]),
+                str(state["lineage_id"]),
+            )
+            groups.setdefault(key, []).append(
+                {
+                    "content_id": _state_content_id(raw),
+                    "identity": identity,
+                    "path": path,
+                    "lineage_id": state["lineage_id"],
+                    "session_id": state["session_id"],
+                    "workspace_root": state["workspace_root"],
+                }
+            )
+
+        for path in sources:
             try:
-                raw = _read_bounded_bytes(path, "legacy lifecycle recovery")
+                raw, identity = _read_stable_bytes(
+                    path,
+                    "legacy lifecycle recovery",
+                )
                 state = self._validate_lifecycle_state(
                     _decode_object(raw, "legacy lifecycle recovery")
                 )
@@ -1426,11 +2173,32 @@ class ControlPlane:
                     raise ControlPlaneError(
                         "unmarked state root contains invalid legacy recovery"
                     )
-                self._quarantine_legacy_state(path)
-                migrated += 1
+                recovered = self._quarantine_legacy_state(
+                    path,
+                    allow_streaming_quarantine=True,
+                )
+                for recovered_path, _recovered_state in recovered:
+                    recovered_raw, recovered_identity = _read_stable_bytes(
+                        recovered_path,
+                        "repaired lifecycle recovery",
+                    )
+                    recovered_state = self._validate_lifecycle_state(
+                        _decode_object(
+                            recovered_raw,
+                            "repaired lifecycle recovery",
+                        )
+                    )
+                    remember(
+                        recovered_path,
+                        recovered_raw,
+                        recovered_identity,
+                        recovered_state,
+                    )
                 continue
-            self._publish_session_recovery(path, state, raw)
-            migrated += 1
+            remember(path, raw, identity, state)
+        for snapshots in groups.values():
+            self._merge_recovery_group(snapshots)
+        self.replay_pending_events(all_sessions=True)
         return migrated
 
     def _resolve_state_path(self) -> Path:
@@ -1661,6 +2429,18 @@ class ControlPlane:
             for item in logical.values()
         ):
             raise ControlPlaneError("lifecycle logical state is invalid")
+        settled_events = normalized.setdefault("settled_events", [])
+        if (
+            not isinstance(settled_events, list)
+            or len(settled_events) > MAX_SETTLED_EVENTS
+            or len(set(settled_events)) != len(settled_events)
+            or any(
+                not isinstance(event_id, str)
+                or SHA256_RE.fullmatch(event_id) is None
+                for event_id in settled_events
+            )
+        ):
+            raise ControlPlaneError("lifecycle settled event collection is invalid")
         return normalized
 
     def _workspace_hint(self) -> str:
@@ -1815,69 +2595,79 @@ class ControlPlane:
     def _quarantine_legacy_state(
         self,
         path: Path,
+        *,
+        allow_streaming_quarantine: bool = False,
     ) -> list[tuple[Path, dict[str, Any]]]:
-        """Atomically isolate invalid legacy state inside a marked CCO root."""
+        """Claim a legacy pathname, preserving valid repairs and streaming invalid data."""
 
         if not self._state_root_is_marked():
             return []
-        reservation: Path | None = None
+        staging = path
         with acquire(
             self.root,
             STATE_ROOT_LOCK,
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
-            recovery_count = sum(
-                RECOVERY_FILE_RE.fullmatch(candidate.name) is not None
-                for candidate in _state_json_paths(self.root)
-            )
-            source_is_recovery = RECOVERY_FILE_RE.fullmatch(path.name) is not None
-            if recovery_count - int(source_is_recovery) >= MAX_RECOVERY_FILES:
-                raise ControlPlaneUnavailable(
-                    "lifecycle state directory exceeds the "
-                    f"{MAX_RECOVERY_FILES} recovery file limit"
-                )
-            try:
-                descriptor, reservation_name = tempfile.mkstemp(
-                    dir=self.root,
-                    prefix=".cco-recovery-",
-                    suffix=".reserve",
-                )
-                os.close(descriptor)
-                reservation = Path(reservation_name)
-            except OSError as error:
-                raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
-            staging = reservation.with_suffix(".json")
-            try:
-                os.replace(path, staging)
-            except FileNotFoundError:
-                return []
-            except OSError as error:
-                raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
-            finally:
-                if reservation is not None:
-                    try:
-                        reservation.unlink(missing_ok=True)
-                    except OSError as error:
-                        raise ControlPlaneUnavailable(
-                            "legacy recovery reservation cleanup failed"
-                        ) from error
+            if RECOVERY_STAGING_FILE_RE.fullmatch(path.name) is None:
+                staging_count = 0
+                try:
+                    with os.scandir(self.root) as entries:
+                        for entry in entries:
+                            checkpoint()
+                            if RECOVERY_STAGING_FILE_RE.fullmatch(entry.name) is not None:
+                                staging_count += 1
+                except OSError as error:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle state directory is unavailable"
+                    ) from error
+                if staging_count >= MAX_RECOVERY_STAGING_FILES:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle state directory exceeds the "
+                        f"{MAX_RECOVERY_STAGING_FILES} staging file limit"
+                    )
+                try:
+                    descriptor, staging_name = tempfile.mkstemp(
+                        dir=self.root,
+                        prefix=".cco-staging-",
+                        suffix=".pending",
+                    )
+                    os.close(descriptor)
+                    staging = Path(staging_name)
+                    os.replace(path, staging)
+                except FileNotFoundError:
+                    staging.unlink(missing_ok=True)
+                    return []
+                except OSError as error:
+                    staging.unlink(missing_ok=True)
+                    raise ControlPlaneUnavailable(
+                        "legacy lifecycle state is unavailable"
+                    ) from error
 
-        # Recovery staging stays in the state root and ends in .json.  A crash or I/O
-        # failure therefore remains visible to the next workspace lease scan.
-        raw = _read_bounded_bytes(staging, "staged legacy lifecycle state")
-        try:
-            staged_state = self._validate_lifecycle_state(
-                _decode_object(raw, "staged legacy cco.v9 lifecycle state")
+        oversize = (
+            _path_identity(staging, "staged legacy lifecycle state")[3]
+            > MAX_STATE_FILE_BYTES
+        )
+        if oversize and not allow_streaming_quarantine:
+            raise ControlPlaneUnavailable(
+                "oversize staged lifecycle recovery requires explicit "
+                "migrate-recoveries"
             )
-        except ControlPlaneError:
-            staged_state = None
+        staged_state = None
+        if not oversize:
+            try:
+                raw, _identity = _read_stable_bytes(
+                    staging,
+                    "staged legacy lifecycle state",
+                )
+                staged_state = self._validate_lifecycle_state(
+                    _decode_object(raw, "staged legacy cco.v9 lifecycle state")
+                )
+            except ControlPlaneUnavailable:
+                raise
+            except ControlPlaneError:
+                pass
 
         if staged_state is not None:
-            staging, staged_state = self._publish_session_recovery(
-                staging,
-                staged_state,
-                raw,
-            )
             recovered = [(staging, staged_state)]
             if path.exists():
                 try:
@@ -1894,23 +2684,53 @@ class ControlPlane:
             return recovered
 
         name_identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
-        content_identity = hashlib.sha256(raw).hexdigest()
+        content_identity, content_size, staging_identity = _streaming_file_identity(
+            staging,
+            "staged legacy lifecycle state",
+        )
         quarantine = self.root / "quarantine"
+        destination = quarantine / f"legacy-{name_identity}-{content_identity}.json"
+        destination_snapshot: tuple[
+            str,
+            int,
+            tuple[int, int, int, int, int, int],
+        ] | None = None
+        if destination.exists():
+            destination_snapshot = _streaming_file_identity(
+                destination,
+                "quarantined lifecycle state",
+            )
         try:
-            quarantine.mkdir(parents=True, exist_ok=True)
-            destination = quarantine / f"legacy-{name_identity}-{content_identity}.json"
-            os.link(staging, destination)
-        except FileExistsError:
-            if _read_bounded_bytes(destination, "quarantined lifecycle state") != raw:
-                raise ControlPlaneError("legacy quarantine identity collision")
+            with acquire(
+                self.root,
+                STATE_ROOT_LOCK,
+                timeout=_bounded_lock_timeout(self.lock_timeout),
+            ):
+                if _path_identity(
+                    staging,
+                    "staged legacy lifecycle state",
+                )[:4] != staging_identity[:4]:
+                    raise ControlPlaneUnavailable(
+                        "staged legacy lifecycle state changed before quarantine"
+                    )
+                quarantine.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    if destination_snapshot is None or _path_identity(
+                        destination,
+                        "quarantined lifecycle state",
+                    )[:4] != destination_snapshot[2][:4]:
+                        raise ControlPlaneUnavailable(
+                            "quarantined lifecycle state changed before deduplication"
+                        )
+                    if destination_snapshot[:2] != (content_identity, content_size):
+                        raise ControlPlaneError("legacy quarantine identity collision")
+                else:
+                    os.link(staging, destination)
+                staging.unlink()
         except OSError as error:
             raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
-        try:
-            staging.unlink(missing_ok=True)
-        except OSError as error:
-            raise ControlPlaneUnavailable("legacy quarantine finalization failed") from error
         recovered: list[tuple[Path, dict[str, Any]]] = []
-        if path.exists():
+        if path != staging and path.exists():
             try:
                 replacement = self._validate_lifecycle_state(
                     _load_object(path, "replacement legacy cco.v9 lifecycle state")
@@ -2019,28 +2839,10 @@ class ControlPlane:
                             ) from error
                         return canonical, recovery
                     raise ControlPlaneError("conflicting lifecycle recovery")
-                if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
-                    return path, recovery
-                try:
-                    os.link(path, canonical)
-                except FileExistsError:
-                    return path, recovery
-                except OSError as error:
-                    raise ControlPlaneUnavailable(
-                        "valid legacy lifecycle state could not be restored"
-                    ) from error
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError as error:
-                    try:
-                        if os.path.samefile(path, canonical):
-                            canonical.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    raise ControlPlaneUnavailable(
-                        "lifecycle recovery finalization failed"
-                    ) from error
-                return canonical, recovery
+                # A stable session-addressed recovery is already authoritative.
+                # Keeping it in place avoids another publication transaction and
+                # remains writable until cleanup removes the lifecycle.
+                return path, recovery
 
     def _workspace_state_candidates(
         self,
@@ -2145,6 +2947,30 @@ class ControlPlane:
         if kind not in {"plan", "wave"} or SHA256_RE.fullmatch(identity) is None:
             raise ControlPlaneError("artifact identity is invalid")
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
+
+    def _owned_artifact_paths(self, kind: str) -> list[Path]:
+        if kind not in {"plan", "wave"}:
+            raise ControlPlaneError("artifact kind is invalid")
+        artifacts = self.root / "artifacts"
+        if not artifacts.is_dir():
+            return []
+        prefix = f"{self.session_id}-{kind}-"
+        owned: list[Path] = []
+        try:
+            with os.scandir(artifacts) as entries:
+                for entry in entries:
+                    checkpoint()
+                    if not entry.name.startswith(prefix) or not entry.name.endswith(".json"):
+                        continue
+                    identity = entry.name[len(prefix) : -5]
+                    if len(identity) == 64 and all(
+                        character in "0123456789abcdef" for character in identity
+                    ):
+                        owned.append(Path(entry.path))
+        except OSError as error:
+            raise ControlPlaneUnavailable("artifact directory is unavailable") from error
+        owned.sort(key=lambda item: item.name)
+        return owned
 
     def _read_state(
         self,
@@ -2260,14 +3086,14 @@ class ControlPlane:
             if isinstance(active_wave, str)
             else None
         )
-        for path in artifacts.glob(f"{self.session_id}-wave-*.json"):
+        for path in self._owned_artifact_paths("wave"):
             if keep_wave is None or path != keep_wave:
                 try:
                     path.unlink(missing_ok=True)
                 except OSError:
                     pass
         keep_plan = Path(state["plan_path"])
-        for path in artifacts.glob(f"{self.session_id}-plan-*.json"):
+        for path in self._owned_artifact_paths("plan"):
             if path != keep_plan:
                 try:
                     path.unlink(missing_ok=True)
@@ -2366,6 +3192,9 @@ class ControlPlane:
         *,
         resume_identical: bool = False,
     ) -> dict[str, Any]:
+        pending = self.pending_event_reason()
+        if pending is not None:
+            raise ControlPlaneError(pending)
         backend, workspace = discover_workspace(repo)
         normalized = _normalize_brief(brief, workspace, backend)
         unsigned = {
@@ -2446,6 +3275,7 @@ class ControlPlane:
                     "protocol": LIFECYCLE_PROTOCOL,
                     "revision": 0,
                     "session_id": self.session_id,
+                    "settled_events": [],
                     "tombstones": [],
                     "wave_sequence": 0,
                     "workspace_root": str(workspace),
@@ -3454,39 +4284,39 @@ class ControlPlane:
         return fallback
 
     def postflight_tool(self, payload: Mapping[str, Any]) -> None:
-        tool_use_id = payload.get("tool_use_id")
-        if not isinstance(tool_use_id, str):
-            raise ControlPlaneError("native tool result has no call identity")
-        tool_input = payload.get("tool_input")
-        if not isinstance(tool_input, Mapping):
-            raise ControlPlaneError("native tool result has no input identity")
-        message = tool_input.get("message")
-        if isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
-            dispatch_id = parse_task_message(message)["dispatch_id"]
-        elif isinstance(message, str) and message.startswith(CONTINUE_HEADER + "\n"):
-            dispatch_id = parse_continue_message(message)["dispatch_id"]
-        else:
-            raise ControlPlaneError("native tool result is not CCO-owned")
+        event = self._pending_postflight_event(payload)
+        if event["kind"] != "native_success":
+            raise ControlPlaneError("native tool result is not a spawn or follow-up")
+        self._settle_native_success_event(event)
+
+    def _settle_native_success_event(self, event: Mapping[str, Any]) -> bool:
+        event_id = str(event["event_id"])
+        dispatch_id = str(event["dispatch_id"])
+        tool_use_id = str(event["tool_use_id"])
+        if not self.state_path.exists():
+            return False
         with self._coordinated_state() as state:
+            if event_id in state["settled_events"]:
+                return True
             dispatch = self._find_dispatch(state, dispatch_id)
-            if dispatch["state"] == "retired":
-                return
-            if dispatch["state"] in {"fenced", "rejected"}:
-                return
+            if dispatch["state"] in {"fenced", "rejected", "retired"} or (
+                dispatch["state"] == "paused"
+                and isinstance(dispatch.get("result"), Mapping)
+            ):
+                self._remember_settled_event(state, event_id)
+                self._write_state(state)
+                return True
             expected = dispatch.get("native")
-            if not isinstance(expected, Mapping) or any(
-                tool_input.get(key) != expected.get(key) for key in expected
+            if (
+                not isinstance(expected, Mapping)
+                or _digest(b"cco.native-input.v1\0", dict(expected))
+                != event.get("tool_input_sha256")
             ):
                 raise ControlPlaneError("native tool result input is stale")
             if isinstance(dispatch.get("tool_use_id"), str) and dispatch[
                 "tool_use_id"
             ] != tool_use_id:
                 raise ControlPlaneError("native tool result call identity is stale")
-            response = payload.get("tool_response")
-            if _native_response_failed(response):
-                raise ControlPlaneError(
-                    "failure-side PostToolUse is not a settlement event; use native-failure"
-                )
             self._assert_cross_task_compatible(
                 dispatch["workspace_root"],
                 role=dispatch["role"],
@@ -3494,19 +4324,21 @@ class ControlPlane:
                 current_dispatch=dispatch["dispatch_id"],
             )
             if dispatch["state"] == "starting" and dispatch["tool_kind"] == "spawn":
-                owners = _task_paths(response)
+                owners = set(event["owners"])
                 if len(owners) > 1:
                     self._fence_members(state, dispatch, "native_owner_ambiguous")
                     self._settle_wave(state)
+                    self._remember_settled_event(state, event_id)
                     self._write_state(state)
-                    return
+                    return True
                 if owners:
                     owner = owners.pop()
                     if not _owner_matches_task(owner, dispatch["task_name"]):
                         self._fence_members(state, dispatch, "native_owner_mismatch")
                         self._settle_wave(state)
+                        self._remember_settled_event(state, event_id)
                         self._write_state(state)
-                        return
+                        return True
                     dispatch["owner"] = owner
             elif dispatch["pending_cursor"] is not None:
                 dispatch["cursor"] = dispatch["pending_cursor"]
@@ -3516,8 +4348,9 @@ class ControlPlane:
             dispatch["claim_expires_at"] = None
             for member in dispatch["members"]:
                 state["logical"][member]["state"] = "running"
+            self._remember_settled_event(state, event_id)
             self._write_state(state)
-            return
+            return True
 
     def prepare_continuation(self, dispatch_id: str, evidence_delta: object) -> dict[str, Any]:
         if not isinstance(evidence_delta, Mapping) or not evidence_delta:
@@ -3588,22 +4421,21 @@ class ControlPlane:
             return True
 
     def postflight_interrupt(self, payload: Mapping[str, Any]) -> bool:
-        tool_use_id = payload.get("tool_use_id")
-        if not isinstance(tool_use_id, str):
-            raise ControlPlaneError("interrupt result has no call identity")
-        tool_input = payload.get("tool_input")
-        owner = tool_input.get("target") if isinstance(tool_input, Mapping) else None
-        if not isinstance(owner, str):
-            raise ControlPlaneError("interrupt result has no target identity")
-        response = payload.get("tool_response")
-        previous_status = (
-            response.get("previous_status") if isinstance(response, Mapping) else None
-        )
-        if previous_status is None:
-            raise ControlPlaneError("interrupt result has no previous native status")
+        event = self._pending_postflight_event(payload)
+        if event["kind"] != "interrupt_success":
+            raise ControlPlaneError("native tool result is not an interrupt")
+        return self._settle_interrupt_event(event)
+
+    def _settle_interrupt_event(self, event: Mapping[str, Any]) -> bool:
+        event_id = str(event["event_id"])
+        tool_use_id = str(event["tool_use_id"])
+        owner = str(event["owner"])
+        previous_status = str(event["previous_status"])
         if not self.state_path.exists():
             return False
         with self._coordinated_state() as state:
+            if event_id in state["settled_events"]:
+                return True
             matches = [
                 item
                 for item in state["dispatches"].values()
@@ -3611,21 +4443,25 @@ class ControlPlane:
                 and item.get("interrupt_tool_use_id") == tool_use_id
             ]
             if not matches:
-                return any(
+                managed = any(
                     item.get("owner") == owner
                     for item in state["dispatches"].values()
                 )
+                if managed:
+                    self._remember_settled_event(state, event_id)
+                    self._write_state(state)
+                return managed
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt result has no unique prepared dispatch")
             dispatch = matches[0]
             dispatch.pop("interrupt_tool_use_id", None)
             if (
-                isinstance(previous_status, str)
-                and previous_status in {"interrupted", "pending_init", "running"}
+                previous_status in {"interrupted", "pending_init", "running"}
                 and dispatch["state"] in {"running", "paused"}
             ):
                 self._fence_members(state, dispatch, "interrupted")
                 self._settle_wave(state)
+            self._remember_settled_event(state, event_id)
             self._write_state(state)
             return True
 
@@ -3703,6 +4539,19 @@ class ControlPlane:
             return dispatch, plan, nodes, wave, allowed
 
         with self._coordinated_state() as state:
+            existing = self._find_dispatch(state, result["dispatch_id"])
+            if (
+                existing.get("state") in {"paused", "retired"}
+                and existing.get("owner") == owner
+                and existing.get("result") == result
+            ):
+                return {
+                    "dispatch_id": existing["dispatch_id"],
+                    "members": existing["members"],
+                    "replayed": True,
+                    "state": existing["state"],
+                    "verification": None,
+                }
             owner_was_pending = self._find_dispatch(
                 state, result["dispatch_id"]
             ).get("owner") is None
@@ -3932,9 +4781,17 @@ class ControlPlane:
                 self._write_state(state)
 
     def restart(self) -> int:
+        return self._restart(None)
+
+    def _settle_restart_event(self, event: Mapping[str, Any]) -> int:
+        return self._restart(str(event["event_id"]))
+
+    def _restart(self, event_id: str | None) -> int:
         if not self.state_path.exists():
             return 0
         with self._coordinated_state() as state:
+            if event_id is not None and event_id in state["settled_events"]:
+                return 0
             count = 0
             for dispatch in state["dispatches"].values():
                 if dispatch["state"] in ACTIVE_STATES or _native_claim_active(dispatch):
@@ -3942,6 +4799,8 @@ class ControlPlane:
                     count += 1
             self._settle_wave(state)
             state["epoch"] += 1
+            if event_id is not None:
+                self._remember_settled_event(state, event_id)
             self._write_state(state)
             return count
 
@@ -4036,17 +4895,19 @@ class ControlPlane:
     def cleanup(self) -> int:
         """Remove only this task's inactive v9 state and immutable artifacts."""
 
+        pending = self.pending_event_reason()
+        if pending is not None:
+            raise ControlPlaneError(pending)
+
         def remove_artifacts() -> int:
             removed = 0
-            artifacts = self.root / "artifacts"
-            if artifacts.is_dir():
-                for kind in ("plan", "wave"):
-                    for path in artifacts.glob(f"{self.session_id}-{kind}-*.json"):
-                        try:
-                            path.unlink()
-                            removed += 1
-                        except FileNotFoundError:
-                            pass
+            for kind in ("plan", "wave"):
+                for path in self._owned_artifact_paths(kind):
+                    try:
+                        path.unlink()
+                        removed += 1
+                    except FileNotFoundError:
+                        pass
             return removed
 
         if self.state_path.exists():
@@ -4104,6 +4965,25 @@ class ControlPlane:
             ):
                 return "CCO child work is still active; wait for its native terminal event."
             return None
+
+    def pending_event_reason(self) -> str | None:
+        """Expose unresolved one-shot receipts without performing heavy settlement."""
+
+        prefix = f".cco-pending-s{_session_digest(self.session_id)}-"
+        with acquire(
+            self.root,
+            STATE_ROOT_LOCK,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
+        ):
+            pending = any(
+                path.name.startswith(prefix) for path in _pending_event_paths(self.root)
+            )
+        if not pending:
+            return None
+        return (
+            "CCO has an unsettled native lifecycle event; run `python -B "
+            "<PLUGIN_ROOT>/scripts/control_plane.py migrate-recoveries` before stopping."
+        )
 
 
 def _session_arg() -> str:

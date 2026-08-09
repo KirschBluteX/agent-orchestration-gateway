@@ -33,9 +33,10 @@ never substitute a parent, child, or handoff task ID.
 - `restart`: explicitly apply the same interruption fencing as SessionStart.
 - `cleanup`: remove only the current task's inactive lifecycle state and artifacts;
   active or paused child work is refused.
-- `migrate-recoveries`: migrate pre-4.0.7 random recovery names one durable file at a
-  time. It needs no current task identity. Run it when a Hook requests it; invalid files
-  in an unmarked shared state root remain untouched and fail closed.
+- `migrate-recoveries`: merge pre-4.1.0 recovery state by exact parent hashes and replay
+  pending one-shot Hook receipts. It needs no current task identity. Run it when a Hook
+  requests it; invalid files in an unmarked shared state root remain untouched and fail
+  closed.
 
 Do not edit lifecycle JSON by hand, mutate Codex's host database from a Hook, or treat a
 Desktop task card as CCO authority. Use explicit maintenance only after evidence proves a
