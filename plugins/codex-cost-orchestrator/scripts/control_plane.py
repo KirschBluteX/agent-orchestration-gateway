@@ -43,6 +43,7 @@ from routing_catalog import (
 from state_lock import StateLockBusy, acquire
 from workspace_guard import (
     WorkspaceGuardError,
+    WorkspaceGuardUnavailable,
     capture as capture_workspace,
     discover_workspace,
     normalize_scope_groups,
@@ -95,6 +96,10 @@ NATIVE_FAILURE_KINDS = frozenset(
 )
 EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{64})\.json$")
+STATE_ROOT_SENTINEL = ".cco-state-root-v1"
+STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
+MAX_STATE_FILE_BYTES = 32 * 1024 * 1024
+STATE_READ_CHUNK_BYTES = 1024 * 1024
 
 
 class ControlPlaneError(RuntimeError):
@@ -209,14 +214,31 @@ def _write_immutable(path: Path, value: Mapping[str, Any]) -> None:
     _atomic_write(path, value)
 
 
-def _load_object(path: Path, label: str) -> dict[str, Any]:
+def _read_bounded_bytes(
+    path: Path,
+    label: str,
+    *,
+    limit: int = MAX_STATE_FILE_BYTES,
+) -> bytes:
     checkpoint()
+    raw = bytearray()
     try:
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            while True:
+                checkpoint()
+                chunk = handle.read(min(STATE_READ_CHUNK_BYTES, limit - len(raw) + 1))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+                if len(raw) > limit:
+                    raise ControlPlaneError(f"{label} is too large")
     except OSError as error:
         raise ControlPlaneUnavailable(f"{label} is unavailable") from error
-    if len(raw) > 32 * 1024 * 1024:
-        raise ControlPlaneError(f"{label} is too large")
+    return bytes(raw)
+
+
+def _load_object(path: Path, label: str) -> dict[str, Any]:
+    raw = _read_bounded_bytes(path, label)
     checkpoint()
     try:
         value = json.loads(
@@ -232,6 +254,7 @@ def _load_object(path: Path, label: str) -> dict[str, Any]:
         ProtocolHashError,
     ) as error:
         raise ControlPlaneError(f"{label} is not valid JSON") from error
+    checkpoint()
     if not isinstance(value, dict):
         raise ControlPlaneError(f"{label} is malformed")
     return value
@@ -1071,9 +1094,63 @@ class ControlPlane:
         if lock_timeout <= 0:
             raise ControlPlaneError("lock timeout must be positive")
         self.session_id = session_id
+        self._uses_default_root = root is None and not os.environ.get("CCO_STATE_DIR")
         self.root = Path(os.path.abspath((root or _state_root()).expanduser()))
         self._state_path: Path | None = None
         self.lock_timeout = float(lock_timeout)
+
+    @property
+    def _state_root_sentinel(self) -> Path:
+        return self.root / STATE_ROOT_SENTINEL
+
+    def _state_root_is_marked(self) -> bool:
+        marker = self._state_root_sentinel
+        if not marker.exists():
+            return False
+        if _read_bounded_bytes(marker, "CCO state-root sentinel", limit=128) != (
+            STATE_ROOT_SENTINEL_BYTES
+        ):
+            raise ControlPlaneError("CCO state-root sentinel is invalid")
+        return True
+
+    def _mark_state_root_if_safe(self) -> None:
+        """Mark only a dedicated or empty state root as CCO-owned."""
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        if self._state_root_is_marked():
+            return
+        try:
+            json_files = list(self.root.glob("*.json"))
+        except OSError as error:
+            raise ControlPlaneUnavailable("lifecycle state directory is unavailable") from error
+        if json_files and not self._uses_default_root:
+            for path in json_files:
+                if STATE_FILE_RE.fullmatch(path.name) is not None:
+                    continue
+                try:
+                    self._validate_lifecycle_state(
+                        _load_object(path, "legacy cco.v9 lifecycle state")
+                    )
+                except (ControlPlaneError, ControlPlaneUnavailable):
+                    return
+        try:
+            descriptor = os.open(
+                self._state_root_sentinel,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            if not self._state_root_is_marked():
+                raise ControlPlaneError("CCO state-root sentinel is invalid")
+            return
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(STATE_ROOT_SENTINEL_BYTES)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            self._state_root_sentinel.unlink(missing_ok=True)
+            raise
 
     @property
     def state_path(self) -> Path:
@@ -1083,15 +1160,18 @@ class ControlPlane:
             return self._state_path
         suffix = f"--{_session_digest(self.session_id)}.json"
         try:
-            matches = sorted(self.root.glob(f"*{suffix}"), key=lambda item: item.name)
+            snapshot = sorted(self.root.glob("*.json"), key=lambda item: item.name)
         except OSError as error:
             raise ControlPlaneUnavailable("lifecycle state directory is unavailable") from error
         legacy = self.root / f"{self.session_id}.json"
-        if legacy.exists():
-            matches.append(legacy)
+        matches = [path for path in snapshot if path.name.endswith(suffix)]
         if len(matches) > 1:
             raise ControlPlaneError("current task has multiple lifecycle state files")
-        self._state_path = matches[0] if matches else legacy
+        self._state_path = (
+            matches[0]
+            if matches
+            else next((path for path in snapshot if path.name == legacy.name), legacy)
+        )
         return self._state_path
 
     @staticmethod
@@ -1294,11 +1374,16 @@ class ControlPlane:
                 if item.get("wave_id") == wave_id
             ]
             rebuildable = bool(wave_records) and all(
-                item.get("state") == "starting"
-                and item.get("owner") is None
+                item.get("owner") is None
                 and (
-                    item.get("tool_use_id") is None
-                    or item.get("dispatch_id") == dispatch_id
+                    item.get("state") == "rejected"
+                    or (
+                        item.get("state") == "starting"
+                        and (
+                            item.get("tool_use_id") is None
+                            or item.get("dispatch_id") == dispatch_id
+                        )
+                    )
                 )
                 for item in wave_records
             )
@@ -1309,6 +1394,8 @@ class ControlPlane:
                 return False
             plan = self._read_plan(state)
             for item in wave_records:
+                if item.get("state") == "rejected":
+                    continue
                 self._append_tombstone(state, item, "workspace_baseline_recaptured")
                 for member in item["members"]:
                     logical = state["logical"][member]
@@ -1322,19 +1409,39 @@ class ControlPlane:
             return True
 
     def _quarantine_legacy_state(self, path: Path) -> None:
-        """Isolate an unindexable pre-2.0.4 state without blocking unrelated workspaces."""
+        """Isolate invalid legacy state only inside a marked CCO-owned root."""
 
+        if not self._state_root_is_marked():
+            return
+        raw = _read_bounded_bytes(path, "legacy lifecycle state")
         quarantine = self.root / "quarantine"
         quarantine.mkdir(parents=True, exist_ok=True)
-        identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()
-        destination = quarantine / f"legacy-{identity}.json"
+        name_identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
+        content_identity = hashlib.sha256(raw).hexdigest()
+        destination = quarantine / f"legacy-{name_identity}-{content_identity}.json"
         try:
-            os.replace(path, destination)
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            if _read_bounded_bytes(destination, "quarantined lifecycle state") != raw:
+                raise ControlPlaneError("legacy quarantine identity collision")
         except FileNotFoundError:
             return
+        else:
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
         try:
-            os.chmod(destination, 0o600)
-        except OSError:
+            path.unlink()
+        except FileNotFoundError:
             pass
 
     def _workspace_state_candidates(
@@ -1345,22 +1452,22 @@ class ControlPlane:
 
         workspace_digest = _workspace_digest(workspace_root)
         try:
-            indexed = sorted(
-                self.root.glob(f"{workspace_digest}--*.json"),
-                key=lambda item: item.name,
-            )
-            legacy = sorted(
-                (
-                    item
-                    for item in self.root.glob("*.json")
-                    if STATE_FILE_RE.fullmatch(item.name) is None
-                ),
-                key=lambda item: item.name,
-            )
+            snapshot = sorted(self.root.glob("*.json"), key=lambda item: item.name)
         except OSError as error:
             raise ControlPlaneUnavailable(
                 "lifecycle state directory is unavailable"
             ) from error
+        indexed: list[Path] = []
+        marked = self._state_root_is_marked()
+        legacy: list[Path] = []
+        for path in snapshot:
+            match = STATE_FILE_RE.fullmatch(path.name)
+            if match is None:
+                if marked:
+                    legacy.append(path)
+                continue
+            if match.group("workspace") == workspace_digest:
+                indexed.append(path)
         candidates: list[tuple[Path, dict[str, Any]]] = []
         for path in indexed:
             checkpoint()
@@ -1452,6 +1559,30 @@ class ControlPlane:
         )
         if STATE_FILE_RE.fullmatch(source.name) is not None and source != canonical:
             raise ControlPlaneError("indexed lifecycle filename does not match its state")
+        legacy = self.root / f"{self.session_id}.json"
+        if source == canonical and legacy.exists():
+            legacy_raw = _load_object(legacy, "legacy cco.v9 lifecycle state")
+            legacy_state = self._validate_lifecycle_state(
+                legacy_raw,
+                expected_session=self.session_id,
+            )
+            canonical_revision = state.get("revision")
+            legacy_revision = legacy_state.get("revision")
+            comparable = deepcopy(legacy_state)
+            comparable["revision"] = canonical_revision
+            if (
+                isinstance(canonical_revision, bool)
+                or not isinstance(canonical_revision, int)
+                or isinstance(legacy_revision, bool)
+                or not isinstance(legacy_revision, int)
+                or canonical_revision != legacy_revision + 1
+                or comparable != state
+            ):
+                raise ControlPlaneError("current task has conflicting lifecycle state files")
+            try:
+                legacy.unlink()
+            except FileNotFoundError:
+                pass
         if source != canonical:
             if canonical.exists():
                 raise ControlPlaneError("current task has conflicting lifecycle state files")
@@ -1466,6 +1597,7 @@ class ControlPlane:
         return state
 
     def _write_state(self, state: dict[str, Any]) -> None:
+        self._mark_state_root_if_safe()
         self._state_path = _lifecycle_state_path(
             self.root,
             state["workspace_root"],
@@ -1540,7 +1672,13 @@ class ControlPlane:
             raise ControlPlaneError("wave baseline scopes do not match its physical units")
         return wave
 
-    def create_plan(self, repo: Path, brief: object) -> dict[str, Any]:
+    def create_plan(
+        self,
+        repo: Path,
+        brief: object,
+        *,
+        resume_identical: bool = False,
+    ) -> dict[str, Any]:
         backend, workspace = discover_workspace(repo)
         normalized = _normalize_brief(brief, workspace, backend)
         unsigned = {
@@ -1554,7 +1692,29 @@ class ControlPlane:
         plan_path = self._artifact_path("plan", plan_id)
         with acquire(self.root, self.session_id, timeout=self.lock_timeout):
             if self.state_path.exists():
-                self._read_state()
+                state = self._read_state()
+                if (
+                    resume_identical
+                    and state.get("plan_id") == plan_id
+                    and state.get("active_wave_id") is None
+                    and state.get("wave_sequence") == 0
+                    and not state.get("dispatches")
+                    and all(
+                        item.get("state") in {"waiting", "ready"}
+                        for item in state["logical"].values()
+                    )
+                    and self._read_plan(state) == plan
+                ):
+                    return {
+                        "plan_id": plan_id,
+                        "protocol": PLAN_PROTOCOL,
+                        "ready": sorted(
+                            node
+                            for node, item in state["logical"].items()
+                            if item["state"] == "ready"
+                        ),
+                        "workspace_root": str(workspace),
+                    }
                 raise ControlPlaneError(
                     "the current task already has CCO lifecycle proof; run explicit cleanup first"
                 )
@@ -1754,6 +1914,39 @@ class ControlPlane:
         }
 
     @staticmethod
+    def _available_route_cursor(
+        state: Mapping[str, Any],
+        unit: Mapping[str, Any],
+    ) -> int | None:
+        generation = max(
+            state["logical"][member]["generation"] for member in unit["members"]
+        )
+        rejected: set[tuple[str, str]] = set()
+        for dispatch in state["dispatches"].values():
+            if (
+                dispatch.get("state") != "rejected"
+                or dispatch.get("generation") != generation
+                or dispatch.get("members") != unit.get("members")
+            ):
+                continue
+            cursor = dispatch.get("route_cursor")
+            candidates = dispatch.get("route_candidates")
+            if (
+                isinstance(cursor, bool)
+                or not isinstance(cursor, int)
+                or not isinstance(candidates, list)
+                or not 0 <= cursor < len(candidates)
+                or not isinstance(candidates[cursor], Mapping)
+            ):
+                raise ControlPlaneError("rejected route history is invalid")
+            route = candidates[cursor]
+            rejected.add((str(route.get("model")), str(route.get("effort"))))
+        for cursor, route in enumerate(unit["route"]["candidates"]):
+            if (str(route.get("model")), str(route.get("effort"))) not in rejected:
+                return cursor
+        return None
+
+    @staticmethod
     def _public_batch(state: Mapping[str, Any], dispatches: list[Mapping[str, Any]]) -> dict[str, Any]:
         return {
             "dispatches": [deepcopy(item["native"]) for item in dispatches],
@@ -1855,6 +2048,32 @@ class ControlPlane:
                 downstream=downstream,
             )
             selected = _select_units(units, capacity)
+            route_cursors: dict[str, int] = {}
+            available: list[dict[str, Any]] = []
+            for unit in selected:
+                cursor = self._available_route_cursor(state, unit)
+                if cursor is None:
+                    for member in unit["members"]:
+                        state["logical"][member]["state"] = "fenced"
+                        state["logical"][member]["result"] = {
+                            "failure_signature": "route_exhausted",
+                            "summary": "all prepared native routes were rejected",
+                        }
+                        route_errors[member] = "all prepared native routes were rejected"
+                    continue
+                route_cursors[unit["id"]] = cursor
+                available.append(unit)
+            selected = available
+            if not selected:
+                self._write_state(state)
+                return {
+                    **self._public_batch(state, []),
+                    "blocked": [
+                        {"node": node, "reason": route_errors[node]}
+                        for node in sorted(route_errors)
+                    ],
+                    "state": "blocked",
+                }
             wave_scopes = {
                 (scope["kind"], scope["path"]): dict(scope)
                 for unit in selected
@@ -1938,7 +2157,7 @@ class ControlPlane:
                     plan,
                     wave_id,
                     unit,
-                    route_cursor=0,
+                    route_cursor=route_cursors[unit["id"]],
                 )
                 state["dispatches"][dispatch["dispatch_id"]] = dispatch
                 for member in unit["members"]:
@@ -2023,6 +2242,7 @@ class ControlPlane:
             )
             baseline = deepcopy(wave["baseline"])
             owner_scopes = deepcopy(dispatch["scopes"])
+            checkpoint()
             self._begin_native_claim(state, dispatch, tool_use_id)
             self._write_state(state)
             claim_revision = state["revision"]
@@ -2036,6 +2256,9 @@ class ControlPlane:
                     pre_spawn=True,
                 )
         except OperationDeadlineExceeded as error:
+            self._rollback_native_claim(dispatch_id, tool_use_id)
+            raise ControlPlaneUnavailable(str(error)) from error
+        except WorkspaceGuardUnavailable as error:
             self._rollback_native_claim(dispatch_id, tool_use_id)
             raise ControlPlaneUnavailable(str(error)) from error
         except WorkspaceGuardError as error:
@@ -2070,6 +2293,7 @@ class ControlPlane:
                 dispatch["claim_expires_at"] = (
                     _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
                 )
+                checkpoint()
                 self._write_state(state)
         except Exception:
             self._rollback_native_claim(dispatch_id, tool_use_id)
@@ -2522,6 +2746,8 @@ class ControlPlane:
                 allowed_scopes=allowed,
                 owner_scopes=owner_scopes,
             )
+        except (OperationDeadlineExceeded, WorkspaceGuardUnavailable) as error:
+            raise ControlPlaneUnavailable(str(error)) from error
         except WorkspaceGuardError as error:
             raise ControlPlaneError(str(error)) from error
         actual = verification["owner_changed_paths"]
@@ -2918,9 +3144,15 @@ def main() -> int:
     try:
         control = ControlPlane(_session_arg())
         if args.command == "prepare":
-            catalog = _load_object(args.catalog, "native catalogue") if args.catalog else None
+            if args.capacity < 1:
+                raise ControlPlaneError("native capacity must be a positive integer")
+            catalog = (
+                _load_object(args.catalog, "native catalogue")
+                if args.catalog
+                else load_native_catalog()
+            )
             brief = _prepare_brief(_stdin_json())
-            control.create_plan(args.repo, brief)
+            control.create_plan(args.repo, brief, resume_identical=True)
             result = control.next_wave(
                 capacity=args.capacity,
                 native_catalog=catalog,

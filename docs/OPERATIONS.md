@@ -73,9 +73,9 @@ returns complete native inputs for the first ready wave. A single child needs `r
 ```
 
 When nodes must share named acceptance IDs, submit a full brief with top-level
-`acceptance` to the same `prepare` command. An existing lifecycle state must be explicitly
-cleaned before another plan can be created in the same Codex task. No form needs a
-temporary contract file.
+`acceptance` to the same `prepare` command. An exact retry resumes an identical plan only
+while it has not produced a wave; replacing a plan still requires explicit inactive
+cleanup. No form needs a temporary contract file.
 
 Omitted `decision` means bounded judgment. Set `decision` to `mechanical` only when
 all allowed choices are acceptance-equivalent. `verification=semantic|manual` or a
@@ -130,7 +130,9 @@ Lifecycle v1 files left by 2.0.1 with `interrupting` state recover the recorded 
 `running`; the uncertain native owner keeps its lease until restart, a terminal result,
 or explicit interrupt settlement. New lifecycle filenames carry canonical workspace and
 task digests, so an invalid indexed state blocks only its workspace. Unindexable malformed
-legacy files move to the local `quarantine` directory for manual inspection.
+legacy files move to content-addressed, no-replace files under `quarantine` only when the
+state root carries CCO's ownership marker. Unmarked shared directories are never used to
+quarantine unrelated JSON.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
@@ -146,6 +148,9 @@ lock waits with rollback reserve below the 30-second manifest timeout. Current C
 a Hook command crash or timeout but still allows the native tool; this host-level
 fail-open behavior is outside a plugin's enforcement authority. Treat CCO as a workflow
 guardrail, keep Hooks trusted, and inspect host Hook failures.
+SubagentStop uses its own budget below the 120-second host timeout. Temporary workspace or
+state infrastructure failures return `decision:block`, so the child repeats the exact same
+`CCO_RESULT`; only a verified scope or result-contract violation is fenced.
 
 Wave artifacts contain the fresh baseline and are deleted as soon as every physical
 dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,

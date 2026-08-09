@@ -125,6 +125,15 @@ class V9HookTests(unittest.TestCase):
         )
         self.assertLess(control.lock_timeout, 3)
 
+    def test_subagent_stop_budget_leaves_host_settlement_reserve(self) -> None:
+        manifest = json.loads((HOOKS / "hooks.json").read_text(encoding="utf-8"))
+        host_timeout = manifest["hooks"]["SubagentStop"][0]["hooks"][0]["timeout"]
+        self.assertLess(cco_hook.SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS, host_timeout)
+        control = cco_hook._control(
+            {"hook_event_name": "SubagentStop", "session_id": "result-budget"}
+        )
+        self.assertLessEqual(control.lock_timeout, 10)
+
     def test_postflight_delegates_only_success_settlement(self) -> None:
         class Control:
             @staticmethod

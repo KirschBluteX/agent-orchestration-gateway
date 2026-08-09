@@ -18,9 +18,48 @@ from directory_state import (  # noqa: E402
     normalize_directory_scope,
     verify_directory_state,
 )
+import directory_state as directory_state_module  # noqa: E402
 
 
 class DirectoryStateTests(unittest.TestCase):
+    def test_directory_enumeration_checks_deadline_between_entries(self) -> None:
+        class Entry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+        class Entries:
+            def __init__(self) -> None:
+                self.items = iter([Entry("one"), Entry("two"), Entry("three")])
+                self.yielded = 0
+
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __next__(self):  # type: ignore[no-untyped-def]
+                item = next(self.items)
+                self.yielded += 1
+                return item
+
+        entries = Entries()
+
+        def checkpoint() -> None:
+            if entries.yielded:
+                raise RuntimeError("deadline")
+
+        with (
+            mock.patch.object(directory_state_module.os, "scandir", return_value=entries),
+            mock.patch.object(directory_state_module, "checkpoint", side_effect=checkpoint),
+            self.assertRaisesRegex(RuntimeError, "deadline"),
+        ):
+            directory_state_module._child_names(Path("unused"))
+        self.assertEqual(entries.yielded, 1)
+
     def test_scope_snapshot_detects_any_explorer_or_reviewer_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -20,11 +20,8 @@ import workspace_state  # noqa: E402
 
 
 class OperationDeadlineTests(unittest.TestCase):
-    def test_context_rejects_an_unchecked_overrun_on_exit(self) -> None:
-        with (
-            patch("operation_deadline.time.monotonic", side_effect=[100.0, 106.0]),
-            self.assertRaises(OperationDeadlineExceeded),
-        ):
+    def test_context_exit_does_not_overturn_already_committed_work(self) -> None:
+        with patch("operation_deadline.time.monotonic", side_effect=[100.0, 106.0]):
             with deadline_after(5):
                 pass
 

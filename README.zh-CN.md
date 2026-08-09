@@ -108,7 +108,8 @@ baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地�
 普通首波无论是单个子 Agent 还是紧凑多节点 DAG，都只调用一次本地 `prepare`。
 它从标准输入读取任务并直接返回完整的原生工具参数；派遣过程不创建临时合同文件，
 也不需要读取 CCO 源码。后续依赖波次只调用 `next`。只有多个节点必须共享具名验收
-证据时，向同一个入口提交包含顶层 `acceptance` 的完整 DAG。
+证据时，向同一个入口提交包含顶层 `acceptance` 的完整 DAG。若首个波次生成前失败，
+可用完全相同的任务再次执行 `prepare`，无需先清理半完成 plan。
 
 一个 Codex 任务在显式清理非活动状态前只拥有一份 plan。`status` 除紧凑计数外，
 还会直接列出暂停、fenced 或等待 owner 绑定的 dispatch。spawn 即时返回缺少 owner
@@ -122,7 +123,7 @@ CCO 会通过 `native-failure` 精确结算对应 dispatch。尚未进入 PreToo
 准入 claim 会在工作区校验前持久化，并在原生调用前再次验证，reservation 过期不会形成跨任务读写竞态；
 若宿主已报告 owner 为 interrupted，显式 interrupt 重试也能完成结算。CCO 不会根据子 Agent 的普通文本猜测并重试。
 尚未真正执行的 spawn 若基线已过时，CCO 会废弃该波次，并在下一次 `next` 时重新捕获，
-而不是无限重复旧基线。
+而不是无限重复旧基线。若过时的是 fallback，已拒绝的路由证据会保留，不会再次选择该模型。
 
 安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
 `$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。
@@ -152,7 +153,8 @@ CCO 是工作流护栏，不是操作系统安全边界。Primary 仍是可信�
 
 Codex 当前会在 PreToolUse 命令崩溃或被宿主超时终止时 fail-open。CCO 使用明显更短的
 内部期限并在宿主期限前显式阻止调用，但无法把被杀死的 Hook 进程变成操作系统级
-fail-closed 边界。
+fail-closed 边界。SubagentStop 同样使用短于宿主的内部期限；临时 Git、文件系统或状态锁
+故障只会要求子 Agent 原样重复同一份结果，不会 fencing 合法结果。
 
 Git 工作区会保护仓库控制状态、typed scopes、范围内 ignored 内容、路径别名、submodule
 和隐藏 status 情况。非 Git 工作区不会执行 `git init`，默认上限为 20,000 个条目和 1 GiB。

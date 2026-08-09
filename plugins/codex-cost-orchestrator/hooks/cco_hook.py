@@ -24,7 +24,11 @@ from control_plane import (  # noqa: E402
     ControlPlaneUnavailable,
 )
 from host_paths import HostPathError, host_path, is_within  # noqa: E402
-from operation_deadline import checkpoint, deadline_after  # noqa: E402
+from operation_deadline import (  # noqa: E402
+    OperationDeadlineExceeded,
+    checkpoint,
+    deadline_after,
+)
 from rollout_io import RolloutError, first_record, is_rollout_path  # noqa: E402
 from state_lock import StateLockBusy  # noqa: E402
 
@@ -51,6 +55,7 @@ MAX_PROTECTED_DEPTH = 32
 MAX_PROTECTED_NODES = 10_000
 MAX_PROTECTED_BYTES = 1024 * 1024
 PRETOOL_INTERNAL_BUDGET_SECONDS = 24.0
+SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS = 100.0
 
 
 def _control(payload: Mapping[str, Any]) -> ControlPlane:
@@ -63,7 +68,7 @@ def _control(payload: Mapping[str, Any]) -> ControlPlane:
         "PreToolUse": 2.5,
         "SessionStart": 3.0,
         "Stop": 3.0,
-        "SubagentStop": 90.0,
+        "SubagentStop": 10.0,
     }.get(event, 3.0)
     return ControlPlane(session_id, lock_timeout=lock_timeout)
 
@@ -74,7 +79,10 @@ def _block(error: Exception | str) -> dict[str, str]:
 
 def _event_error(event: object, error: Exception) -> dict[str, Any]:
     message = f"CCO: {error}"
-    if isinstance(error, (ControlPlaneUnavailable, StateLockBusy, OSError)):
+    if isinstance(
+        error,
+        (ControlPlaneUnavailable, OperationDeadlineExceeded, StateLockBusy, OSError),
+    ):
         if event == "SubagentStop":
             return {
                 "decision": "block",
@@ -296,33 +304,51 @@ def evaluate(value: object) -> dict[str, Any]:
             reason = _control(value).stop_reason()
             return _block(reason) if reason else {}
         if event == "SubagentStop":
-            control = _control(value)
-            try:
-                owner = _owner(value)
-            except Exception:
-                return {
-                    "continue": False,
-                    "systemMessage": (
-                        "CCO could not map the native child result; Primary must inspect the actual state."
-                    )
-                }
-            message = value.get("last_assistant_message")
-            try:
-                control.record_result(owner, message)
-            except (ControlPlaneUnavailable, StateLockBusy, OSError) as error:
-                return _event_error(event, error)
-            except Exception:
+            with deadline_after(SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS):
+                control = _control(value)
                 try:
-                    control.fence_invalid_result(owner)
-                except (ControlPlaneUnavailable, StateLockBusy, OSError) as error:
+                    owner = _owner(value)
+                except (
+                    ControlPlaneUnavailable,
+                    OperationDeadlineExceeded,
+                    StateLockBusy,
+                    OSError,
+                ):
+                    raise
+                except Exception:
+                    return {
+                        "continue": False,
+                        "systemMessage": (
+                            "CCO could not map the native child result; Primary must inspect the actual state."
+                        )
+                    }
+                message = value.get("last_assistant_message")
+                try:
+                    control.record_result(owner, message)
+                except (
+                    ControlPlaneUnavailable,
+                    OperationDeadlineExceeded,
+                    StateLockBusy,
+                    OSError,
+                ) as error:
                     return _event_error(event, error)
-                return {
-                    "continue": False,
-                    "systemMessage": (
-                        "CCO rejected and fenced the child result; Primary must inspect the actual state."
-                    )
-                }
-            return {"continue": False}
+                except Exception:
+                    try:
+                        control.fence_invalid_result(owner)
+                    except (
+                        ControlPlaneUnavailable,
+                        OperationDeadlineExceeded,
+                        StateLockBusy,
+                        OSError,
+                    ) as error:
+                        return _event_error(event, error)
+                    return {
+                        "continue": False,
+                        "systemMessage": (
+                            "CCO rejected and fenced the child result; Primary must inspect the actual state."
+                        )
+                    }
+                return {"continue": False}
         return {}
     except Exception as error:
         return _event_error(event, error)

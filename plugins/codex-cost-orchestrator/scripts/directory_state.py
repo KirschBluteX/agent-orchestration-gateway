@@ -49,6 +49,10 @@ class DirectoryStateError(ValueError):
     """A non-Git workspace cannot be represented or verified safely."""
 
 
+class DirectoryStateUnavailable(DirectoryStateError):
+    """Directory metadata or content could not be inspected temporarily."""
+
+
 class DirectoryBudgetError(DirectoryStateError):
     """A safe directory capture would exceed its configured metadata budget."""
 
@@ -68,7 +72,7 @@ def _root_metadata(path: Path) -> os.stat_result:
     try:
         metadata = path.lstat()
     except OSError as error:
-        raise DirectoryStateError("directory workspace root is unavailable") from error
+        raise DirectoryStateUnavailable("directory workspace root is unavailable") from error
     if _is_reparse_metadata(metadata) or not stat.S_ISDIR(metadata.st_mode):
         raise DirectoryStateError("directory workspace root must be a real directory")
     return metadata
@@ -83,13 +87,17 @@ def directory_root(path: Path) -> Path:
         try:
             metadata = ancestor.lstat()
         except OSError as error:
-            raise DirectoryStateError("directory workspace ancestry is unavailable") from error
+            raise DirectoryStateUnavailable(
+                "directory workspace ancestry is unavailable"
+            ) from error
         if _is_reparse_metadata(metadata):
             raise DirectoryStateError("directory workspace cannot use a reparse ancestor")
     try:
         return candidate.resolve(strict=True)
     except OSError as error:
-        raise DirectoryStateError("directory workspace root cannot be resolved") from error
+        raise DirectoryStateUnavailable(
+            "directory workspace root cannot be resolved"
+        ) from error
 
 
 def _case_key(path: str) -> str:
@@ -107,10 +115,16 @@ def _canonical_child_path(relative: str) -> str:
 
 def _child_names(path: Path) -> list[str]:
     checkpoint()
+    names: list[str] = []
     try:
-        names = [entry.name for entry in os.scandir(path)]
+        with os.scandir(path) as entries:
+            for entry in entries:
+                checkpoint()
+                names.append(entry.name)
     except OSError as error:
-        raise DirectoryStateError("directory workspace enumeration failed") from error
+        raise DirectoryStateUnavailable(
+            "directory workspace enumeration failed"
+        ) from error
     keys: dict[str, str] = {}
     for name in names:
         checkpoint()
@@ -120,7 +134,9 @@ def _child_names(path: Path) -> list[str]:
         if key in keys and keys[key] != name:
             raise DirectoryStateError("directory contains a case-insensitive path alias")
         keys[key] = name
-    return sorted(names, key=lambda value: (value.casefold(), value))
+    ordered = sorted(names, key=lambda value: (value.casefold(), value))
+    checkpoint()
+    return ordered
 
 
 def normalize_directory_scope(root: Path, value: object) -> dict[str, str]:
@@ -149,7 +165,9 @@ def normalize_directory_scope(root: Path, value: object) -> dict[str, str]:
         try:
             metadata = candidate.lstat()
         except OSError as error:
-            raise DirectoryStateError("directory scope cannot be inspected") from error
+            raise DirectoryStateUnavailable(
+                "directory scope cannot be inspected"
+            ) from error
         if _is_reparse_metadata(metadata):
             raise DirectoryStateError("directory scope cannot traverse a reparse point")
         if stat.S_ISDIR(metadata.st_mode):
@@ -174,7 +192,7 @@ def _inspect_entry(path: Path, relative: str) -> tuple[dict[str, Any], tuple[Any
     try:
         metadata = path.lstat()
     except OSError as error:
-        raise DirectoryStateError("directory entry inspection failed") from error
+        raise DirectoryStateUnavailable("directory entry inspection failed") from error
     if _is_reparse_metadata(metadata):
         raise DirectoryStateError(f"directory entry is a reparse point: {relative}")
     mode = stat.S_IMODE(metadata.st_mode)
@@ -358,7 +376,7 @@ def _digest_file(path: Path, expected: tuple[Any, ...]) -> str:
                 digest.update(chunk)
         after = path.stat(follow_symlinks=False)
     except OSError as error:
-        raise DirectoryStateError("directory file hashing failed") from error
+        raise DirectoryStateUnavailable("directory file hashing failed") from error
     if _metadata_token(after, "file") != expected:
         raise DirectoryStateError("directory file changed during snapshot capture")
     return digest.hexdigest()

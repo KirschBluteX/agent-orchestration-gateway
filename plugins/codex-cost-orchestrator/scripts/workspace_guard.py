@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from operation_deadline import checkpoint
 from directory_state import (
     DirectoryStateError,
+    DirectoryStateUnavailable,
     capture_directory_state,
     directory_root,
     normalize_directory_scope,
@@ -24,6 +25,7 @@ from protocol_hash import (
 )
 from workspace_state import (
     StateError,
+    StateUnavailable,
     normalize_allow,
     repository_control_roots,
     repository_gitlinks,
@@ -43,6 +45,10 @@ class WorkspaceGuardError(RuntimeError):
     """The requested workspace cannot be represented or verified safely."""
 
 
+class WorkspaceGuardUnavailable(WorkspaceGuardError):
+    """Workspace inspection infrastructure is temporarily unavailable."""
+
+
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(path.expanduser()))
 
@@ -56,7 +62,9 @@ def _has_git_marker(path: Path) -> bool:
         except FileNotFoundError:
             continue
         except OSError as error:
-            raise WorkspaceGuardError("Git workspace marker is unavailable") from error
+            raise WorkspaceGuardUnavailable(
+                "Git workspace marker is unavailable"
+            ) from error
     return False
 
 
@@ -67,15 +75,19 @@ def discover_workspace(path: Path) -> tuple[str, Path]:
     requested = _absolute(path)
     try:
         return "git", repository_root(requested)
-    except (OSError, StateError):
+    except (OSError, StateUnavailable):
         if _has_git_marker(requested):
-            raise WorkspaceGuardError(
+            raise WorkspaceGuardUnavailable(
                 "Git workspace is present but its authoritative root is unavailable"
             )
         try:
             return "directory", directory_root(requested)
-        except (OSError, DirectoryStateError) as error:
+        except (OSError, DirectoryStateUnavailable) as error:
+            raise WorkspaceGuardUnavailable(str(error)) from error
+        except DirectoryStateError as error:
             raise WorkspaceGuardError(str(error)) from error
+    except StateError as error:
+        raise WorkspaceGuardError(str(error)) from error
 
 
 def normalize_scope_groups(
@@ -140,7 +152,9 @@ def _normalize_scope_groups(
                 ]
                 for group in requested_groups
             ]
-    except (DirectoryStateError, OSError, StateError) as error:
+    except (DirectoryStateUnavailable, OSError, StateUnavailable) as error:
+        raise WorkspaceGuardUnavailable(str(error)) from error
+    except (DirectoryStateError, StateError) as error:
         raise WorkspaceGuardError(str(error)) from error
     result: list[list[dict[str, str]]] = []
     for normalized in normalized_groups:
@@ -183,7 +197,9 @@ def capture(
         try:
             control_roots = repository_control_roots(workspace)
             index_records = repository_index_records(workspace)
-        except (OSError, StateError) as error:
+        except (OSError, StateUnavailable) as error:
+            raise WorkspaceGuardUnavailable(str(error)) from error
+        except StateError as error:
             raise WorkspaceGuardError(str(error)) from error
     normalized = _normalize_scope_groups(
         backend,
@@ -208,7 +224,9 @@ def capture(
                 capture_mode="full" if writable else "scope",
                 workspace_mode=workspace_mode,
             )
-    except (DirectoryStateError, OSError, StateError) as error:
+    except (DirectoryStateUnavailable, OSError, StateUnavailable) as error:
+        raise WorkspaceGuardUnavailable(str(error)) from error
+    except (DirectoryStateError, StateError) as error:
         raise WorkspaceGuardError(str(error)) from error
     return {
         "backend": backend,
@@ -328,7 +346,9 @@ def verify_state(
                 raise WorkspaceGuardError(
                     "workspace verification failed: " + ", ".join(result["violations"])
                 )
-    except (DirectoryStateError, OSError, StateError) as error:
+    except (DirectoryStateUnavailable, OSError, StateError) as error:
+        raise WorkspaceGuardUnavailable(str(error)) from error
+    except DirectoryStateError as error:
         raise WorkspaceGuardError(str(error)) from error
     changed = list(result["changed_paths"])
     return {

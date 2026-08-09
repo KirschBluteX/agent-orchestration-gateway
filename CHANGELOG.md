@@ -2,6 +2,23 @@
 
 The project follows semantic versioning.
 
+## 3.0.0 - 2026-08-09
+
+- Declared the unified `prepare` interface and removal of the native-spawn bypass as a
+  major-version boundary; no deprecated bypass or duplicate planning path was restored.
+- Made legacy-to-indexed lifecycle migration use one directory snapshot and recover an
+  interrupted, provably identical migration without losing a workspace lease.
+- Prevented an elapsed deadline from overturning a committed native admission, while
+  retaining explicit checkpoints before commit and bounded chunked state/directory reads.
+- Made identical `prepare` retries resume a plan that has not produced a wave, and moved
+  capacity plus native-catalog validation ahead of plan persistence.
+- Distinguished workspace violations from temporary Git/filesystem unavailability.
+  SubagentStop now has an internal deadline and asks the same child to repeat the exact
+  result instead of fencing it when verification infrastructure is unavailable.
+- Recaptured stale fallback waves without retrying an already rejected route, and limited
+  malformed legacy quarantine to marked CCO-owned roots with content-addressed no-replace
+  files.
+
 ## 2.0.4 - 2026-08-09
 
 - Removed the public native-spawn bypass and made every requested native subagent pass

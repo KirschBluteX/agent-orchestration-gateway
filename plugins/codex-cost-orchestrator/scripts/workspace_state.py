@@ -86,6 +86,10 @@ class StateError(Exception):
     pass
 
 
+class StateUnavailable(StateError):
+    """Git or filesystem inspection was temporarily unavailable."""
+
+
 def git(repo: Path, *args: str, allow_failure: bool = False) -> bytes:
     environment = os.environ.copy()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
@@ -104,7 +108,7 @@ def git(repo: Path, *args: str, allow_failure: bool = False) -> bytes:
             "Git workspace inspection exceeded the CCO Hook deadline"
         ) from error
     if result.returncode and not allow_failure:
-        raise StateError("Git repository inspection failed")
+        raise StateUnavailable("Git repository inspection failed")
     return result.stdout
 
 
@@ -116,14 +120,14 @@ def repository_root(repo: Path) -> Path:
     candidate = repo.expanduser().resolve()
     output = git(candidate, "rev-parse", "--show-toplevel")
     if not output:
-        raise StateError("--repo must identify a Git work tree")
+        raise StateUnavailable("--repo must identify a Git work tree")
     return Path(os.fsdecode(output.rstrip(b"\r\n"))).resolve()
 
 
 def repository_control_path(root: Path, option: str) -> Path:
     output = git(root, "rev-parse", option).rstrip(b"\r\n")
     if not output:
-        raise StateError("Git control path is unavailable")
+        raise StateUnavailable("Git control path is unavailable")
     path = Path(os.fsdecode(output))
     if not path.is_absolute():
         path = root / path
@@ -247,7 +251,7 @@ def reparse_resolved_record(path: Path) -> dict[str, Any]:
             return {"kind": "missing"}
         return {"kind": "special"}
     except OSError as error:
-        raise StateError("Git control reparse target inspection failed") from error
+        raise StateUnavailable("Git control reparse target inspection failed") from error
 
 
 def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
@@ -261,7 +265,7 @@ def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
         try:
             children = sorted(os.scandir(current), key=lambda entry: entry.name)
         except OSError as error:
-            raise StateError("Git control directory inspection failed") from error
+            raise StateUnavailable("Git control directory inspection failed") from error
         for child in children:
             checkpoint()
             relative = f"{prefix}/{child.name}" if prefix else child.name
@@ -742,10 +746,10 @@ def symbolic_head(root: Path) -> str | None:
     if result.returncode == 1:
         return None
     if result.returncode != 0:
-        raise StateError("Git symbolic HEAD inspection failed")
+        raise StateUnavailable("Git symbolic HEAD inspection failed")
     output = result.stdout.rstrip(b"\r\n")
     if not output:
-        raise StateError("Git symbolic HEAD inspection returned an empty reference")
+        raise StateUnavailable("Git symbolic HEAD inspection returned an empty reference")
     return output.decode("utf-8", errors="strict")
 
 

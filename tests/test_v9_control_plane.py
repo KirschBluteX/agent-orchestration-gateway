@@ -20,13 +20,18 @@ from control_plane import (  # noqa: E402
     TASK_HEADER,
     ControlPlane,
     ControlPlaneError,
+    ControlPlaneUnavailable,
     _select_units,
     parse_result,
     parse_task_message,
 )
 import control_plane as control_plane_module  # noqa: E402
 from state_lock import StateLockBusy, acquire  # noqa: E402
-from workspace_guard import WorkspaceGuardError  # noqa: E402
+from workspace_guard import (  # noqa: E402
+    WorkspaceGuardError,
+)
+import workspace_guard as workspace_guard_module  # noqa: E402
+from workspace_state import StateError  # noqa: E402
 
 
 def catalog(*models: str) -> dict[str, object]:
@@ -181,6 +186,41 @@ class V9ControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 2)
         self.assertIn("duplicate JSON key", completed.stderr)
+
+    def test_prepare_rejects_invalid_capacity_without_persisting_a_plan(self) -> None:
+        environment = os.environ.copy()
+        environment["CCO_STATE_DIR"] = str(self.state_root)
+        environment["CODEX_THREAD_ID"] = "invalid-capacity"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPTS / "control_plane.py"),
+                "prepare",
+                "--repo",
+                str(self.repo),
+                "--capacity",
+                "0",
+            ],
+            input=json.dumps(self.brief([self.node("n01", "A01", "a.txt")])),
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertFalse(list(self.state_root.rglob("*.json")))
+
+    def test_identical_prepare_can_resume_a_plan_that_has_no_wave(self) -> None:
+        control = self.control("idempotent-prepare")
+        brief = self.brief([self.node("n01", "A01", "a.txt")])
+        first = control.create_plan(self.repo, brief, resume_identical=True)
+
+        resumed = control.create_plan(self.repo, brief, resume_identical=True)
+
+        self.assertEqual(resumed, first)
+        self.assertEqual(control.status()["state"], "ready")
 
     def test_prepare_cli_compiles_one_child_and_wave_without_temp_contract_file(self) -> None:
         environment = os.environ.copy()
@@ -583,9 +623,78 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(next(iter(migrated["dispatches"].values()))["state"], "fenced")
         self.assertEqual(migrated["logical"]["legacy"]["state"], "fenced")
 
+    def test_workspace_scan_cannot_miss_a_concurrent_legacy_migration(self) -> None:
+        legacy = self.control("legacy-race")
+        brief = self.brief([self.node("writer", "A01", "a.txt")])
+        legacy.create_plan(self.repo, brief)
+        native = legacy.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        _dispatch_id, owner = self.start_dispatch(legacy, native)
+        legacy.state_path.replace(self.state_root / "legacy-race.json")
+        legacy = self.control("legacy-race")
+
+        contender = self.control("legacy-race-contender")
+        contender.create_plan(self.repo, brief)
+        original_glob = Path.glob
+        migrated = False
+        inside_migration = False
+
+        def racing_glob(path: Path, pattern: str):  # type: ignore[no-untyped-def]
+            nonlocal inside_migration, migrated
+            snapshot = list(original_glob(path, pattern))
+            if (
+                path == self.state_root
+                and pattern == "*.json"
+                and not migrated
+                and not inside_migration
+            ):
+                inside_migration = True
+                migrated = True
+                try:
+                    self.assertTrue(legacy.owner_is_managed(owner))
+                finally:
+                    inside_migration = False
+            return iter(snapshot)
+
+        with (
+            patch.object(Path, "glob", new=racing_glob),
+            self.assertRaises(ControlPlaneUnavailable),
+        ):
+            contender.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-terra"),
+            )
+        self.assertTrue(migrated)
+        with self.assertRaisesRegex(ControlPlaneError, "writer lease"):
+            contender.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-terra"),
+            )
+
+    def test_completed_legacy_migration_recovers_an_identical_duplicate(self) -> None:
+        session = "legacy-crash-window"
+        control = self.control(session)
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        canonical = control.state_path
+        legacy_state = json.loads(canonical.read_text(encoding="utf-8"))
+        legacy_state["revision"] -= 1
+        legacy_path = self.state_root / f"{session}.json"
+        legacy_path.write_text(json.dumps(legacy_state), encoding="utf-8")
+
+        recovered = self.control(session)
+        self.assertEqual(recovered.status()["state"], "ready")
+        self.assertFalse(legacy_path.exists())
+        self.assertEqual(recovered.state_path, canonical)
+
     def test_unindexed_invalid_legacy_state_is_quarantined(self) -> None:
         malformed = self.state_root / "old-unindexable.json"
         self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
         malformed.write_text('{"protocol":', encoding="utf-8")
         control = self.control("quarantine-legacy")
         control.create_plan(
@@ -601,6 +710,38 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(len(batch["dispatches"]), 1)
         self.assertFalse(malformed.exists())
         self.assertEqual(len(list((self.state_root / "quarantine").glob("*.json"))), 1)
+
+    def test_unmarked_shared_state_does_not_move_unrelated_json(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        unrelated = self.state_root / "notes.json"
+        unrelated.write_text('{"not":"cco"}', encoding="utf-8")
+        control = self.control("shared-state-root")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+
+        batch = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )
+
+        self.assertEqual(len(batch["dispatches"]), 1)
+        self.assertTrue(unrelated.exists())
+        self.assertFalse((self.state_root / "quarantine").exists())
+
+    def test_quarantine_never_overwrites_an_earlier_payload(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
+        path = self.state_root / "old.json"
+        control = self.control("quarantine-no-replace")
+        path.write_text('{"first":', encoding="utf-8")
+        control._workspace_state_candidates(self.repo)
+        path.write_text('{"second":', encoding="utf-8")
+        control._workspace_state_candidates(self.repo)
+
+        quarantined = list((self.state_root / "quarantine").glob("*.json"))
+        self.assertEqual(len(quarantined), 2)
 
     def test_invalid_indexed_same_workspace_state_blocks_admission(self) -> None:
         control = self.control("indexed-corruption")
@@ -774,6 +915,64 @@ class V9ControlPlaneTests(unittest.TestCase):
         control.preflight_spawn(
             {"tool_input": refreshed, "tool_use_id": "fresh-baseline"}
         )
+
+    def test_stale_fallback_route_recaptures_without_retrying_rejected_model(self) -> None:
+        control = self.control("stale-fallback-wave")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt", decision="mechanical")]),
+        )
+        first = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
+        )["dispatches"][0]
+        first_id = parse_task_message(first["message"])["dispatch_id"]
+        control.preflight_spawn({"tool_input": first, "tool_use_id": "reject-first"})
+        control.settle_native_failure(first_id, "route_rejected")
+        fallback = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
+        )["dispatches"][0]
+        self.assertEqual(fallback["model"], "gpt-5.6-terra")
+        (self.repo / "a.txt").write_text("changed before fallback\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ControlPlaneError, "call next again"):
+            control.preflight_spawn(
+                {"tool_input": fallback, "tool_use_id": "stale-fallback"}
+            )
+
+        refreshed = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
+        )["dispatches"][0]
+        self.assertEqual(refreshed["model"], "gpt-5.6-terra")
+
+    def test_git_result_inspection_failure_does_not_fence_the_owner(self) -> None:
+        control = self.control("result-infrastructure-failure")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("worker", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        dispatch_id, owner = self.start_dispatch(control, native)
+
+        with (
+            patch.object(
+                workspace_guard_module,
+                "verify",
+                side_effect=StateError("Git is temporarily unavailable"),
+            ),
+            self.assertRaises(ControlPlaneUnavailable),
+        ):
+            control.record_result(
+                owner,
+                result_text(dispatch_id, evidence={"A01": "done"}),
+            )
+
+        self.assertEqual(control.status()["counts"]["running"], 1)
 
     @unittest.skipUnless(os.name == "nt", "extended path aliases are Windows-specific")
     def test_workspace_lock_identity_collapses_windows_extended_aliases(self) -> None:

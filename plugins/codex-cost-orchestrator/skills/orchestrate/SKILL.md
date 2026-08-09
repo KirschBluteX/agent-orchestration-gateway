@@ -26,6 +26,7 @@ A compact DAG has `goal` and `nodes`; every node has `id` plus the same required
 also declare `depends_on` or `review_of`. A full DAG may instead add top-level `acceptance` and use
 its IDs in nodes when evidence is shared. CCO compiles either form, captures one baseline, derives
 the first ready wave, and returns complete `spawn_agent` inputs.
+If `prepare` fails before its first wave, retry the identical command and brief.
 
 Do not pass a session ID. Dispatch every returned input unchanged and use its exact profile,
 model, effort, name, and message. Mechanical explorer/worker prefers Luna; bounded work prefers

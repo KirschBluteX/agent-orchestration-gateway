@@ -27,7 +27,6 @@ def deadline_after(seconds: float) -> Iterator[None]:
     token = _DEADLINE.set(candidate if current is None else min(current, candidate))
     try:
         yield
-        remaining_seconds()
     finally:
         _DEADLINE.reset(token)
 

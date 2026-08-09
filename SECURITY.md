@@ -52,6 +52,9 @@ its own admission budget below the manifest timeout, bounds Git and directory in
 and reserves time to roll back an unfinished claim, so ordinary deadline exhaustion
 returns an explicit block. A process killed before it can return that block cannot be
 made fail-closed by a plugin and remains part of the trusted-host boundary.
+SubagentStop has a separate internal budget below its manifest timeout. Git, filesystem,
+deadline, and state-lock unavailability request an exact result replay; they do not fence
+the owner as though it violated scope.
 
 Review and trust Hook hashes in `/hooks` after every update. Doctor never changes trust.
 
@@ -72,6 +75,9 @@ workspace. Active prepared claims, running workers, and paused workers keep the 
 Cross-task readers are also excluded from overlapping active writers. Compatible read
 leaves may run beside a non-overlapping writer; their results
 permit only the known sibling writer scope and must show no read-scope delta.
+Legacy state migration is scanned from one directory snapshot. A duplicate left between
+the canonical write and legacy unlink is removed only when its normalized state and
+revision prove it is the same migration.
 
 ## Host maintenance
 

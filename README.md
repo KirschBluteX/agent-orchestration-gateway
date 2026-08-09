@@ -119,7 +119,8 @@ The normal first wave uses one local `prepare` call for either one child or a co
 multi-node DAG. It consumes the brief from stdin and returns complete native tool inputs;
 no temporary contract file or CCO source inspection is part of dispatch. Later dependency
 waves require only `next`. The same entry accepts a full DAG when nodes share named
-acceptance evidence.
+acceptance evidence. If preparation fails before any wave exists, repeating the exact
+brief safely resumes that plan instead of requiring cleanup.
 
 One Codex task owns one plan until explicit inactive cleanup. `status` reports compact
 counts plus actionable paused, fenced, or owner-pending dispatch identities. A spawn
@@ -136,7 +137,8 @@ restart recovery. Admission is claimed before workspace verification and recheck
 the native call, so reservation expiry cannot open a reader/writer race. Interrupt retry
 can settle an owner the host already reports as interrupted. It never infers retries from
 child prose. If a not-yet-executed spawn baseline is stale, CCO discards that wave and
-captures a fresh one on the next `next` call instead of replaying it indefinitely.
+captures a fresh one on the next `next` call instead of replaying it indefinitely. A stale
+fallback preserves the rejected-route proof and does not retry that model.
 
 Use `$codex-cost-orchestrator:manage-cco` for installation, doctor, configuration,
 paused work, restart recovery, retry, abandonment, or cleanup. Normal tasks do not load
@@ -169,6 +171,8 @@ workers receive one bounded write lease and must not stage files.
 Codex currently treats a crashed or host-timed-out PreToolUse command as fail-open. CCO
 uses a shorter internal deadline and returns an explicit block before the host deadline,
 but it cannot turn a killed Hook process into an OS-level fail-closed boundary.
+SubagentStop also settles within its own shorter budget; temporary Git, filesystem, or
+state-lock failures ask the child to repeat the exact same result rather than fencing it.
 
 Git workspaces protect repository control state, typed scopes, ignored content within
 scope, path aliases, submodules, and hidden status cases. Non-Git workspaces are

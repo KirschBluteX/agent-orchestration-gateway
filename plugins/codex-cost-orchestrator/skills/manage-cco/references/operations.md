@@ -34,6 +34,9 @@ owner-pending work. A Desktop restart fences every active prepared claim, runnin
 or paused turn; inspect the workspace before `retry`.
 `wait_agent` returning `timed_out:true` is only a wait-window expiry. Continue a long
 wait; do not settle it as a native timeout.
+An exact `prepare` retry resumes an identical plan only before its first wave exists.
+Temporary SubagentStop verification failures make the same child repeat its exact
+`CCO_RESULT`; do not create a replacement child.
 
 `cleanup` is current-task-only and refuses active or paused child work. Run it only
 after host-card maintenance is no longer needed.
