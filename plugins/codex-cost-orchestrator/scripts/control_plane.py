@@ -55,6 +55,7 @@ from workspace_guard import (
 PROTOCOL = "cco.v9"
 PLAN_PROTOCOL = "cco.plan.v1"
 WAVE_PROTOCOL = "cco.wave.v2"
+LEGACY_WAVE_PROTOCOL = "cco.wave.v1"
 BATCH_PROTOCOL = "cco.wave-batch.v2"
 LIFECYCLE_PROTOCOL = "cco.lifecycle.v1"
 TASK_HEADER = "CCO_TASK cco.v9"
@@ -170,6 +171,21 @@ def _session_digest(value: str) -> str:
 
 def _lifecycle_state_path(root: Path, workspace: object, session_id: str) -> Path:
     return root / f"{_workspace_digest(workspace)}--{_session_digest(session_id)}.json"
+
+
+def _lifecycle_lineage_id(
+    workspace: object,
+    session_id: str,
+    plan_id: str,
+) -> str:
+    return _digest(
+        b"cco.lifecycle-lineage.v1\0",
+        {
+            "plan_id": plan_id,
+            "session_id": session_id,
+            "workspace_root": _workspace_key(workspace),
+        },
+    )
 
 
 def _preflight_verification_budget() -> float:
@@ -324,18 +340,39 @@ def _session_state_paths(root: Path, session_id: str) -> list[Path]:
     suffix = f"--{_session_digest(session_id)}.json"
     legacy_name = f"{session_id}.json"
     matches: list[Path] = []
+    recovery_paths: list[Path] = []
+    recovery_count = 0
     try:
         with os.scandir(root) as entries:
             for entry in entries:
                 checkpoint()
                 if entry.name == legacy_name or entry.name.endswith(suffix):
                     matches.append(Path(entry.path))
+                elif RECOVERY_FILE_RE.fullmatch(entry.name) is not None:
+                    if recovery_count >= MAX_RECOVERY_FILES:
+                        raise ControlPlaneUnavailable(
+                            "lifecycle state directory exceeds the "
+                            f"{MAX_RECOVERY_FILES} recovery file limit"
+                        )
+                    recovery_count += 1
+                    recovery_paths.append(Path(entry.path))
     except FileNotFoundError:
         return []
     except OSError as error:
         raise ControlPlaneUnavailable(
             "lifecycle state directory is unavailable"
         ) from error
+    for path in recovery_paths:
+        try:
+            candidate = _load_object(path, "cco.v9 recovery lifecycle state")
+        except FileNotFoundError:
+            continue
+        except ControlPlaneUnavailable:
+            raise
+        except ControlPlaneError:
+            continue
+        if candidate.get("session_id") == session_id:
+            matches.append(path)
     matches.sort(key=lambda item: item.name)
     return matches
 
@@ -1254,15 +1291,26 @@ class ControlPlane:
     def state_path(self) -> Path:
         """Resolve this task's workspace-partitioned state without parsing other tasks."""
 
-        if self._state_path is not None:
+        if self._state_path is not None and self._state_path.exists():
             return self._state_path
+        self._state_path = None
         legacy = self.root / f"{self.session_id}.json"
-        matches = _session_state_paths(self.root, self.session_id)
+        with acquire(
+            self.root,
+            STATE_ROOT_CAPACITY_LOCK,
+            timeout=self.lock_timeout,
+        ):
+            matches = _session_state_paths(self.root, self.session_id)
         indexed = [path for path in matches if STATE_FILE_RE.fullmatch(path.name)]
+        recovery = [path for path in matches if RECOVERY_FILE_RE.fullmatch(path.name)]
         if len(indexed) > 1:
             raise ControlPlaneError("current task has multiple lifecycle state files")
+        if len(recovery) > 1:
+            raise ControlPlaneError("current task has multiple lifecycle recovery files")
         self._state_path = (
-            indexed[0]
+            recovery[0]
+            if recovery
+            else indexed[0]
             if indexed
             else next((path for path in matches if path.name == legacy.name), legacy)
         )
@@ -1274,10 +1322,21 @@ class ControlPlane:
         *,
         expected_session: str | None = None,
     ) -> dict[str, Any]:
+        raw_dispatches = state.get("dispatches")
         legacy = any(
             isinstance(dispatch, Mapping) and dispatch.get("state") == "interrupting"
-            for dispatch in (state.get("dispatches") or {}).values()
-        ) if isinstance(state.get("dispatches"), Mapping) else False
+            for dispatch in (raw_dispatches or {}).values()
+        ) if isinstance(raw_dispatches, Mapping) else False
+        legacy_layout = "lineage_id" not in state and isinstance(
+            raw_dispatches, Mapping
+        ) and any(
+            isinstance(dispatch, Mapping)
+            and any(
+                field not in dispatch
+                for field in ("context_turns", "fallback_from_owner", "reused_from")
+            )
+            for dispatch in raw_dispatches.values()
+        )
         logical_value = state.get("logical")
         legacy = legacy or (
             isinstance(logical_value, Mapping)
@@ -1286,7 +1345,7 @@ class ControlPlane:
                 for item in logical_value.values()
             )
         )
-        normalized = deepcopy(dict(state)) if legacy else dict(state)
+        normalized = deepcopy(dict(state)) if legacy or legacy_layout else dict(state)
         if legacy:
             logical = normalized.get("logical")
             dispatches = normalized.get("dispatches")
@@ -1348,10 +1407,42 @@ class ControlPlane:
             raise ControlPlaneError("lifecycle state session does not match")
         if not isinstance(normalized.get("workspace_root"), str):
             raise ControlPlaneError("lifecycle workspace root is invalid")
+        plan_id = normalized.get("plan_id")
+        revision = normalized.get("revision")
+        if not isinstance(plan_id, str) or SHA256_RE.fullmatch(plan_id) is None:
+            raise ControlPlaneError("lifecycle plan identity is invalid")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ControlPlaneError("lifecycle revision is invalid")
+        lineage_id = _lifecycle_lineage_id(
+            normalized["workspace_root"],
+            session,
+            plan_id,
+        )
+        if normalized.get("lineage_id", lineage_id) != lineage_id:
+            raise ControlPlaneError("lifecycle lineage identity is invalid")
+        normalized["lineage_id"] = lineage_id
         dispatches = normalized.get("dispatches")
         if not isinstance(dispatches, Mapping):
             raise ControlPlaneError("lifecycle dispatch collection is invalid")
         for dispatch_id, dispatch in dispatches.items():
+            if isinstance(dispatch, dict) and legacy_layout:
+                native = dispatch.get("native")
+                fork_turns = native.get("fork_turns") if isinstance(native, Mapping) else None
+                if "context_turns" not in dispatch:
+                    if fork_turns == "none":
+                        dispatch["context_turns"] = 0
+                    elif (
+                        isinstance(fork_turns, str)
+                        and fork_turns.isdigit()
+                        and 1 <= int(fork_turns) <= 32
+                    ):
+                        dispatch["context_turns"] = int(fork_turns)
+                    else:
+                        raise ControlPlaneError(
+                            "legacy lifecycle context inheritance is invalid"
+                        )
+                dispatch.setdefault("fallback_from_owner", None)
+                dispatch.setdefault("reused_from", None)
             if (
                 not isinstance(dispatch_id, str)
                 or SHA256_RE.fullmatch(dispatch_id) is None
@@ -1512,31 +1603,45 @@ class ControlPlane:
         if not self._state_root_is_marked():
             return []
         reservation: Path | None = None
-        try:
-            descriptor, reservation_name = tempfile.mkstemp(
-                dir=self.root,
-                prefix=".cco-recovery-",
-                suffix=".reserve",
+        with acquire(
+            self.root,
+            STATE_ROOT_CAPACITY_LOCK,
+            timeout=self.lock_timeout,
+        ):
+            recovery_count = sum(
+                RECOVERY_FILE_RE.fullmatch(candidate.name) is not None
+                for candidate in _state_json_paths(self.root)
             )
-            os.close(descriptor)
-            reservation = Path(reservation_name)
-        except OSError as error:
-            raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
-        staging = reservation.with_suffix(".json")
-        try:
-            os.replace(path, staging)
-        except FileNotFoundError:
-            return []
-        except OSError as error:
-            raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
-        finally:
-            if reservation is not None:
-                try:
-                    reservation.unlink(missing_ok=True)
-                except OSError as error:
-                    raise ControlPlaneUnavailable(
-                        "legacy recovery reservation cleanup failed"
-                    ) from error
+            if recovery_count >= MAX_RECOVERY_FILES:
+                raise ControlPlaneUnavailable(
+                    "lifecycle state directory exceeds the "
+                    f"{MAX_RECOVERY_FILES} recovery file limit"
+                )
+            try:
+                descriptor, reservation_name = tempfile.mkstemp(
+                    dir=self.root,
+                    prefix=".cco-recovery-",
+                    suffix=".reserve",
+                )
+                os.close(descriptor)
+                reservation = Path(reservation_name)
+            except OSError as error:
+                raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
+            staging = reservation.with_suffix(".json")
+            try:
+                os.replace(path, staging)
+            except FileNotFoundError:
+                return []
+            except OSError as error:
+                raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
+            finally:
+                if reservation is not None:
+                    try:
+                        reservation.unlink(missing_ok=True)
+                    except OSError as error:
+                        raise ControlPlaneUnavailable(
+                            "legacy recovery reservation cleanup failed"
+                        ) from error
 
         # Recovery staging stays in the state root and ends in .json.  A crash or I/O
         # failure therefore remains visible to the next workspace lease scan.
@@ -1621,7 +1726,10 @@ class ControlPlane:
                     _load_object(canonical, "recovered cco.v9 lifecycle state"),
                     expected_session=state["session_id"],
                 )
-                if current == state or current["revision"] > state["revision"]:
+                if current == state or (
+                    current["lineage_id"] == state["lineage_id"]
+                    and current["revision"] > state["revision"]
+                ):
                     try:
                         path.unlink(missing_ok=True)
                     except OSError as error:
@@ -1629,7 +1737,18 @@ class ControlPlane:
                             "lifecycle recovery finalization failed"
                         ) from error
                     return canonical, current
-                return path, state
+                if (
+                    current["lineage_id"] == state["lineage_id"]
+                    and state["revision"] > current["revision"]
+                ):
+                    try:
+                        os.replace(path, canonical)
+                    except OSError as error:
+                        raise ControlPlaneUnavailable(
+                            "lifecycle recovery publication failed"
+                        ) from error
+                    return canonical, state
+                raise ControlPlaneError("conflicting lifecycle recovery")
             if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
                 return path, state
             try:
@@ -1766,6 +1885,15 @@ class ControlPlane:
             state["workspace_root"],
             self.session_id,
         )
+        if (
+            RECOVERY_FILE_RE.fullmatch(source.name) is not None
+            and self._state_root_is_marked()
+        ):
+            source, state = self._replay_recovery_state(source, state)
+            self._state_path = source
+            raw_state = state
+            if source != canonical:
+                return state
         if STATE_FILE_RE.fullmatch(source.name) is not None and source != canonical:
             raise ControlPlaneError("indexed lifecycle filename does not match its state")
         legacy = self.root / f"{self.session_id}.json"
@@ -1809,13 +1937,22 @@ class ControlPlane:
 
     def _write_state(self, state: dict[str, Any]) -> None:
         self._mark_state_root_if_safe()
-        self._state_path = _lifecycle_state_path(
+        canonical = _lifecycle_state_path(
             self.root,
             state["workspace_root"],
             self.session_id,
         )
+        if (
+            self._state_path is not None
+            and RECOVERY_FILE_RE.fullmatch(self._state_path.name) is not None
+            and not canonical.exists()
+        ):
+            target = self._state_path
+        else:
+            target = canonical
+        self._state_path = target
         state["revision"] = int(state.get("revision", 0)) + 1
-        _atomic_write(self.state_path, state)
+        _atomic_write(target, state)
         artifacts = self.root / "artifacts"
         if not artifacts.is_dir():
             return
@@ -1853,7 +1990,10 @@ class ControlPlane:
         if not isinstance(wave_id, str):
             raise ControlPlaneError("there is no active wave")
         wave = _load_object(self._artifact_path("wave", wave_id), "cco.v9 wave artifact")
-        if wave.get("protocol") != WAVE_PROTOCOL or wave.get("wave_id") != wave_id:
+        protocol = wave.get("protocol")
+        if protocol not in {LEGACY_WAVE_PROTOCOL, WAVE_PROTOCOL} or wave.get(
+            "wave_id"
+        ) != wave_id:
             raise ControlPlaneError("wave artifact identity is invalid")
         identity = {
             key: wave.get(key)
@@ -1863,7 +2003,13 @@ class ControlPlane:
             wave.get("plan_id") != state.get("plan_id")
             or not isinstance(wave.get("baseline"), Mapping)
             or wave["baseline"].get("state_id") != wave.get("baseline_id")
-            or _digest(b"cco.wave.v2\0", identity) != wave_id
+            or _digest(
+                b"cco.wave.v1\0"
+                if protocol == LEGACY_WAVE_PROTOCOL
+                else b"cco.wave.v2\0",
+                identity,
+            )
+            != wave_id
         ):
             raise ControlPlaneError("wave artifact digest is invalid")
         units = wave.get("units")
@@ -1954,6 +2100,11 @@ class ControlPlane:
                     "active_wave_id": None,
                     "dispatches": {},
                     "epoch": 1,
+                    "lineage_id": _lifecycle_lineage_id(
+                        workspace,
+                        self.session_id,
+                        plan_id,
+                    ),
                     "logical": logical,
                     "plan_id": plan_id,
                     "plan_path": str(plan_path),
@@ -3097,6 +3248,8 @@ class ControlPlane:
             ]
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt target has no unique active dispatch")
+            matches[0]["interrupt_tool_use_id"] = tool_use_id
+            self._write_state(state)
 
     def postflight_interrupt(self, payload: Mapping[str, Any]) -> None:
         tool_use_id = payload.get("tool_use_id")
@@ -3118,14 +3271,14 @@ class ControlPlane:
                 item
                 for item in state["dispatches"].values()
                 if item.get("owner") == owner
+                and item.get("interrupt_tool_use_id") == tool_use_id
             ]
             if not matches:
                 return
             if len(matches) != 1:
-                raise ControlPlaneError("interrupt result has no unique managed dispatch")
+                raise ControlPlaneError("interrupt result has no unique prepared dispatch")
             dispatch = matches[0]
-            if dispatch["state"] in {"retired", "fenced", "rejected"}:
-                return
+            dispatch.pop("interrupt_tool_use_id", None)
             if (
                 isinstance(previous_status, str)
                 and previous_status in {"interrupted", "pending_init", "running"}
@@ -3133,7 +3286,7 @@ class ControlPlane:
             ):
                 self._fence_members(state, dispatch, "interrupted")
                 self._settle_wave(state)
-                self._write_state(state)
+            self._write_state(state)
 
     def record_result(self, owner: str, raw_result: object) -> dict[str, Any]:
         result = parse_result(raw_result)

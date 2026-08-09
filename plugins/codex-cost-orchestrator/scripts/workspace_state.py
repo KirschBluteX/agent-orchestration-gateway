@@ -467,9 +467,13 @@ def control_entry_record(
     return {"kind": "special", "mode": mode}
 
 
-def control_entry_digest(path: Path) -> str:
+def control_entry_digest(
+    path: Path,
+    *,
+    _budget: _ControlEntryBudget | None = None,
+) -> str:
     canonical = json.dumps(
-        control_entry_record(path),
+        control_entry_record(path, _budget=_budget),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -477,9 +481,13 @@ def control_entry_digest(path: Path) -> str:
     return sha256_bytes(canonical)
 
 
-def git_admin_digest(root: Path) -> str:
+def git_admin_digest(
+    root: Path,
+    *,
+    _budget: _ControlEntryBudget | None = None,
+) -> str:
     paths = repository_git_paths(root, GIT_ADMIN_PATHS)
-    budget = _ControlEntryBudget()
+    budget = _budget or _ControlEntryBudget()
     records = [
         {"name": name, **control_entry_record(paths[name], _budget=budget)}
         for name in GIT_ADMIN_PATHS
@@ -906,6 +914,7 @@ def state_payload(
     control_roots = (
         repository_control_roots(root) if control_roots is None else control_roots
     )
+    git_control_budget = _ControlEntryBudget()
     payload: dict[str, Any] = {
         "schema": SCHEMA,
         "repo_root": str(root),
@@ -916,11 +925,17 @@ def state_payload(
         ],
         "head": head_oid(root),
         "symbolic_head": symbolic_head(root),
-        "git_admin_sha256": git_admin_digest(root),
+        "git_admin_sha256": git_admin_digest(root, _budget=git_control_budget),
         "git_config_sha256": git_config_digest(root),
         "refs_sha256": refs_digest(root),
-        "hooks_sha256": control_entry_digest(repository_git_path(root, "hooks")),
-        "git_info_sha256": control_entry_digest(repository_git_path(root, "info")),
+        "hooks_sha256": control_entry_digest(
+            repository_git_path(root, "hooks"),
+            _budget=git_control_budget,
+        ),
+        "git_info_sha256": control_entry_digest(
+            repository_git_path(root, "info"),
+            _budget=git_control_budget,
+        ),
         "ignored_mode": ignored_mode,
         "ignored_limits": {
             "max_bytes": ignored_max_bytes,

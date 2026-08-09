@@ -209,6 +209,38 @@ class V9ControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(completed["state"], "retired")
 
+    def test_interrupt_after_owner_reuse_settles_only_the_active_dispatch(self) -> None:
+        control, _first_id, owner = self.ready_reuse_chain("reuse-interrupt")
+        action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        control.preflight_reuse(
+            {"tool_input": action["tool_input"], "tool_use_id": "reuse-call"}
+        )
+        control.postflight_tool(
+            {
+                "tool_input": action["tool_input"],
+                "tool_response": {"task_name": owner},
+                "tool_use_id": "reuse-call",
+            }
+        )
+
+        control.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "interrupt-reuse"}
+        )
+        control.postflight_interrupt(
+            {
+                "tool_input": {"target": owner},
+                "tool_response": {"previous_status": "running"},
+                "tool_use_id": "interrupt-reuse",
+            }
+        )
+
+        status = control.status()
+        self.assertEqual(status["counts"]["retired"], 1)
+        self.assertEqual(status["counts"]["fenced"], 1)
+
     def test_reviewer_and_scope_expansion_never_reuse_an_owner(self) -> None:
         reviewer = self.control("reuse-reviewer")
         reviewer_nodes = [
@@ -1340,6 +1372,99 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertTrue(source.state_path.exists())
         self.assertEqual(list(self.state_root.glob(".cco-recovery-*.json")), [])
 
+    def test_current_session_discovers_an_active_recovery_state(self) -> None:
+        resumed = self.control("recovery-owned-writer")
+        self.assertFalse(resumed.state_path.exists())
+        source = self.control("recovery-owned-writer")
+        source.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = source.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(source, native)
+        recovery = self.state_root / ".cco-recovery-owned.json"
+        os.replace(source.state_path, recovery)
+
+        self.assertEqual(resumed.status()["counts"]["running"], 1)
+        self.assertTrue(resumed.owner_is_managed(owner))
+        with self.assertRaisesRegex(ControlPlaneError, "already has CCO lifecycle proof"):
+            resumed.create_plan(
+                self.repo,
+                self.brief([self.node("replacement", "A02", "b.txt")]),
+            )
+
+    def test_unrelated_high_revision_state_cannot_delete_active_recovery(self) -> None:
+        source = self.control("recovery-lineage-writer")
+        brief = self.brief([self.node("writer", "A01", "a.txt")])
+        source.create_plan(self.repo, brief)
+        native = source.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(source, native)
+        recovery = self.state_root / ".cco-recovery-lineage.json"
+        os.replace(source.state_path, recovery)
+        unrelated = json.loads(recovery.read_text(encoding="utf-8"))
+        unrelated["plan_id"] = "sha256:" + "f" * 64
+        unrelated.pop("lineage_id", None)
+        unrelated["revision"] += 100
+        unrelated["dispatches"] = {}
+        for logical in unrelated["logical"].values():
+            logical["dispatch_id"] = None
+            logical["result"] = None
+            logical["state"] = "ready"
+        canonical = control_plane_module._lifecycle_state_path(
+            self.state_root,
+            self.repo,
+            source.session_id,
+        )
+        canonical.write_text(
+            json.dumps(unrelated, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        contender = self.control("recovery-lineage-contender")
+        contender.create_plan(self.repo, brief)
+        with self.assertRaisesRegex(ControlPlaneError, "conflicting lifecycle recovery"):
+            contender.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-terra"),
+            )
+        self.assertTrue(recovery.exists())
+
+    def test_recovery_capacity_is_reserved_before_quarantine_move(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
+        (self.state_root / ".cco-recovery-existing.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        legacy = self.state_root / "legacy-invalid.json"
+        legacy.write_text('{"broken":', encoding="utf-8")
+        control = self.control("recovery-capacity")
+        original_read = control_plane_module._read_bounded_bytes
+
+        def fail_staged_read(path: Path, label: str, **kwargs: object) -> bytes:
+            if path.name.startswith(".cco-recovery-") and path.suffix == ".json":
+                raise ControlPlaneUnavailable("simulated staged read failure")
+            return original_read(path, label, **kwargs)
+
+        with (
+            patch.object(control_plane_module, "MAX_RECOVERY_FILES", 1),
+            patch.object(
+                control_plane_module,
+                "_read_bounded_bytes",
+                side_effect=fail_staged_read,
+            ),
+            self.assertRaises(ControlPlaneUnavailable),
+        ):
+            control._quarantine_legacy_state(legacy)
+
+        self.assertTrue(legacy.exists())
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+
     def test_invalid_indexed_same_workspace_state_blocks_admission(self) -> None:
         control = self.control("indexed-corruption")
         control.create_plan(
@@ -1718,7 +1843,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(body["cursor"], 1)
         self.assertEqual(native_input["target"], owner)
 
-    def test_interrupt_is_read_only_until_native_active_status_confirms_success(self) -> None:
+    def test_interrupt_preserves_lease_until_native_active_status_confirms_success(self) -> None:
         first = self.control("interrupt-one")
         second = self.control("interrupt-two")
         brief = self.brief([self.node("n01", "A01", "a.txt")])
@@ -2101,6 +2226,49 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         settled = control.settle_native_failure(dispatch_id, "route_rejected")
         self.assertEqual(settled["action"], "fallback_route")
+
+    def test_active_v1_wave_can_finish_after_upgrade(self) -> None:
+        control = self.control("legacy-wave-settlement")
+        control.create_plan(self.repo, self.brief([self.node("n01", "A01", "a.txt")]))
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        current_wave_id = state["active_wave_id"]
+        current_wave_path = control._artifact_path("wave", current_wave_id)
+        wave = json.loads(current_wave_path.read_text(encoding="utf-8"))
+        wave["protocol"] = "cco.wave.v1"
+        identity = {
+            key: wave[key]
+            for key in ("baseline_id", "plan_id", "protocol", "sequence", "units")
+        }
+        legacy_wave_id = control_plane_module._digest(b"cco.wave.v1\0", identity)
+        wave["wave_id"] = legacy_wave_id
+        control._artifact_path("wave", legacy_wave_id).write_text(
+            json.dumps(wave, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        state["active_wave_id"] = legacy_wave_id
+        state.pop("lineage_id")
+        for dispatch in state["dispatches"].values():
+            dispatch["wave_id"] = legacy_wave_id
+            dispatch.pop("context_turns")
+            dispatch.pop("fallback_from_owner")
+            dispatch.pop("reused_from")
+        control.state_path.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        dispatch_id, owner = self.start_dispatch(control, native)
+        result = control.record_result(
+            owner,
+            result_text(dispatch_id, evidence={"A01": "legacy wave settled"}),
+        )
+
+        self.assertEqual(result["state"], "retired")
+        self.assertEqual(control.status()["state"], "complete")
 
     def test_wave_unit_mutation_is_rejected_before_spawn(self) -> None:
         control = self.control()

@@ -105,6 +105,45 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             ):
                 workspace_state_module.directory_digest(scanned)
 
+    def test_complete_git_control_inspection_uses_one_shared_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = self.make_repo(Path(temp_dir))
+            observed: list[object | None] = []
+
+            def admin_digest(
+                _root: Path,
+                *,
+                _budget: object | None = None,
+            ) -> str:
+                observed.append(_budget)
+                return "admin"
+
+            def entry_digest(
+                _path: Path,
+                *,
+                _budget: object | None = None,
+            ) -> str:
+                observed.append(_budget)
+                return "entry"
+
+            with (
+                mock.patch.object(
+                    workspace_state_module,
+                    "git_admin_digest",
+                    side_effect=admin_digest,
+                ),
+                mock.patch.object(
+                    workspace_state_module,
+                    "control_entry_digest",
+                    side_effect=entry_digest,
+                ),
+            ):
+                workspace_state_module.state_payload(repo)
+
+            self.assertEqual(len(observed), 3)
+            self.assertIsNotNone(observed[0])
+            self.assertTrue(all(item is observed[0] for item in observed))
+
     def test_head_oid_rejects_an_unexpected_git_failure(self) -> None:
         failed = subprocess.CompletedProcess(
             ["git", "rev-parse"],

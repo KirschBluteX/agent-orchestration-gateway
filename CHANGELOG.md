@@ -2,6 +2,18 @@
 
 The project follows semantic versioning.
 
+## 4.0.1 - 2026-08-09
+
+- Keep active recovery state visible to its owning Codex task and bind recovery
+  finalization to the same workspace, session, and plan lineage. An unrelated
+  higher-revision plan can no longer discard an active writer recovery lease.
+- Settle interrupts against the unique active dispatch for a reused native owner,
+  without treating its retired dispatch history as an ambiguous target.
+- Reserve recovery staging capacity before moving legacy state, and accept active
+  `cco.wave.v1` artifacts for settlement while writing all new waves as v2.
+- Apply one shared 100,000-entry budget across Git administrative state, hooks, info,
+  and every resolved reparse target.
+
 ## 4.0.0 - 2026-08-09
 
 - Return every prepared native operation as one exact `action` / `tool_name` /
@@ -21,8 +33,8 @@ The project follows semantic versioning.
 - Keep quarantine recovery objects visible at the state-root level and replay them with
   atomic no-replace links, so a crash or filesystem failure cannot hide an active lease
   in a maintenance subdirectory or expose a partial restored JSON file.
-- Share one 100,000-entry budget across the complete Git-control inspection, including
-  every resolved reparse target, instead of granting each nested digest a fresh budget.
+- Share one 100,000-entry budget across Git administrative inspection and every
+  resolved reparse target, instead of granting each nested digest a fresh budget.
 
 ## 3.0.1 - 2026-08-09
 

@@ -18,6 +18,10 @@ Add `--replace` only when intentionally replacing the two exact CCO profile file
 The installer stages both profiles before replacement and rolls back a partial write.
 It does not overwrite another filename or remove modified content.
 
+An update may leave an already active `cco.wave.v1` artifact. CCO accepts that artifact
+only until its existing work settles; every newly created wave uses v2. Updating does
+not require interrupting active v1 children first.
+
 Open `/hooks`, review and trust these five definitions:
 
 1. SessionStart
