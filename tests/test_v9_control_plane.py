@@ -1347,6 +1347,14 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         recovery_files = list(self.state_root.glob(".cco-recovery-*.json"))
         self.assertEqual(len(recovery_files), 1)
+        recovery_match = control_plane_module.SESSION_RECOVERY_FILE_RE.fullmatch(
+            recovery_files[0].name
+        )
+        self.assertIsNotNone(recovery_match)
+        self.assertEqual(
+            recovery_match.group("session"),
+            control_plane_module._session_digest(source.session_id),
+        )
         contender = self.control("quarantine-crash-safe-contender")
         contender.create_plan(self.repo, brief)
         with self.assertRaisesRegex(ControlPlaneError, "writer lease"):
@@ -1465,7 +1473,7 @@ class V9ControlPlaneTests(unittest.TestCase):
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
             )
-        self.assertTrue(recovery.exists())
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
 
     def test_recovery_capacity_is_reserved_before_quarantine_move(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -1577,11 +1585,14 @@ class V9ControlPlaneTests(unittest.TestCase):
             session,
         )
 
-        with self.assertRaisesRegex(ControlPlaneError, "multiple workspaces"):
+        with self.assertRaisesRegex(
+            ControlPlaneError,
+            "multiple workspaces|unindexed lifecycle recovery requires reconciliation",
+        ):
             active.owner_is_managed(owner)
 
         self.assertTrue(canonical_a.exists())
-        self.assertTrue(recovery.exists())
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
         self.assertFalse(canonical_b.exists())
 
         legacy_a = self.state_root / f"{session}.json"
@@ -1589,7 +1600,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         with self.assertRaisesRegex(ControlPlaneError, "multiple workspaces"):
             self.control(session).stop_reason()
         self.assertTrue(legacy_a.exists())
-        self.assertTrue(recovery.exists())
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
         self.assertFalse(canonical_b.exists())
 
     def test_repaired_foreign_legacy_state_is_not_replayed_under_current_lock(self) -> None:
@@ -1669,12 +1680,17 @@ class V9ControlPlaneTests(unittest.TestCase):
         original_read = hook_control._read_state
 
         def block_authoritative_read(
-            *, expected_workspace: object | None = None
+            *,
+            expected_workspace: object | None = None,
+            reconcile_recoveries: bool = True,
         ) -> dict[str, object]:
             read_entered.set()
             if not release_read.wait(timeout=5):
                 raise TimeoutError("test authoritative-read barrier timed out")
-            return original_read(expected_workspace=expected_workspace)
+            return original_read(
+                expected_workspace=expected_workspace,
+                reconcile_recoveries=reconcile_recoveries,
+            )
 
         def run_hook_decision() -> None:
             try:
@@ -1784,6 +1800,54 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(interrupted.status()["counts"]["fenced"], 1)
 
+    def test_interrupt_settlement_does_not_parse_unrelated_indexed_recoveries(self) -> None:
+        interrupted = self.control("interrupt-recovery-index")
+        interrupted.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = interrupted.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(interrupted, native)
+        interrupted.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "indexed-interrupt"}
+        )
+
+        for index in range(control_plane_module.MAX_RECOVERY_FILES):
+            other_digest = control_plane_module._session_digest(
+                f"unrelated-recovery-session-{index}"
+            )
+            recovery = self.state_root / (
+                f".cco-recovery-s{other_digest}-{index:064x}.json"
+            )
+            recovery.write_text("{}", encoding="utf-8")
+
+        original_load = control_plane_module._load_object
+
+        def reject_unrelated_recovery_load(path: Path, label: str) -> dict[str, object]:
+            if path.name.startswith(".cco-recovery-s"):
+                raise AssertionError("unrelated recovery was parsed during settlement")
+            return original_load(path, label)
+
+        with patch.object(
+            control_plane_module,
+            "_load_object",
+            side_effect=reject_unrelated_recovery_load,
+        ):
+            self.assertTrue(
+                interrupted.postflight_interrupt(
+                    {
+                        "tool_input": {"target": owner},
+                        "tool_response": {"previous_status": "running"},
+                        "tool_use_id": "indexed-interrupt",
+                    }
+                )
+            )
+
+        self.assertEqual(interrupted.status()["counts"]["fenced"], 1)
+
     def test_workspace_switch_is_rejected_before_foreign_recovery_replay(self) -> None:
         session = "workspace-switch-before-replay"
         local = self.control(session)
@@ -1822,7 +1886,8 @@ class V9ControlPlaneTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(
                 ControlPlaneError,
-                "lifecycle workspace changed during coordination",
+                "lifecycle workspace changed during coordination|"
+                "unindexed lifecycle recovery requires reconciliation",
             ),
         ):
             local.status()
@@ -1855,7 +1920,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         with patch.object(control_plane_module, "MAX_STATE_FILES", 1):
             self.assertEqual(recovered.status()["state"], "ready")
 
-        self.assertTrue(recovery.exists())
+        self.assertEqual(len(list(unmarked_root.glob(".cco-recovery-*.json"))), 1)
         self.assertFalse(canonical.exists())
         self.assertFalse((unmarked_root / ".cco-state-root-v1").exists())
 

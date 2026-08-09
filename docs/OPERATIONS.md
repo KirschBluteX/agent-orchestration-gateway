@@ -152,13 +152,18 @@ and shares one 100,000-entry budget across every Git control-directory and resol
 target. These are admission limits: CCO blocks instead of truncating evidence.
 Legacy quarantine first atomically moves the pathname to top-level recovery staging and
 validates the object actually moved. A concurrent replacement at the original path is never
-deleted. Valid recovery state remains lease-visible and is replayed to its canonical pathname
-under that recovery's own workspace lock. An existing canonical state is replaced or
+deleted. Valid recovery state receives a stable session- and content-addressed filename, remains
+lease-visible, and is replayed to its canonical pathname under that recovery's own workspace lock.
+Older random recovery names are validated and renamed outside the shared state-root lock; the
+final locked scan uses filenames only and fails closed if a new unindexed recovery appears. An
+existing canonical state is replaced or
 finalized only when exact content or a hash-proven direct parent transition establishes
 its lineage; invalid state moves to content-addressed quarantine only after the durable
-object is available. Recovery state from another workspace or plan can never replace the
+object is available. The ownership sentinel authorizes quarantine of arbitrary legacy
+JSON names; the reserved `.cco-recovery-*` namespace is already CCO-owned. Recovery state
+from another workspace or plan can never replace the
 current session's canonical state; the operation preserves both and fails closed. The
-ownership sentinel authorizes invalid-file quarantine only, not valid recovery replay.
+sentinel never controls valid recovery replay.
 The same state-root lock serializes capacity changes and recovery publication. An
 authoritative lifecycle operation holds it only for its final path rescan and state load,
 then releases it before plan/wave work, state calculation, persistence, or artifact cleanup.

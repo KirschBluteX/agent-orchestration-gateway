@@ -107,6 +107,9 @@ NATIVE_FAILURE_KINDS = frozenset(
 EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{64})\.json$")
 RECOVERY_FILE_RE = re.compile(r"^\.cco-recovery-[A-Za-z0-9_-]+\.json$")
+SESSION_RECOVERY_FILE_RE = re.compile(
+    r"^\.cco-recovery-s(?P<session>[0-9a-f]{64})-(?P<content>[0-9a-f]{64})\.json$"
+)
 STATE_ROOT_SENTINEL = ".cco-state-root-v1"
 STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
 # Capacity reservation and recovery publication share this existing root lock.
@@ -175,6 +178,13 @@ def _lifecycle_state_path(root: Path, workspace: object, session_id: str) -> Pat
     return root / f"{_workspace_digest(workspace)}--{_session_digest(session_id)}.json"
 
 
+def _lifecycle_recovery_path(root: Path, session_id: str, raw: bytes) -> Path:
+    return root / (
+        f".cco-recovery-s{_session_digest(session_id)}-"
+        f"{hashlib.sha256(raw).hexdigest()}.json"
+    )
+
+
 def _lifecycle_lineage_id(
     workspace: object,
     session_id: str,
@@ -206,6 +216,21 @@ def _bounded_lock_timeout(limit: float) -> float:
 
 def _state_content_id(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _path_identity(path: Path, label: str) -> tuple[int, int, int, int, int, int]:
+    try:
+        stat = path.stat()
+    except OSError as error:
+        raise ControlPlaneUnavailable(f"{label} is unavailable") from error
+    return (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_mode,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
 
 
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -345,14 +370,15 @@ def _state_capacity_used(paths: list[Path]) -> int:
     return sum(RECOVERY_FILE_RE.fullmatch(path.name) is None for path in paths)
 
 
-def _session_state_paths(root: Path, session_id: str) -> list[Path]:
-    """Find only one task's state even when the shared root is over capacity."""
+def _session_state_paths(root: Path, session_id: str) -> tuple[list[Path], list[Path]]:
+    """Find one task's state without reading another task's recovery payload."""
 
     suffix = f"--{_session_digest(session_id)}.json"
+    session_digest = _session_digest(session_id)
     legacy_name = f"{session_id}.json"
     matches: list[Path] = []
-    recovery_paths: list[Path] = []
     recovery_count = 0
+    unindexed_recoveries: list[Path] = []
     try:
         with os.scandir(root) as entries:
             for entry in entries:
@@ -366,26 +392,20 @@ def _session_state_paths(root: Path, session_id: str) -> list[Path]:
                             f"{MAX_RECOVERY_FILES} recovery file limit"
                         )
                     recovery_count += 1
-                    recovery_paths.append(Path(entry.path))
+                    recovery_match = SESSION_RECOVERY_FILE_RE.fullmatch(entry.name)
+                    if recovery_match is None:
+                        unindexed_recoveries.append(Path(entry.path))
+                    elif recovery_match.group("session") == session_digest:
+                        matches.append(Path(entry.path))
     except FileNotFoundError:
-        return []
+        return [], []
     except OSError as error:
         raise ControlPlaneUnavailable(
             "lifecycle state directory is unavailable"
         ) from error
-    for path in recovery_paths:
-        try:
-            candidate = _load_object(path, "cco.v9 recovery lifecycle state")
-        except FileNotFoundError:
-            continue
-        except ControlPlaneUnavailable:
-            raise
-        except ControlPlaneError:
-            continue
-        if candidate.get("session_id") == session_id:
-            matches.append(path)
     matches.sort(key=lambda item: item.name)
-    return matches
+    unindexed_recoveries.sort(key=lambda item: item.name)
+    return matches, unindexed_recoveries
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1287,10 +1307,75 @@ class ControlPlane:
             self._state_root_sentinel.unlink(missing_ok=True)
             raise
 
-    @property
-    def state_path(self) -> Path:
-        """Resolve this task's workspace-partitioned state without parsing other tasks."""
+    def _publish_session_recovery(
+        self,
+        path: Path,
+        state: Mapping[str, Any],
+        raw: bytes,
+    ) -> Path:
+        """Give a validated recovery a stable session-addressable name."""
 
+        target = _lifecycle_recovery_path(self.root, str(state["session_id"]), raw)
+        if path == target:
+            return path
+        identity = _path_identity(path, "lifecycle recovery")
+        target_identity: tuple[int, int, int, int, int, int] | None = None
+        if target.exists():
+            if _read_bounded_bytes(target, "indexed lifecycle recovery") != raw:
+                raise ControlPlaneError("lifecycle recovery identity collision")
+            target_identity = _path_identity(target, "indexed lifecycle recovery")
+        with acquire(
+            self.root,
+            STATE_ROOT_LOCK,
+            timeout=_bounded_lock_timeout(self.lock_timeout),
+        ):
+            if not path.exists():
+                if target.exists():
+                    return target
+                raise ControlPlaneUnavailable("lifecycle recovery disappeared during indexing")
+            if _path_identity(path, "lifecycle recovery") != identity:
+                raise ControlPlaneUnavailable("lifecycle recovery changed during indexing")
+            if target.exists():
+                if (
+                    target_identity is None
+                    or _path_identity(target, "indexed lifecycle recovery")
+                    != target_identity
+                ):
+                    raise ControlPlaneUnavailable(
+                        "indexed lifecycle recovery changed during deduplication"
+                    )
+                try:
+                    path.unlink()
+                except OSError as error:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle recovery indexing finalization failed"
+                    ) from error
+                return target
+            try:
+                os.replace(path, target)
+            except OSError as error:
+                raise ControlPlaneUnavailable(
+                    "lifecycle recovery indexing failed"
+                ) from error
+        return target
+
+    def _normalize_recovery_names(self, legacy_recoveries: list[Path]) -> None:
+        """Migrate old random recovery names without parsing under the root lock."""
+
+        for path in legacy_recoveries:
+            try:
+                raw = _read_bounded_bytes(path, "legacy lifecycle recovery")
+                state = self._validate_lifecycle_state(
+                    _decode_object(raw, "legacy lifecycle recovery")
+                )
+            except ControlPlaneUnavailable:
+                raise
+            except ControlPlaneError:
+                self._quarantine_legacy_state(path)
+                continue
+            self._publish_session_recovery(path, state, raw)
+
+    def _resolve_state_path(self, *, reconcile_recoveries: bool) -> Path:
         if self._state_path is not None and self._state_path.exists():
             return self._state_path
         self._state_path = None
@@ -1300,7 +1385,23 @@ class ControlPlane:
             STATE_ROOT_LOCK,
             timeout=_bounded_lock_timeout(self.lock_timeout),
         ):
-            matches = _session_state_paths(self.root, self.session_id)
+            matches, unindexed = _session_state_paths(self.root, self.session_id)
+        if unindexed:
+            if not reconcile_recoveries:
+                raise ControlPlaneUnavailable(
+                    "unindexed lifecycle recovery requires reconciliation"
+                )
+            self._normalize_recovery_names(unindexed)
+            with acquire(
+                self.root,
+                STATE_ROOT_LOCK,
+                timeout=_bounded_lock_timeout(self.lock_timeout),
+            ):
+                matches, unindexed = _session_state_paths(self.root, self.session_id)
+            if unindexed:
+                raise ControlPlaneUnavailable(
+                    "unindexed lifecycle recovery requires reconciliation"
+                )
         indexed = [path for path in matches if STATE_FILE_RE.fullmatch(path.name)]
         recovery = [path for path in matches if RECOVERY_FILE_RE.fullmatch(path.name)]
         if len(indexed) > 1:
@@ -1347,6 +1448,12 @@ class ControlPlane:
             else next((path for path in matches if path.name == legacy.name), legacy)
         )
         return self._state_path
+
+    @property
+    def state_path(self) -> Path:
+        """Resolve this task's state without parsing another task's recovery."""
+
+        return self._resolve_state_path(reconcile_recoveries=True)
 
     @staticmethod
     def _validate_lifecycle_state(
@@ -1548,7 +1655,10 @@ class ControlPlane:
                     # publication, then release the root-wide lock before any
                     # workspace-local computation or persistence.
                     self._state_path = None
-                    state = self._read_state(expected_workspace=workspace_key)
+                    state = self._read_state(
+                        expected_workspace=workspace_key,
+                        reconcile_recoveries=False,
+                    )
                 yield state
 
     @staticmethod
@@ -1665,7 +1775,12 @@ class ControlPlane:
     ) -> list[tuple[Path, dict[str, Any]]]:
         """Atomically isolate invalid legacy state inside a marked CCO root."""
 
-        if not self._state_root_is_marked():
+        # The sentinel protects arbitrary JSON in a shared custom directory.
+        # The reserved recovery namespace is itself proof that CCO created the file.
+        if (
+            not self._state_root_is_marked()
+            and RECOVERY_FILE_RE.fullmatch(path.name) is None
+        ):
             return []
         reservation: Path | None = None
         with acquire(
@@ -1720,6 +1835,7 @@ class ControlPlane:
             staged_state = None
 
         if staged_state is not None:
+            staging = self._publish_session_recovery(staging, staged_state, raw)
             recovered = [(staging, staged_state)]
             if path.exists():
                 try:
@@ -1995,8 +2111,15 @@ class ControlPlane:
             raise ControlPlaneError("artifact identity is invalid")
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
 
-    def _read_state(self, *, expected_workspace: object | None = None) -> dict[str, Any]:
-        source = self.state_path
+    def _read_state(
+        self,
+        *,
+        expected_workspace: object | None = None,
+        reconcile_recoveries: bool = True,
+    ) -> dict[str, Any]:
+        source = self._resolve_state_path(
+            reconcile_recoveries=reconcile_recoveries,
+        )
         raw_state = _load_object(source, "cco.v9 lifecycle state")
         state = self._validate_lifecycle_state(
             raw_state,

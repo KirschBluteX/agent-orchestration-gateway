@@ -2,6 +2,15 @@
 
 The project follows semantic versioning.
 
+## 4.0.6 - 2026-08-09
+
+- Give validated recovery files stable session- and content-addressed names, so a task
+  selects its own recovery without loading unrelated recovery payloads.
+- Reconcile older random recovery names outside the shared state-root lock and fail
+  closed if an older process publishes another one during the final authoritative scan.
+- Cover interrupt settlement at the 32-file recovery limit without parsing any unrelated
+  recovery state.
+
 ## 4.0.5 - 2026-08-09
 
 - Limit the shared state-root lock to the final lifecycle path rescan and state load,
