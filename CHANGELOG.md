@@ -2,6 +2,14 @@
 
 The project follows semantic versioning.
 
+## 4.0.5 - 2026-08-09
+
+- Limit the shared state-root lock to the final lifecycle path rescan and state load,
+  so unrelated workspaces cannot hold it across plan/wave work, state calculation,
+  persistence, or artifact cleanup.
+- Reject a lock-time workspace change before recovery replay, preventing an A-to-B
+  workspace lock inversion while preserving the recovery publication linearization point.
+
 ## 4.0.4 - 2026-08-09
 
 - Serialize recovery publication with the complete authoritative lifecycle decision,

@@ -1544,16 +1544,12 @@ class ControlPlane:
                     STATE_ROOT_LOCK,
                     timeout=remaining(),
                 ):
-                    # The root lock also serializes recovery publication. Keep it
-                    # through the authoritative decision so a repaired lifecycle
-                    # cannot appear between the locked rescan and state use.
+                    # Serialize the final path rescan and state load with recovery
+                    # publication, then release the root-wide lock before any
+                    # workspace-local computation or persistence.
                     self._state_path = None
-                    state = self._read_state()
-                    if _workspace_key(state["workspace_root"]) != workspace_key:
-                        raise ControlPlaneError(
-                            "lifecycle workspace changed during coordination"
-                        )
-                    yield state
+                    state = self._read_state(expected_workspace=workspace_key)
+                yield state
 
     @staticmethod
     def _reconcile_expired_claims(state: dict[str, Any], *, now: int | None = None) -> bool:
@@ -1999,13 +1995,17 @@ class ControlPlane:
             raise ControlPlaneError("artifact identity is invalid")
         return self.root / "artifacts" / f"{self.session_id}-{kind}-{identity[7:]}.json"
 
-    def _read_state(self) -> dict[str, Any]:
+    def _read_state(self, *, expected_workspace: object | None = None) -> dict[str, Any]:
         source = self.state_path
         raw_state = _load_object(source, "cco.v9 lifecycle state")
         state = self._validate_lifecycle_state(
             raw_state,
             expected_session=self.session_id,
         )
+        if expected_workspace is not None and _workspace_key(
+            state["workspace_root"]
+        ) != _workspace_key(expected_workspace):
+            raise ControlPlaneError("lifecycle workspace changed during coordination")
         state = self._restore_legacy_context_from_wave(state)
         canonical = _lifecycle_state_path(
             self.root,

@@ -58,10 +58,11 @@ made fail-closed by a plugin and remains part of the trusted-host boundary.
 PostToolUse uses one 3.5-second internal deadline within the host's five-second timeout;
 interrupt ownership and settlement share one workspace-coordinated transaction instead
 of consuming separate lock budgets.
-Authoritative lifecycle decisions hold the workspace, session, and existing state-root
-publication lock as one bounded transaction. Recovery staging therefore cannot appear
-between the locked state reload and the Hook decision. Workspace verification remains
-outside this transaction.
+Authoritative lifecycle decisions hold the workspace and session locks. The shared
+state-root lock covers only the final path rescan and state load, so recovery staging
+cannot appear inside that linearization point while unrelated workspaces remain parallel.
+A changed workspace identity is rejected before recovery replay. Workspace verification
+also remains outside the lifecycle locks.
 Lifecycle roots are limited to 4,096 JSON files; Git output is limited to 64 MiB and
 200,000 records; each Git control-directory digest is limited to 100,000 entries. Limit
 violations block admission and never authorize truncated evidence.

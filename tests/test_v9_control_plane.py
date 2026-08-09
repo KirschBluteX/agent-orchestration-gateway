@@ -1668,11 +1668,13 @@ class V9ControlPlaneTests(unittest.TestCase):
         managed: list[bool] = []
         original_read = hook_control._read_state
 
-        def block_authoritative_read() -> dict[str, object]:
+        def block_authoritative_read(
+            *, expected_workspace: object | None = None
+        ) -> dict[str, object]:
             read_entered.set()
             if not release_read.wait(timeout=5):
                 raise TimeoutError("test authoritative-read barrier timed out")
-            return original_read()
+            return original_read(expected_workspace=expected_workspace)
 
         def run_hook_decision() -> None:
             try:
@@ -1711,6 +1713,119 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertIn("conflicting lifecycle state", str(errors[0]))
         self.assertEqual(managed, [])
         self.assertTrue(published.is_set())
+
+    def test_unrelated_workspace_state_work_does_not_block_interrupt_settlement(self) -> None:
+        other_repo = self.root / "interrupt-unrelated-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+
+        interrupted = ControlPlane(
+            "interrupt-independent-workspace",
+            root=self.state_root,
+            lock_timeout=0.2,
+        )
+        interrupted.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = interrupted.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(interrupted, native)
+        interrupted.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "independent-interrupt"}
+        )
+
+        unrelated = ControlPlane(
+            "unrelated-workspace-state-work",
+            root=self.state_root,
+            lock_timeout=0.2,
+        )
+        unrelated.create_plan(
+            other_repo,
+            self.brief(
+                [self.node("reader", "A02", "other.txt", role="explorer")]
+            ),
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def hold_unrelated_state_work() -> None:
+            try:
+                with unrelated._coordinated_state():
+                    entered.set()
+                    if not release.wait(timeout=5):
+                        raise TimeoutError("test unrelated-state barrier timed out")
+            except BaseException as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        thread = threading.Thread(target=hold_unrelated_state_work)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=5))
+        try:
+            self.assertTrue(
+                interrupted.postflight_interrupt(
+                    {
+                        "tool_input": {"target": owner},
+                        "tool_response": {"previous_status": "running"},
+                        "tool_use_id": "independent-interrupt",
+                    }
+                )
+            )
+        finally:
+            release.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(interrupted.status()["counts"]["fenced"], 1)
+
+    def test_workspace_switch_is_rejected_before_foreign_recovery_replay(self) -> None:
+        session = "workspace-switch-before-replay"
+        local = self.control(session)
+        local.create_plan(
+            self.repo,
+            self.brief([self.node("local", "A01", "a.txt", role="explorer")]),
+        )
+        canonical = local.state_path
+
+        other_repo = self.root / "workspace-switch-other-repo"
+        other_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
+        (other_repo / "other.txt").write_text("other\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=other_repo, check=True)
+        foreign = ControlPlane(session, root=self.root / "workspace-switch-foreign-root")
+        foreign.create_plan(
+            other_repo,
+            self.brief([self.node("foreign", "A02", "other.txt", role="explorer")]),
+        )
+        foreign_state = foreign.state_path.read_bytes()
+        recovery = self.state_root / ".cco-recovery-workspace-switch.json"
+        original_hint = local._workspace_hint
+
+        def switch_after_hint() -> str:
+            workspace = original_hint()
+            canonical.unlink()
+            recovery.write_bytes(foreign_state)
+            return workspace
+
+        with (
+            patch.object(local, "_workspace_hint", side_effect=switch_after_hint),
+            patch.object(
+                local,
+                "_replay_recovery_state",
+                side_effect=AssertionError("foreign workspace replay attempted"),
+            ),
+            self.assertRaisesRegex(
+                ControlPlaneError,
+                "lifecycle workspace changed during coordination",
+            ),
+        ):
+            local.status()
 
     def test_unmarked_full_root_keeps_valid_recovery_in_its_existing_slot(self) -> None:
         other_repo = self.root / "unmarked-recovery-repo"
