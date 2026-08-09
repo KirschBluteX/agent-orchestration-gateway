@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -53,8 +54,8 @@ from workspace_guard import (
 
 PROTOCOL = "cco.v9"
 PLAN_PROTOCOL = "cco.plan.v1"
-WAVE_PROTOCOL = "cco.wave.v1"
-BATCH_PROTOCOL = "cco.wave-batch.v1"
+WAVE_PROTOCOL = "cco.wave.v2"
+BATCH_PROTOCOL = "cco.wave-batch.v2"
 LIFECYCLE_PROTOCOL = "cco.lifecycle.v1"
 TASK_HEADER = "CCO_TASK cco.v9"
 CONTINUE_HEADER = "CCO_CONTINUE cco.v9"
@@ -92,14 +93,25 @@ NATIVE_CLAIM_TTL_MILLISECONDS = 120_000
 PREFLIGHT_VERIFICATION_SECONDS = 14.0
 PREFLIGHT_ROLLBACK_RESERVE_SECONDS = 4.0
 NATIVE_FAILURE_KINDS = frozenset(
-    {"network", "other", "rate_limit", "route_rejected", "service", "timeout"}
+    {
+        "network",
+        "other",
+        "owner_unavailable",
+        "rate_limit",
+        "route_rejected",
+        "service",
+        "timeout",
+    }
 )
 EFFORT_LABELS = frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
 STATE_FILE_RE = re.compile(r"^(?P<workspace>[0-9a-f]{64})--(?P<session>[0-9a-f]{64})\.json$")
+RECOVERY_FILE_RE = re.compile(r"^\.cco-recovery-[A-Za-z0-9_-]+\.json$")
 STATE_ROOT_SENTINEL = ".cco-state-root-v1"
 STATE_ROOT_SENTINEL_BYTES = b"cco.state-root.v1\n"
+STATE_ROOT_CAPACITY_LOCK = "state-root-capacity"
 MAX_STATE_FILE_BYTES = 32 * 1024 * 1024
 MAX_STATE_FILES = 4_096
+MAX_RECOVERY_FILES = 32
 STATE_READ_CHUNK_BYTES = 1024 * 1024
 
 
@@ -268,17 +280,28 @@ def _state_json_paths(root: Path) -> list[Path]:
     """Return a deterministic, memory-bounded snapshot of lifecycle files."""
 
     paths: list[Path] = []
+    ordinary_count = 0
+    recovery_count = 0
     try:
         with os.scandir(root) as entries:
             for entry in entries:
                 checkpoint()
                 if not entry.name.endswith(".json"):
                     continue
-                if len(paths) >= MAX_STATE_FILES:
+                if RECOVERY_FILE_RE.fullmatch(entry.name) is not None:
+                    if recovery_count >= MAX_RECOVERY_FILES:
+                        raise ControlPlaneUnavailable(
+                            "lifecycle state directory exceeds the "
+                            f"{MAX_RECOVERY_FILES} recovery file limit"
+                        )
+                    recovery_count += 1
+                elif ordinary_count >= MAX_STATE_FILES:
                     raise ControlPlaneUnavailable(
                         "lifecycle state directory exceeds the "
                         f"{MAX_STATE_FILES} file limit"
                     )
+                else:
+                    ordinary_count += 1
                 paths.append(Path(entry.path))
     except FileNotFoundError:
         return []
@@ -289,6 +312,32 @@ def _state_json_paths(root: Path) -> list[Path]:
     checkpoint()
     paths.sort(key=lambda item: item.name)
     return paths
+
+
+def _state_capacity_used(paths: list[Path]) -> int:
+    return sum(RECOVERY_FILE_RE.fullmatch(path.name) is None for path in paths)
+
+
+def _session_state_paths(root: Path, session_id: str) -> list[Path]:
+    """Find only one task's state even when the shared root is over capacity."""
+
+    suffix = f"--{_session_digest(session_id)}.json"
+    legacy_name = f"{session_id}.json"
+    matches: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                checkpoint()
+                if entry.name == legacy_name or entry.name.endswith(suffix):
+                    matches.append(Path(entry.path))
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise ControlPlaneUnavailable(
+            "lifecycle state directory is unavailable"
+        ) from error
+    matches.sort(key=lambda item: item.name)
+    return matches
 
 
 def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -650,6 +699,25 @@ def _descendant_counts(plan: Mapping[str, Any]) -> dict[str, int]:
 
 def _scopes_overlap(left: list[dict[str, str]], right: list[dict[str, str]]) -> bool:
     return any(repository_scopes_overlap(a, b) for a in left for b in right)
+
+
+def _scopes_within(
+    child_scopes: list[dict[str, str]],
+    parent_scopes: list[dict[str, str]],
+) -> bool:
+    """Return whether every child scope is contained by a parent scope."""
+
+    def contains(parent: Mapping[str, str], child: Mapping[str, str]) -> bool:
+        parent_path = ntpath.normcase(parent["path"]).replace("\\", "/")
+        child_path = ntpath.normcase(child["path"]).replace("\\", "/")
+        if parent["kind"] == "exact":
+            return child["kind"] == "exact" and child_path == parent_path
+        return child_path == parent_path or child_path.startswith(parent_path + "/")
+
+    return all(
+        any(contains(parent, child) for parent in parent_scopes)
+        for child in child_scopes
+    )
 
 
 def _units_conflict(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
@@ -1188,16 +1256,15 @@ class ControlPlane:
 
         if self._state_path is not None:
             return self._state_path
-        suffix = f"--{_session_digest(self.session_id)}.json"
-        snapshot = _state_json_paths(self.root)
         legacy = self.root / f"{self.session_id}.json"
-        matches = [path for path in snapshot if path.name.endswith(suffix)]
-        if len(matches) > 1:
+        matches = _session_state_paths(self.root, self.session_id)
+        indexed = [path for path in matches if STATE_FILE_RE.fullmatch(path.name)]
+        if len(indexed) > 1:
             raise ControlPlaneError("current task has multiple lifecycle state files")
         self._state_path = (
-            matches[0]
-            if matches
-            else next((path for path in snapshot if path.name == legacy.name), legacy)
+            indexed[0]
+            if indexed
+            else next((path for path in matches if path.name == legacy.name), legacy)
         )
         return self._state_path
 
@@ -1382,7 +1449,7 @@ class ControlPlane:
                 )
             self._write_state(state)
 
-    def _discard_stale_spawn_wave(self, dispatch_id: str, tool_use_id: str) -> bool:
+    def _discard_stale_unstarted_wave(self, dispatch_id: str, tool_use_id: str) -> bool:
         """Discard a baseline that never reached a native child and can be recaptured."""
 
         with self._coordinated():
@@ -1390,7 +1457,7 @@ class ControlPlane:
             dispatch = self._find_dispatch(state, dispatch_id)
             if (
                 dispatch.get("state") != "starting"
-                or dispatch.get("tool_kind") != "spawn"
+                or dispatch.get("tool_kind") not in {"spawn", "reuse"}
                 or dispatch.get("tool_use_id") != tool_use_id
             ):
                 return False
@@ -1401,15 +1468,19 @@ class ControlPlane:
                 if item.get("wave_id") == wave_id
             ]
             rebuildable = bool(wave_records) and all(
-                item.get("owner") is None
-                and (
-                    item.get("state") == "rejected"
-                    or (
-                        item.get("state") == "starting"
-                        and (
-                            item.get("tool_use_id") is None
-                            or item.get("dispatch_id") == dispatch_id
-                        )
+                (item.get("state") == "rejected" and item.get("owner") is None)
+                or (
+                    item.get("state") == "starting"
+                    and item.get("tool_kind") in {"spawn", "reuse"}
+                    and (
+                        item.get("tool_use_id") is None
+                        or item.get("dispatch_id") == dispatch_id
+                    )
+                    and (
+                        item.get("owner") is None
+                        if item.get("tool_kind") == "spawn"
+                        else isinstance(item.get("owner"), str)
+                        and isinstance(item.get("reused_from"), str)
                     )
                 )
                 for item in wave_records
@@ -1440,30 +1511,35 @@ class ControlPlane:
 
         if not self._state_root_is_marked():
             return []
-        quarantine = self.root / "quarantine"
+        reservation: Path | None = None
         try:
-            quarantine.mkdir(parents=True, exist_ok=True)
-            descriptor, staging_name = tempfile.mkstemp(
-                dir=quarantine,
-                prefix=".legacy-staging-",
-                suffix=".json",
+            descriptor, reservation_name = tempfile.mkstemp(
+                dir=self.root,
+                prefix=".cco-recovery-",
+                suffix=".reserve",
             )
             os.close(descriptor)
+            reservation = Path(reservation_name)
         except OSError as error:
             raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
-        staging = Path(staging_name)
+        staging = reservation.with_suffix(".json")
         try:
             os.replace(path, staging)
         except FileNotFoundError:
-            staging.unlink(missing_ok=True)
             return []
         except OSError as error:
-            staging.unlink(missing_ok=True)
             raise ControlPlaneUnavailable("legacy lifecycle state is unavailable") from error
+        finally:
+            if reservation is not None:
+                try:
+                    reservation.unlink(missing_ok=True)
+                except OSError as error:
+                    raise ControlPlaneUnavailable(
+                        "legacy recovery reservation cleanup failed"
+                    ) from error
 
-        # The pathname is no longer consulted after this atomic move.  A repair that
-        # creates a replacement at the original path therefore cannot be unlinked by
-        # quarantine finalization.
+        # Recovery staging stays in the state root and ends in .json.  A crash or I/O
+        # failure therefore remains visible to the next workspace lease scan.
         raw = _read_bounded_bytes(staging, "staged legacy lifecycle state")
         try:
             staged_state = self._validate_lifecycle_state(
@@ -1472,58 +1548,43 @@ class ControlPlane:
         except ControlPlaneError:
             staged_state = None
 
+        if staged_state is not None:
+            _replayed_path, replayed = self._replay_recovery_state(
+                staging,
+                staged_state,
+            )
+            recovered = [replayed]
+            if path.exists():
+                try:
+                    replacement = self._validate_lifecycle_state(
+                        _load_object(path, "replacement legacy cco.v9 lifecycle state")
+                    )
+                except ControlPlaneUnavailable:
+                    raise
+                except ControlPlaneError:
+                    pass
+                else:
+                    if replacement not in recovered:
+                        recovered.append(replacement)
+            return recovered
+
         name_identity = hashlib.sha256(path.name.encode("utf-8")).hexdigest()[:16]
         content_identity = hashlib.sha256(raw).hexdigest()
-        prefix = "recovered-valid" if staged_state is not None else "legacy"
-        destination = quarantine / f"{prefix}-{name_identity}-{content_identity}.json"
-
-        if staged_state is not None:
-            try:
-                descriptor = os.open(
-                    path,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                )
-            except FileExistsError:
-                pass
-            except OSError as error:
-                raise ControlPlaneUnavailable(
-                    "valid legacy lifecycle state could not be restored"
-                ) from error
-            else:
-                try:
-                    with os.fdopen(descriptor, "wb") as handle:
-                        handle.write(raw)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                except OSError as error:
-                    raise ControlPlaneUnavailable(
-                        "valid legacy lifecycle state could not be restored"
-                    ) from error
-                staging.unlink(missing_ok=True)
-                return [staged_state]
-
+        quarantine = self.root / "quarantine"
         try:
-            descriptor = os.open(
-                destination,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
-            )
+            quarantine.mkdir(parents=True, exist_ok=True)
+            destination = quarantine / f"legacy-{name_identity}-{content_identity}.json"
+            os.link(staging, destination)
         except FileExistsError:
             if _read_bounded_bytes(destination, "quarantined lifecycle state") != raw:
                 raise ControlPlaneError("legacy quarantine identity collision")
         except OSError as error:
             raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
-        else:
-            try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(raw)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-            except OSError as error:
-                raise ControlPlaneUnavailable("legacy quarantine is unavailable") from error
-        staging.unlink(missing_ok=True)
-        recovered = [staged_state] if staged_state is not None else []
+        try:
+            staging.unlink(missing_ok=True)
+        except OSError as error:
+            raise ControlPlaneUnavailable("legacy quarantine finalization failed") from error
+        recovered: list[dict[str, Any]] = []
         if path.exists():
             try:
                 replacement = self._validate_lifecycle_state(
@@ -1537,6 +1598,59 @@ class ControlPlane:
                 if replacement not in recovered:
                     recovered.append(replacement)
         return recovered
+
+    def _replay_recovery_state(
+        self,
+        path: Path,
+        state: dict[str, Any],
+    ) -> tuple[Path, dict[str, Any]]:
+        """Publish one visible recovery state without an overwrite window."""
+
+        canonical = _lifecycle_state_path(
+            self.root,
+            state["workspace_root"],
+            state["session_id"],
+        )
+        with acquire(
+            self.root,
+            STATE_ROOT_CAPACITY_LOCK,
+            timeout=self.lock_timeout,
+        ):
+            if canonical.exists():
+                current = self._validate_lifecycle_state(
+                    _load_object(canonical, "recovered cco.v9 lifecycle state"),
+                    expected_session=state["session_id"],
+                )
+                if current == state or current["revision"] > state["revision"]:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as error:
+                        raise ControlPlaneUnavailable(
+                            "lifecycle recovery finalization failed"
+                        ) from error
+                    return canonical, current
+                return path, state
+            if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
+                return path, state
+            try:
+                os.link(path, canonical)
+            except FileExistsError:
+                return path, state
+            except OSError as error:
+                raise ControlPlaneUnavailable(
+                    "valid legacy lifecycle state could not be restored"
+                ) from error
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                try:
+                    canonical.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise ControlPlaneUnavailable(
+                    "lifecycle recovery finalization failed"
+                ) from error
+            return canonical, state
 
     def _workspace_state_candidates(
         self,
@@ -1583,6 +1697,11 @@ class ControlPlane:
                     if _workspace_digest(state["workspace_root"]) == workspace_digest:
                         candidates.append((path, state))
                 continue
+            if (
+                RECOVERY_FILE_RE.fullmatch(path.name) is not None
+                and self._state_root_is_marked()
+            ):
+                path, state = self._replay_recovery_state(path, state)
             if state_workspace_digest == workspace_digest:
                 candidates.append((path, state))
         return candidates
@@ -1676,12 +1795,14 @@ class ControlPlane:
         if source != canonical:
             if canonical.exists():
                 raise ControlPlaneError("current task has conflicting lifecycle state files")
+            try:
+                os.replace(source, canonical)
+            except FileNotFoundError as error:
+                raise ControlPlaneUnavailable("lifecycle state migration was interrupted") from error
+            except OSError as error:
+                raise ControlPlaneUnavailable("lifecycle state migration failed") from error
             self._state_path = canonical
             self._write_state(state)
-            try:
-                source.unlink()
-            except FileNotFoundError:
-                pass
         elif state != raw_state:
             self._write_state(state)
         return state
@@ -1742,7 +1863,7 @@ class ControlPlane:
             wave.get("plan_id") != state.get("plan_id")
             or not isinstance(wave.get("baseline"), Mapping)
             or wave["baseline"].get("state_id") != wave.get("baseline_id")
-            or _digest(b"cco.wave.v1\0", identity) != wave_id
+            or _digest(b"cco.wave.v2\0", identity) != wave_id
         ):
             raise ControlPlaneError("wave artifact digest is invalid")
         units = wave.get("units")
@@ -1808,33 +1929,48 @@ class ControlPlane:
                 raise ControlPlaneError(
                     "the current task already has CCO lifecycle proof; run explicit cleanup first"
                 )
-            _write_immutable(plan_path, plan)
-            logical = {
-                item["id"]: {
-                    "assurance": item["assurance"],
-                    "dispatch_id": None,
-                    "generation": 1,
-                    "result": None,
-                    "state": "waiting",
+            with acquire(
+                self.root,
+                STATE_ROOT_CAPACITY_LOCK,
+                timeout=self.lock_timeout,
+            ):
+                if _state_capacity_used(_state_json_paths(self.root)) >= MAX_STATE_FILES:
+                    raise ControlPlaneUnavailable(
+                        "lifecycle state directory exceeds the "
+                        f"{MAX_STATE_FILES} file limit"
+                    )
+                _write_immutable(plan_path, plan)
+                logical = {
+                    item["id"]: {
+                        "assurance": item["assurance"],
+                        "dispatch_id": None,
+                        "generation": 1,
+                        "result": None,
+                        "state": "waiting",
+                    }
+                    for item in plan["nodes"]
                 }
-                for item in plan["nodes"]
-            }
-            state = {
-                "active_wave_id": None,
-                "dispatches": {},
-                "epoch": 1,
-                "logical": logical,
-                "plan_id": plan_id,
-                "plan_path": str(plan_path),
-                "protocol": LIFECYCLE_PROTOCOL,
-                "revision": 0,
-                "session_id": self.session_id,
-                "tombstones": [],
-                "wave_sequence": 0,
-                "workspace_root": str(workspace),
-            }
-            self._refresh_ready(state, plan)
-            self._write_state(state)
+                state = {
+                    "active_wave_id": None,
+                    "dispatches": {},
+                    "epoch": 1,
+                    "logical": logical,
+                    "plan_id": plan_id,
+                    "plan_path": str(plan_path),
+                    "protocol": LIFECYCLE_PROTOCOL,
+                    "revision": 0,
+                    "session_id": self.session_id,
+                    "tombstones": [],
+                    "wave_sequence": 0,
+                    "workspace_root": str(workspace),
+                }
+                self._refresh_ready(state, plan)
+                try:
+                    self._write_state(state)
+                except Exception:
+                    if not self.state_path.exists():
+                        plan_path.unlink(missing_ok=True)
+                    raise
         return {
             "plan_id": plan_id,
             "protocol": PLAN_PROTOCOL,
@@ -1941,6 +2077,106 @@ class ControlPlane:
             if state["logical"][item]["result"] is not None
         }
 
+    @staticmethod
+    def _selected_dispatch_route(dispatch: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        candidates = dispatch.get("route_candidates")
+        cursor = dispatch.get("route_cursor")
+        if (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or not isinstance(candidates, list)
+            or not 0 <= cursor < len(candidates)
+            or not isinstance(candidates[cursor], Mapping)
+        ):
+            return None
+        return candidates[cursor]
+
+    @classmethod
+    def _source_matches_reuse(
+        cls,
+        source: Mapping[str, Any],
+        *,
+        dependency_dispatches: set[str],
+        role: str,
+        assurance: str,
+        route: Mapping[str, Any],
+        scopes: list[dict[str, str]],
+    ) -> bool:
+        result = source.get("result")
+        selected = cls._selected_dispatch_route(source)
+        owner = source.get("owner")
+        return (
+            source.get("dispatch_id") in dependency_dispatches
+            and source.get("state") == "retired"
+            and source.get("role") == role
+            and role in {"explorer", "worker"}
+            and source.get("assurance") == assurance
+            and isinstance(source.get("members"), list)
+            and len(source["members"]) == 1
+            and isinstance(owner, str)
+            and TASK_PATH_RE.fullmatch(owner) is not None
+            and source.get("transient_retries") == 0
+            and isinstance(result, Mapping)
+            and result.get("status") == "complete"
+            and result.get("outcome") == "retire"
+            and result.get("blockers") == []
+            and result.get("deviations") == []
+            and result.get("failure_signature") is None
+            and isinstance(selected, Mapping)
+            and selected.get("model") == route.get("model")
+            and selected.get("effort") == route.get("effort")
+            and isinstance(source.get("scopes"), list)
+            and _scopes_within(scopes, source["scopes"])
+        )
+
+    @classmethod
+    def _reuse_candidate(
+        cls,
+        state: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        unit: Mapping[str, Any],
+        *,
+        route_cursor: int,
+        reserved_owners: set[str],
+    ) -> Mapping[str, Any] | None:
+        if (
+            unit.get("role") == "reviewer"
+            or unit.get("context_turns") != 0
+            or not isinstance(unit.get("members"), list)
+            or len(unit["members"]) != 1
+        ):
+            return None
+        member = unit["members"][0]
+        node = _node_map(plan)[member]
+        dependency_dispatches = {
+            state["logical"][dependency].get("dispatch_id")
+            for dependency in node["depends_on"]
+            if isinstance(state["logical"][dependency].get("dispatch_id"), str)
+        }
+        route = unit["route"]["candidates"][route_cursor]
+        candidates: list[Mapping[str, Any]] = []
+        for dispatch_id in sorted(dependency_dispatches):
+            source = state["dispatches"].get(dispatch_id)
+            if not isinstance(source, Mapping) or not cls._source_matches_reuse(
+                source,
+                dependency_dispatches=dependency_dispatches,
+                role=unit["role"],
+                assurance=unit["assurance"],
+                route=route,
+                scopes=unit["scopes"],
+            ):
+                continue
+            owner = source["owner"]
+            if owner in reserved_owners or any(
+                other.get("dispatch_id") != source.get("dispatch_id")
+                and other.get("owner") == owner
+                and other.get("state") in {"starting", "running", "paused"}
+                for other in state["dispatches"].values()
+            ):
+                continue
+            candidates.append(source)
+        return candidates[0] if len(candidates) == 1 else None
+
     def _dispatch_record(
         self,
         state: Mapping[str, Any],
@@ -1949,18 +2185,21 @@ class ControlPlane:
         unit: Mapping[str, Any],
         *,
         route_cursor: int,
+        reused_from: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         route = unit["route"]["candidates"][route_cursor]
         generation = max(state["logical"][item]["generation"] for item in unit["members"])
+        source_id = reused_from.get("dispatch_id") if reused_from is not None else None
         identity = {
             "cursor": 0,
             "generation": generation,
             "members": unit["members"],
+            "reused_from": source_id,
             "route": route,
             "route_cursor": route_cursor,
             "wave_id": wave_id,
         }
-        dispatch_id = _digest(b"cco.dispatch.v1\0", identity)
+        dispatch_id = _digest(b"cco.dispatch.v2\0", identity)
         task_name = _task_name(unit, route, generation, dispatch_id)
         message = _render_task(
             plan,
@@ -1969,34 +2208,46 @@ class ControlPlane:
             cursor=0,
             dependency_evidence=self._dependency_evidence(state, plan, unit["members"]),
         )
-        native = {
-            "agent_type": WRITE_ROLE if unit["role"] == "worker" else READ_ROLE,
-            "fork_turns": "none" if unit["context_turns"] == 0 else str(unit["context_turns"]),
-            "message": message,
-            "model": route["model"],
-            "reasoning_effort": route["effort"],
-            "task_name": task_name,
-        }
+        if reused_from is None:
+            native = {
+                "agent_type": WRITE_ROLE if unit["role"] == "worker" else READ_ROLE,
+                "fork_turns": "none"
+                if unit["context_turns"] == 0
+                else str(unit["context_turns"]),
+                "message": message,
+                "model": route["model"],
+                "reasoning_effort": route["effort"],
+                "task_name": task_name,
+            }
+            owner = None
+            tool_kind = "spawn"
+        else:
+            native = {"message": message, "target": reused_from["owner"]}
+            owner = reused_from["owner"]
+            tool_kind = "reuse"
         return {
             "assurance": unit["assurance"],
             "claim_expires_at": (
                 _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
             ),
             "cursor": 0,
+            "context_turns": unit["context_turns"],
             "dispatch_id": dispatch_id,
+            "fallback_from_owner": None,
             "generation": generation,
             "members": list(unit["members"]),
             "native": native,
-            "owner": None,
+            "owner": owner,
             "pending_cursor": None,
             "transient_retries": 0,
             "role": unit["role"],
             "route_candidates": deepcopy(unit["route"]["candidates"]),
             "route_cursor": route_cursor,
+            "reused_from": source_id,
             "scopes": deepcopy(unit["scopes"]),
             "state": "starting",
             "task_name": task_name,
-            "tool_kind": "spawn",
+            "tool_kind": tool_kind,
             "tool_use_id": None,
             "unit_id": unit["id"],
             "wave_id": wave_id,
@@ -2038,8 +2289,20 @@ class ControlPlane:
 
     @staticmethod
     def _public_batch(state: Mapping[str, Any], dispatches: list[Mapping[str, Any]]) -> dict[str, Any]:
+        actions = []
+        for dispatch in dispatches:
+            if dispatch.get("tool_kind") == "spawn":
+                actions.append(
+                    _tool_action("spawn_new_owner", "spawn_agent", dispatch["native"])
+                )
+            elif dispatch.get("tool_kind") == "reuse":
+                actions.append(
+                    _tool_action("reuse_owner", "followup_task", dispatch["native"])
+                )
+            else:
+                raise ControlPlaneError("wave contains an unsupported native action")
         return {
-            "dispatches": [deepcopy(item["native"]) for item in dispatches],
+            "dispatches": actions,
             "plan_id": state["plan_id"],
             "protocol": BATCH_PROTOCOL,
             "state": "dispatch" if dispatches else "waiting",
@@ -2164,6 +2427,20 @@ class ControlPlane:
                     ],
                     "state": "blocked",
                 }
+            reuse_sources: dict[str, str | None] = {}
+            reserved_owners: set[str] = set()
+            for unit in selected:
+                source = self._reuse_candidate(
+                    state,
+                    plan,
+                    unit,
+                    route_cursor=route_cursors[unit["id"]],
+                    reserved_owners=reserved_owners,
+                )
+                source_id = source.get("dispatch_id") if source is not None else None
+                reuse_sources[unit["id"]] = source_id
+                if source is not None:
+                    reserved_owners.add(source["owner"])
             wave_scopes = {
                 (scope["kind"], scope["path"]): dict(scope)
                 for unit in selected
@@ -2181,6 +2458,7 @@ class ControlPlane:
                         ),
                         "id": unit["id"],
                         "members": list(unit["members"]),
+                        "reused_from": reuse_sources[unit["id"]],
                         "role": unit["role"],
                         "route_candidates": deepcopy(unit["route"]["candidates"]),
                         "scopes": deepcopy(unit["scopes"]),
@@ -2237,7 +2515,7 @@ class ControlPlane:
                 "sequence": state["wave_sequence"],
                 "units": artifact_units,
             }
-            wave_id = _digest(b"cco.wave.v1\0", wave_identity)
+            wave_id = _digest(b"cco.wave.v2\0", wave_identity)
             wave = {**wave_identity, "baseline": baseline, "wave_id": wave_id}
             _write_immutable(self._artifact_path("wave", wave_id), wave)
             created: list[dict[str, Any]] = []
@@ -2248,6 +2526,11 @@ class ControlPlane:
                     wave_id,
                     unit,
                     route_cursor=route_cursors[unit["id"]],
+                    reused_from=(
+                        state["dispatches"][reuse_sources[unit["id"]]]
+                        if reuse_sources[unit["id"]] is not None
+                        else None
+                    ),
                 )
                 state["dispatches"][dispatch["dispatch_id"]] = dispatch
                 for member in unit["members"]:
@@ -2279,8 +2562,10 @@ class ControlPlane:
         unit = matches[0]
         for field, dispatch_field in (
             ("assurance", "assurance"),
+            ("context_turns", "context_turns"),
             ("generation", "generation"),
             ("members", "members"),
+            ("reused_from", "reused_from"),
             ("role", "role"),
             ("route_candidates", "route_candidates"),
             ("scopes", "scopes"),
@@ -2304,6 +2589,13 @@ class ControlPlane:
             or native.get("reasoning_effort") != selected.get("effort")
         ):
             raise ControlPlaneError("dispatch native route does not match its wave")
+        if dispatch.get("tool_kind") == "reuse" and (
+            not isinstance(native, Mapping)
+            or native.get("target") != dispatch.get("owner")
+            or native.get("message") is None
+            or not isinstance(dispatch.get("reused_from"), str)
+        ):
+            raise ControlPlaneError("dispatch reuse input does not match its wave")
 
     def _verify_native_admission(
         self,
@@ -2314,7 +2606,7 @@ class ControlPlane:
             tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]],
         ],
         *,
-        recapture_stale_spawn: bool,
+        recapture_stale_native: bool,
     ) -> None:
         """Run the shared two-phase admission around lock-free workspace verification."""
 
@@ -2352,15 +2644,15 @@ class ControlPlane:
             self._rollback_native_claim(dispatch_id, tool_use_id)
             raise ControlPlaneUnavailable(str(error)) from error
         except WorkspaceGuardError as error:
-            if recapture_stale_spawn:
-                recaptured = self._discard_stale_spawn_wave(dispatch_id, tool_use_id)
+            if recapture_stale_native:
+                recaptured = self._discard_stale_unstarted_wave(dispatch_id, tool_use_id)
                 action = (
                     "call next again"
                     if recaptured
                     else "inspect and retry the fenced node"
                 )
                 raise ControlPlaneError(
-                    f"{error}; the stale native admission was settled—{action}"
+                    f"{error}; the stale native admission was settled; {action}"
                 ) from error
             self._rollback_native_claim(dispatch_id, tool_use_id)
             raise ControlPlaneError(str(error)) from error
@@ -2435,7 +2727,81 @@ class ControlPlane:
             dispatch_id,
             tool_use_id,
             claim,
-            recapture_stale_spawn=True,
+            recapture_stale_native=True,
+        )
+
+    def preflight_reuse(self, payload: Mapping[str, Any]) -> None:
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, Mapping):
+            raise ControlPlaneError("reuse input is missing")
+        task = parse_task_message(tool_input.get("message"))
+        dispatch_id = task["dispatch_id"]
+        tool_use_id = payload.get("tool_use_id")
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            raise ControlPlaneError("reuse has no native tool-use identity")
+
+        def claim(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
+            dispatch = self._find_dispatch(state, dispatch_id)
+            if dispatch["state"] != "starting" or dispatch["tool_kind"] != "reuse":
+                raise ControlPlaneError("dispatch is not ready to reuse an owner")
+            if (
+                tool_input.get("target") != dispatch.get("owner")
+                or tool_input.get("message") != dispatch["native"].get("message")
+            ):
+                raise ControlPlaneError("reuse does not match its prepared input")
+            if (
+                _native_claim_active(dispatch)
+                and dispatch["tool_use_id"] is not None
+                and dispatch["tool_use_id"] != tool_use_id
+            ):
+                raise ControlPlaneError("dispatch already has an in-flight reuse")
+            wave = self._read_wave(state)
+            self._validate_dispatch_wave(dispatch, wave)
+            plan = self._read_plan(state)
+            members = dispatch.get("members")
+            if not isinstance(members, list) or len(members) != 1:
+                raise ControlPlaneError("reuse requires one logical member")
+            node = _node_map(plan)[members[0]]
+            dependency_dispatches = {
+                state["logical"][dependency].get("dispatch_id")
+                for dependency in node["depends_on"]
+                if isinstance(state["logical"][dependency].get("dispatch_id"), str)
+            }
+            source = state["dispatches"].get(dispatch.get("reused_from"))
+            route = self._selected_dispatch_route(dispatch)
+            if (
+                not isinstance(source, Mapping)
+                or not isinstance(route, Mapping)
+                or not self._source_matches_reuse(
+                    source,
+                    dependency_dispatches=dependency_dispatches,
+                    role=dispatch["role"],
+                    assurance=dispatch["assurance"],
+                    route=route,
+                    scopes=dispatch["scopes"],
+                )
+                or source.get("owner") != dispatch.get("owner")
+                or any(
+                    other.get("dispatch_id")
+                    not in {dispatch.get("dispatch_id"), source.get("dispatch_id")}
+                    and other.get("owner") == dispatch.get("owner")
+                    and other.get("state") in {"starting", "running", "paused"}
+                    for other in state["dispatches"].values()
+                )
+            ):
+                raise ControlPlaneError("prepared owner reuse is no longer valid")
+            sibling_writer_scopes = _sibling_writer_scopes(state, dispatch)
+            if dispatch["role"] == "worker" and sibling_writer_scopes:
+                raise ControlPlaneError(
+                    "another write owner is already bound to this wave"
+                )
+            return dispatch, wave, sibling_writer_scopes
+
+        self._verify_native_admission(
+            dispatch_id,
+            tool_use_id,
+            claim,
+            recapture_stale_native=True,
         )
 
     def preflight_continuation(self, payload: Mapping[str, Any]) -> None:
@@ -2485,7 +2851,7 @@ class ControlPlane:
             body["dispatch_id"],
             tool_use_id,
             claim,
-            recapture_stale_spawn=False,
+            recapture_stale_native=False,
         )
 
     def _append_tombstone(self, state: dict[str, Any], dispatch: Mapping[str, Any], reason: str) -> None:
@@ -2546,13 +2912,37 @@ class ControlPlane:
             "route": {"candidates": rejected["route_candidates"]},
             "scopes": rejected["scopes"],
         }
-        return self._dispatch_record(
+        source_id = rejected.get("reused_from")
+        source = state["dispatches"].get(source_id) if isinstance(source_id, str) else None
+        if source_id is not None and not isinstance(source, Mapping):
+            raise ControlPlaneError("rejected reuse route has no source dispatch")
+        fallback = self._dispatch_record(
             state,
             plan,
             rejected["wave_id"],
             unit,
             route_cursor=next_cursor,
+            reused_from=source,
         )
+        if source is not None:
+            route = fallback["route_candidates"][next_cursor]
+            message = fallback["native"]["message"]
+            fallback["native"] = {
+                "agent_type": WRITE_ROLE
+                if fallback["role"] == "worker"
+                else READ_ROLE,
+                "fork_turns": "none"
+                if fallback["context_turns"] == 0
+                else str(fallback["context_turns"]),
+                "message": message,
+                "model": route["model"],
+                "reasoning_effort": route["effort"],
+                "task_name": fallback["task_name"],
+            }
+            fallback["fallback_from_owner"] = rejected.get("fallback_from_owner")
+            fallback["owner"] = None
+            fallback["tool_kind"] = "spawn"
+        return fallback
 
     def _reject_route_locked(
         self,
@@ -2763,6 +3153,7 @@ class ControlPlane:
             if dispatch["state"] == "starting" and dispatch.get("tool_kind") not in {
                 "spawn",
                 "continuation",
+                "reuse",
             }:
                 raise ControlPlaneError("result owner is stale or fenced")
             if dispatch.get("owner") is None:
@@ -2907,6 +3298,45 @@ class ControlPlane:
         dispatch: dict[str, Any],
         kind: str,
     ) -> dict[str, Any]:
+        if kind == "owner_unavailable":
+            if (
+                dispatch.get("state") != "starting"
+                or dispatch.get("tool_kind") != "reuse"
+                or not isinstance(dispatch.get("owner"), str)
+                or dispatch.get("fallback_from_owner") is not None
+            ):
+                raise ControlPlaneError(
+                    "only one prepared owner reuse can fall back to a fresh spawn"
+                )
+            route = self._selected_dispatch_route(dispatch)
+            native = dispatch.get("native")
+            if not isinstance(route, Mapping) or not isinstance(native, Mapping):
+                raise ControlPlaneError("owner reuse fallback contract is invalid")
+            previous_owner = dispatch["owner"]
+            dispatch["native"] = {
+                "agent_type": WRITE_ROLE
+                if dispatch["role"] == "worker"
+                else READ_ROLE,
+                "fork_turns": "none"
+                if dispatch["context_turns"] == 0
+                else str(dispatch["context_turns"]),
+                "message": native["message"],
+                "model": route["model"],
+                "reasoning_effort": route["effort"],
+                "task_name": dispatch["task_name"],
+            }
+            dispatch["fallback_from_owner"] = previous_owner
+            dispatch["owner"] = None
+            dispatch["tool_kind"] = "spawn"
+            dispatch["tool_use_id"] = None
+            dispatch["claim_expires_at"] = (
+                _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
+            )
+            return _tool_action(
+                "spawn_new_owner",
+                "spawn_agent",
+                dispatch["native"],
+            )
         if kind == "route_rejected":
             fallback = self._reject_route_locked(state, dispatch)
             if fallback is None:
@@ -2928,10 +3358,15 @@ class ControlPlane:
         dispatch["last_transient_failure"] = f"native_{kind}"
         dispatch["tool_use_id"] = None
         dispatch["claim_expires_at"] = None
-        if dispatch["state"] == "starting" and dispatch["tool_kind"] == "spawn":
+        if dispatch["state"] == "starting" and dispatch["tool_kind"] in {
+            "spawn",
+            "reuse",
+        }:
             dispatch["claim_expires_at"] = (
                 _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
             )
+            if dispatch["tool_kind"] == "reuse":
+                return _tool_action("reuse_owner", "followup_task", dispatch["native"])
             return _tool_action("retry_same_call", "spawn_agent", dispatch["native"])
         if not isinstance(dispatch.get("owner"), str):
             raise ControlPlaneError("native failure dispatch has no continuation owner")
@@ -2976,6 +3411,10 @@ class ControlPlane:
                 dispatch["state"] != "starting" or dispatch["tool_kind"] != "spawn"
             ):
                 raise ControlPlaneError("only a prepared spawn route can be rejected")
+            if kind == "owner_unavailable" and (
+                dispatch["state"] != "starting" or dispatch["tool_kind"] != "reuse"
+            ):
+                raise ControlPlaneError("only a prepared owner reuse can be unavailable")
             result = self._settle_native_failure_locked(state, dispatch, kind)
             self._write_state(state)
             return result

@@ -24,6 +24,8 @@ routing service, record billing data, or require an MCP server.
 - Allows one writable child across all Codex tasks sharing a canonical workspace,
   permits parallel readers, and rejects overlapping reader/writer scopes.
 - Aggregates compatible mechanical microtasks when ready work exceeds native capacity.
+- Reuses one idle explorer or worker only across a clean direct dependency with the same
+  route and assurance and a narrower scope; reviewers and ambiguous matches always start fresh.
 - Binds every wave to one fresh Git or bounded non-Git workspace state.
 - Waits for native terminal events instead of polling progress.
 - Preserves prepared native claims and paused writer leases; reviewer rejection blocks
@@ -112,12 +114,14 @@ Use Terra/max for workers and the reviewer in this task.
 
 Primary closes objectives, scopes, dependencies, and acceptance IDs once. CCO then
 handles readiness, route selection, baseline capture, dispatch identity, continuation,
-and result mapping. Returned child names include role, logical node, model, effort, and
-generation so the live Agent list remains readable.
+and result mapping. Fresh child names include role, logical node, model, effort, and
+generation. A reused owner keeps its existing native card name; the new dispatch remains
+visible through CCO status and result evidence.
 
 The normal first wave uses one local `prepare` call for either one child or a compact
-multi-node DAG. It consumes the brief from stdin and returns complete native tool inputs;
-no temporary contract file or CCO source inspection is part of dispatch. Later dependency
+multi-node DAG. It consumes the brief from stdin and returns exact `action`, `tool_name`,
+and `tool_input` envelopes; invoke only each `tool_name` with its `tool_input`. No
+temporary contract file or CCO source inspection is part of dispatch. Later dependency
 waves require only `next`. The same entry accepts a full DAG when nodes share named
 acceptance evidence. If preparation fails before any wave exists, repeating the exact
 brief safely resumes that plan instead of requiring cleanup.
@@ -139,6 +143,15 @@ can settle an owner the host already reports as interrupted. It never infers ret
 child prose. If a not-yet-executed spawn baseline is stale, CCO discards that wave and
 captures a fresh one on the next `next` call instead of replaying it indefinitely. A stale
 fallback preserves the rejected-route proof and does not retry that model.
+
+When a direct dependency's idle explorer or worker still satisfies the strict role, route,
+assurance, scope, and clean-result checks, `next` may return `followup_task` for that owner.
+The new node still gets a fresh dispatch, complete task contract, baseline, and acceptance
+verification. Reviewer work, aggregates, explicit context inheritance, scope expansion,
+ambiguous candidates, or prior transient retries use `spawn_agent`. If the host reports the
+reused owner unavailable, `native-failure --kind owner_unavailable` converts that dispatch to
+one fresh spawn. Reuse can improve context/cache locality, but CCO does not promise a billing
+or token reduction because the host controls model caching and accounting.
 
 Use `$codex-cost-orchestrator:manage-cco` for installation, doctor, configuration,
 paused work, restart recovery, retry, abandonment, or cleanup. Normal tasks do not load

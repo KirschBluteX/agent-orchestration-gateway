@@ -27,8 +27,9 @@ python -B scripts/control_plane.py cleanup
 
 `continue` reads one non-empty JSON evidence delta from stdin. Its result contains
 `action`, `tool_name`, and `tool_input`; invoke `tool_name` with only `tool_input`.
+`prepare` and `next` use the same envelope for both fresh spawn and strict owner reuse.
 `native-failure` accepts `rate_limit`, `network`, `timeout`, `service`, `route_rejected`,
-or `other`; use it only for a typed host error and follow the same envelope rule. A null
+`owner_unavailable`, or `other`; use it only for a typed host error and follow the same envelope rule. A null
 `tool_name` means no native call. `status` identifies paused, fenced, and
 owner-pending work. A Desktop restart fences every active prepared claim, running turn,
 or paused turn; inspect the workspace before `retry`.
@@ -38,8 +39,9 @@ An exact `prepare` retry resumes an identical plan only before its first wave ex
 Temporary SubagentStop verification failures make the same child repeat its exact
 `CCO_RESULT`; do not create a replacement child.
 
-`cleanup` is current-task-only and refuses active or paused child work. Run it only
-after host-card maintenance is no longer needed.
+`cleanup` is current-task-only and refuses active or paused child work. It remains
+available when the shared lifecycle root is already over its admission limit. Run it
+only after host-card maintenance is no longer needed.
 
 ## Static routes
 

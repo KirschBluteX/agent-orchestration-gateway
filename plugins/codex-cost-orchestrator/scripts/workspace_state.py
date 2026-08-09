@@ -318,12 +318,36 @@ def reparse_target(path: str | os.PathLike[str]) -> str | None:
         return None
 
 
-def reparse_resolved_record(path: Path) -> dict[str, Any]:
+class _ControlEntryBudget:
+    """One shared entry budget for a complete Git-control inspection."""
+
+    def __init__(self) -> None:
+        self.remaining = MAX_GIT_CONTROL_ENTRIES
+
+    def consume(self) -> None:
+        if self.remaining <= 0:
+            raise StateUnavailable(
+                "Git control directory exceeds the "
+                f"{MAX_GIT_CONTROL_ENTRIES} control entry limit"
+            )
+        self.remaining -= 1
+
+
+def reparse_resolved_record(
+    path: Path,
+    *,
+    _budget: _ControlEntryBudget | None = None,
+) -> dict[str, Any]:
+    budget = _budget or _ControlEntryBudget()
     try:
         if path.is_dir():
             return {
                 "kind": "directory",
-                "sha256": directory_digest(path, follow_reparse_content=False),
+                "sha256": directory_digest(
+                    path,
+                    follow_reparse_content=False,
+                    _budget=budget,
+                ),
             }
         if path.is_file():
             return {"kind": "file", "sha256": sha256_file(path)}
@@ -334,9 +358,15 @@ def reparse_resolved_record(path: Path) -> dict[str, Any]:
         raise StateUnavailable("Git control reparse target inspection failed") from error
 
 
-def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
+def directory_digest(
+    path: Path,
+    *,
+    follow_reparse_content: bool = True,
+    _budget: _ControlEntryBudget | None = None,
+) -> str:
     if not path.exists():
         return sha256_bytes(b'{"kind":"missing"}')
+    budget = _budget or _ControlEntryBudget()
     records: list[dict[str, Any]] = []
     stack: list[tuple[Path, str]] = [(path, "")]
     while stack:
@@ -347,11 +377,7 @@ def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
             with os.scandir(current) as entries:
                 for child in entries:
                     checkpoint()
-                    if len(records) + len(children) >= MAX_GIT_CONTROL_ENTRIES:
-                        raise StateUnavailable(
-                            "Git control directory exceeds the "
-                            f"{MAX_GIT_CONTROL_ENTRIES} control entry limit"
-                        )
+                    budget.consume()
                     children.append(child)
         except OSError as error:
             raise StateUnavailable("Git control directory inspection failed") from error
@@ -373,7 +399,7 @@ def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
                         "mode": mode,
                         "path": relative,
                         "resolved": (
-                            reparse_resolved_record(Path(child.path))
+                            reparse_resolved_record(Path(child.path), _budget=budget)
                             if follow_reparse_content
                             else None
                         ),
@@ -405,7 +431,12 @@ def directory_digest(path: Path, *, follow_reparse_content: bool = True) -> str:
     return sha256_bytes(canonical)
 
 
-def control_entry_record(path: Path) -> dict[str, Any]:
+def control_entry_record(
+    path: Path,
+    *,
+    _budget: _ControlEntryBudget | None = None,
+) -> dict[str, Any]:
+    budget = _budget or _ControlEntryBudget()
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -420,13 +451,17 @@ def control_entry_record(path: Path) -> dict[str, Any]:
         return {
             "kind": "reparse",
             "mode": mode,
-            "resolved": reparse_resolved_record(path),
+            "resolved": reparse_resolved_record(path, _budget=budget),
             "target_sha256": (
                 sha256_bytes(os.fsencode(target)) if target is not None else None
             ),
         }
     if path.is_dir():
-        return {"kind": "directory", "mode": mode, "sha256": directory_digest(path)}
+        return {
+            "kind": "directory",
+            "mode": mode,
+            "sha256": directory_digest(path, _budget=budget),
+        }
     if path.is_file():
         return {"kind": "file", "mode": mode, "sha256": sha256_file(path)}
     return {"kind": "special", "mode": mode}
@@ -444,8 +479,9 @@ def control_entry_digest(path: Path) -> str:
 
 def git_admin_digest(root: Path) -> str:
     paths = repository_git_paths(root, GIT_ADMIN_PATHS)
+    budget = _ControlEntryBudget()
     records = [
-        {"name": name, **control_entry_record(paths[name])}
+        {"name": name, **control_entry_record(paths[name], _budget=budget)}
         for name in GIT_ADMIN_PATHS
     ]
     canonical = json.dumps(

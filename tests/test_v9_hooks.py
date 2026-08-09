@@ -178,6 +178,30 @@ class V9HookTests(unittest.TestCase):
             )
         self.assertEqual(outcome, {})
 
+    def test_followup_task_routes_a_new_cco_task_to_reuse_preflight(self) -> None:
+        calls: list[object] = []
+
+        class Control:
+            @staticmethod
+            def preflight_reuse(payload: object) -> None:
+                calls.append(payload)
+
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "hook-session",
+            "tool_input": {
+                "message": "CCO_TASK cco.v9\n{}",
+                "target": "/root/worker_first_terra_max_g01_abcd1234",
+            },
+            "tool_name": "followup_task",
+            "tool_use_id": "reuse-call",
+        }
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            outcome = cco_hook.evaluate(payload)
+
+        self.assertEqual(outcome, {})
+        self.assertEqual(calls, [payload])
+
     def test_stop_blocks_only_the_first_stop_event_while_work_is_active(self) -> None:
         class Control:
             @staticmethod

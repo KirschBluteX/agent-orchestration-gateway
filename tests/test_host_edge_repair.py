@@ -82,7 +82,9 @@ class HostEdgeRepairTests(unittest.TestCase):
                 ],
             },
         )
-        native = control.next_wave(capacity=1, native_catalog=CATALOG)["dispatches"][0]
+        native = control.next_wave(capacity=1, native_catalog=CATALOG)["dispatches"][0][
+            "tool_input"
+        ]
         control.preflight_spawn({"tool_input": native, "tool_use_id": "call"})
         owner = "/root/" + native["task_name"]
         control.postflight_tool(

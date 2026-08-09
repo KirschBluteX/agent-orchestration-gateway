@@ -49,8 +49,8 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <PROJECT> --capa
 ```
 
 `prepare` reads a compact brief from stdin, creates the plan, captures one baseline, and
-returns complete native inputs for the first ready wave. A single child needs `role`,
-`objective`, acceptance criterion strings, and scopes. A compact DAG uses `goal` and
+returns `action`, `tool_name`, and `tool_input` envelopes for the first ready wave. A
+single child needs `role`, `objective`, acceptance criterion strings, and scopes. A compact DAG uses `goal` and
 `nodes`; every node adds `id` and may add `depends_on` or `review_of`. External scopes use
 `file` or `tree`.
 
@@ -81,7 +81,8 @@ Omitted `decision` means bounded judgment. Set `decision` to `mechanical` only w
 all allowed choices are acceptance-equivalent. `verification=semantic|manual` or a
 non-empty `risks` list raises the route to guarded.
 
-`prepare` and `next` return complete native inputs. Dispatch them unchanged, then enter
+`prepare` and `next` return the same action envelope for a fresh spawn or strict owner reuse.
+Invoke only `tool_name` with the exact `tool_input`, then enter
 one long `wait_agent`. Call `next` only after the current wave settles. It advances
 logical dependencies from lifecycle evidence; Primary never supplies completed nodes.
 `wait_agent` returning `timed_out:true` means only that the wait window ended. The child
@@ -103,9 +104,12 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
   `action`, `tool_name`, and `tool_input`. Invoke `tool_name` with only `tool_input`;
   do not pass the outer metadata to the native tool.
 - `native-failure` settles one Primary-observed typed host failure. Supported kinds are
-  `rate_limit`, `network`, `timeout`, `service`, `route_rejected`, and `other`. When its
+  `rate_limit`, `network`, `timeout`, `service`, `route_rejected`, `owner_unavailable`,
+  and `other`. When its
   result has a non-null `tool_name`, invoke it with only the returned `tool_input`.
   Transient failures permit at most three exact retries of the same native owner.
+- `owner_unavailable` applies only to a prepared reused owner and converts that dispatch
+  once to a fresh `spawn_agent` action without weakening its task or workspace contract.
 - `abandon` fences paused work and releases its write lease.
 - `retry` creates a guarded newer generation for a fenced logical node.
 - `restart` fences active prepared claims, running turns, and paused turns. Inspect the
@@ -135,13 +139,17 @@ state root carries CCO's ownership marker. Unmarked shared directories are never
 quarantine unrelated JSON, but every valid legacy lifecycle file still participates in
 reader/writer lease checks.
 
-Lifecycle discovery uses incremental `scandir` and refuses more than 4,096 root-level
-JSON files. Git inspection spools output outside process memory, refuses more than 64 MiB
-or 200,000 parsed records, and stops each Git control-directory digest at 100,000 entries.
-These are admission limits: CCO blocks and asks for cleanup instead of truncating evidence.
-Legacy quarantine first atomically moves the pathname to unique staging and validates the
-object actually moved. A concurrent replacement at the original path is never deleted; a
-valid object caught by the move is restored when possible or retained as recovery evidence.
+Lifecycle discovery uses incremental `scandir` and admits no new task after 4,096 ordinary
+root-level lifecycle JSON files. Slot creation is serialized across tasks; an already
+over-capacity root still permits current-task `status` and inactive `cleanup`. Git inspection
+spools output outside process memory, refuses more than 64 MiB or 200,000 parsed records,
+and shares one 100,000-entry budget across every Git control-directory and resolved reparse
+target. These are admission limits: CCO blocks instead of truncating evidence.
+Legacy quarantine first atomically moves the pathname to top-level recovery staging and
+validates the object actually moved. A concurrent replacement at the original path is never
+deleted. Valid recovery state remains lease-visible and is replayed to its canonical pathname
+with an atomic no-replace link; invalid state moves to content-addressed quarantine only after
+the durable object is available.
 
 Current Codex emits PostToolUse only after a successful native tool call and does not emit
 SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two

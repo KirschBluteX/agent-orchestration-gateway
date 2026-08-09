@@ -19,6 +19,8 @@ CCO 只使用 Codex 自身的 Agent runtime，不运行第二套协调器，不�
 - 在宿主真实 Agent 容量内选择最大无冲突 ready set。
 - 所有 Codex 任务共享同一规范工作区时，只允许一个可写子 Agent；只读任务可并行，读写范围重叠时会拒绝准入。
 - ready 数量超过容量时，可安全聚合相容的机械微任务。
+- 仅当同一 plan 的直接依赖具有相同职责、路由和保障等级，结果干净且新范围收窄时，
+  才复用空闲 explorer 或 worker；reviewer 和有歧义的候选始终新建 owner。
 - 每个波次都绑定新的 Git 或有界非 Git 工作区状态。
 - 依靠原生终止事件唤醒 Primary，不轮询进度。
 - 已准备的原生调用和暂停的 worker 都保留写 lease；reviewer 未接受时不会放行下游；只有确认原先处于活动状态的中断、重启和迟到结果才会被 fencing。
@@ -102,12 +104,14 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 ```
 
 Primary 只需一次性闭合目标、范围、依赖和验收 ID。之后的 ready 计算、路由、
-baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地完成。子 Agent
-名称会显示职责、逻辑节点、模型、思考强度与 generation，便于实时查看。
+baseline、dispatch identity、continuation 和逻辑结果映射由 CCO 本地完成。新建子 Agent
+名称会显示职责、逻辑节点、模型、思考强度与 generation。复用 owner 会保留已有原生
+任务卡名称；新逻辑节点仍可通过 CCO status 与结果证据识别。
 
 普通首波无论是单个子 Agent 还是紧凑多节点 DAG，都只调用一次本地 `prepare`。
-它从标准输入读取任务并直接返回完整的原生工具参数；派遣过程不创建临时合同文件，
-也不需要读取 CCO 源码。后续依赖波次只调用 `next`。只有多个节点必须共享具名验收
+它从标准输入读取任务，并返回统一的 `action`、`tool_name`、`tool_input`；只把
+`tool_input` 原样交给对应的 `tool_name`。派遣过程不创建临时合同文件，也不需要读取
+CCO 源码。后续依赖波次只调用 `next`。只有多个节点必须共享具名验收
 证据时，向同一个入口提交包含顶层 `acceptance` 的完整 DAG。若首个波次生成前失败，
 可用完全相同的任务再次执行 `prepare`，无需先清理半完成 plan。
 
@@ -124,6 +128,13 @@ CCO 会通过 `native-failure` 精确结算对应 dispatch。尚未进入 PreToo
 若宿主已报告 owner 为 interrupted，显式 interrupt 重试也能完成结算。CCO 不会根据子 Agent 的普通文本猜测并重试。
 尚未真正执行的 spawn 若基线已过时，CCO 会废弃该波次，并在下一次 `next` 时重新捕获，
 而不是无限重复旧基线。若过时的是 fallback，已拒绝的路由证据会保留，不会再次选择该模型。
+
+当直接依赖的空闲 explorer 或 worker 同时满足职责、模型、思考强度、保障等级、范围收窄
+和干净结果条件时，`next` 可以返回 `followup_task` 复用该 owner。新节点仍会获得新的
+dispatch、完整任务合同、工作区基线和验收验证。reviewer、聚合任务、显式上下文继承、
+范围扩大、有歧义候选或发生过临时重试的任务都会新建 Agent。若宿主报告被复用的 owner
+不可用，`native-failure --kind owner_unavailable` 只回退一次新 spawn。复用有机会提高
+上下文或缓存局部性，但缓存和计费由宿主决定，CCO 不承诺固定 token 或费用下降。
 
 安装、doctor、配置、暂停任务、重启恢复、重试、放弃或清理时使用
 `$codex-cost-orchestrator:manage-cco`；普通任务不会加载这些冷路径说明。

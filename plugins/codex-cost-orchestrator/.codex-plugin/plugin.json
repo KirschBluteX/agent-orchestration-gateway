@@ -1,6 +1,6 @@
 {
   "name": "codex-cost-orchestrator",
-  "version": "3.0.1+codex.20260809040957",
+  "version": "4.0.0+codex.20260809064227",
   "description": "Fast role-aware Codex orchestration with thin skills, static native Agent routing, and exact-state acceptance evidence.",
   "author": {
     "name": "KirschQAQ",
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Cost Orchestrator",
     "shortDescription": "Static native Agent routes with exact-state acceptance.",
-    "longDescription": "Codex Cost Orchestrator is a thin local control plane for Codex native Agents. Primary submits one closed logical plan; CCO derives dependency-ready waves, maximum non-conflicting work, safe mechanical aggregation, current model and effort routes, exact workspace baselines, cross-task reader/writer admission, continuation cursors, restart fencing, and acceptance-ID evidence. The network-free default prefers Luna for mechanical work, Terra for bounded or guarded work and review, and never selects Sol without a current explicit user pin. Codex remains the only Agent runtime, while Primary keeps intent, integration, and final acceptance.",
+    "longDescription": "Codex Cost Orchestrator is a thin local control plane for Codex native Agents. Primary submits one closed logical plan; CCO derives dependency-ready waves, maximum non-conflicting work, strict direct-dependency owner reuse, safe mechanical aggregation, current model and effort routes, exact workspace baselines, cross-task reader/writer admission, continuation cursors, restart fencing, and acceptance-ID evidence. The network-free default prefers Luna for mechanical work, Terra for bounded or guarded work and review, and never selects Sol without a current explicit user pin. Codex remains the only Agent runtime, while Primary keeps intent, integration, and final acceptance.",
     "developerName": "KirschQAQ",
     "category": "Productivity",
     "capabilities": [

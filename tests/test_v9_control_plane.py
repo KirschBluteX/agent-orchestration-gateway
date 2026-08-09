@@ -150,6 +150,280 @@ class V9ControlPlaneTests(unittest.TestCase):
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         return dispatch_id, owner
 
+    def ready_reuse_chain(
+        self,
+        session: str,
+        *,
+        first_path: str = "a.txt",
+        second_path: str = "a.txt",
+    ) -> tuple[ControlPlane, str, str]:
+        control = self.control(session)
+        nodes = [
+            self.node("first", "A01", first_path),
+            self.node("second", "A02", second_path, depends_on=["first"]),
+        ]
+        control.create_plan(self.repo, self.brief(nodes))
+        first_action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        self.assertEqual(first_action["action"], "spawn_new_owner")
+        first_id, owner = self.start_dispatch(control, first_action["tool_input"])
+        control.record_result(
+            owner,
+            result_text(first_id, evidence={"A01": "first complete"}),
+        )
+        return control, first_id, owner
+
+    def test_direct_dependency_reuses_same_owner_with_a_fresh_dispatch(self) -> None:
+        control, first_id, owner = self.ready_reuse_chain("reuse-direct")
+
+        action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+
+        self.assertEqual(action["action"], "reuse_owner")
+        self.assertEqual(action["tool_name"], "followup_task")
+        self.assertEqual(action["tool_input"]["target"], owner)
+        second_task = parse_task_message(action["tool_input"]["message"])
+        self.assertNotEqual(second_task["dispatch_id"], first_id)
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][second_task["dispatch_id"]]
+        self.assertEqual(dispatch["reused_from"], first_id)
+        self.assertEqual(dispatch["tool_kind"], "reuse")
+
+        control.preflight_reuse(
+            {"tool_input": action["tool_input"], "tool_use_id": "reuse-call"}
+        )
+        control.postflight_tool(
+            {
+                "tool_input": action["tool_input"],
+                "tool_response": {"task_name": owner},
+                "tool_use_id": "reuse-call",
+            }
+        )
+        completed = control.record_result(
+            owner,
+            result_text(second_task["dispatch_id"], evidence={"A02": "second complete"}),
+        )
+        self.assertEqual(completed["state"], "retired")
+
+    def test_reviewer_and_scope_expansion_never_reuse_an_owner(self) -> None:
+        reviewer = self.control("reuse-reviewer")
+        reviewer_nodes = [
+            self.node("first", "A01", "a.txt", role="explorer"),
+            self.node(
+                "review",
+                "A02",
+                "a.txt",
+                role="reviewer",
+                depends_on=["first"],
+                review_of="first",
+            ),
+        ]
+        reviewer.create_plan(self.repo, self.brief(reviewer_nodes))
+        first = reviewer.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        first_id, owner = self.start_dispatch(reviewer, first["tool_input"])
+        reviewer.record_result(
+            owner,
+            result_text(first_id, evidence={"A01": "inspected"}),
+        )
+        review_action = reviewer.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        self.assertEqual(review_action["action"], "spawn_new_owner")
+
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "owned.txt").write_text("owned\n", encoding="utf-8")
+        subprocess.run(["git", "add", "src/owned.txt"], cwd=self.repo, check=True)
+        expanded = self.control("reuse-expanded-scope")
+        first_node = self.node("first", "A01", "src/owned.txt")
+        second_node = self.node("second", "A02", "src", depends_on=["first"])
+        second_node["scopes"] = [{"kind": "tree", "path": "src"}]
+        expanded.create_plan(self.repo, self.brief([first_node, second_node]))
+        first_action = expanded.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        first_id, owner = self.start_dispatch(expanded, first_action["tool_input"])
+        expanded.record_result(
+            owner,
+            result_text(first_id, evidence={"A01": "bounded"}),
+        )
+        expanded_action = expanded.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        self.assertEqual(expanded_action["action"], "spawn_new_owner")
+
+    def test_unavailable_reused_owner_falls_back_once_to_a_fresh_spawn(self) -> None:
+        control, _first_id, owner = self.ready_reuse_chain("reuse-owner-unavailable")
+        reuse = control.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        dispatch_id = parse_task_message(reuse["tool_input"]["message"])["dispatch_id"]
+        control.preflight_reuse(
+            {"tool_input": reuse["tool_input"], "tool_use_id": "missing-owner-call"}
+        )
+
+        fallback = control.settle_native_failure(dispatch_id, "owner_unavailable")
+
+        self.assertEqual(fallback["action"], "spawn_new_owner")
+        self.assertEqual(fallback["tool_name"], "spawn_agent")
+        self.assertEqual(fallback["tool_input"]["message"], reuse["tool_input"]["message"])
+        self.assertNotIn("target", fallback["tool_input"])
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        self.assertEqual(dispatch["tool_kind"], "spawn")
+        self.assertIsNone(dispatch["owner"])
+        self.assertEqual(dispatch["fallback_from_owner"], owner)
+        control.preflight_spawn(
+            {"tool_input": fallback["tool_input"], "tool_use_id": "fallback-spawn"}
+        )
+
+    def test_one_owner_is_reused_by_at_most_one_dispatch_in_a_wave(self) -> None:
+        control = self.control("reuse-owner-reservation")
+        nodes = [
+            self.node("source", "A01", "a.txt", role="explorer"),
+            self.node(
+                "left",
+                "A02",
+                "a.txt",
+                role="explorer",
+                depends_on=["source"],
+            ),
+            self.node(
+                "right",
+                "A03",
+                "a.txt",
+                role="explorer",
+                depends_on=["source"],
+            ),
+        ]
+        control.create_plan(self.repo, self.brief(nodes))
+        source_action = control.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        source_id, owner = self.start_dispatch(control, source_action["tool_input"])
+        control.record_result(
+            owner,
+            result_text(source_id, evidence={"A01": "source complete"}),
+        )
+
+        actions = control.next_wave(
+            capacity=2, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"]
+
+        self.assertEqual(
+            sorted(item["action"] for item in actions),
+            ["reuse_owner", "spawn_new_owner"],
+        )
+
+    def test_assurance_change_and_explicit_context_disable_owner_reuse(self) -> None:
+        for session, mutate in (
+            ("reuse-assurance-change", lambda node: node.update({"verification": "semantic"})),
+            ("reuse-explicit-context", lambda node: node.update({"context_turns": 1})),
+        ):
+            with self.subTest(session=session):
+                control = self.control(session)
+                first = self.node("first", "A01", "a.txt")
+                second = self.node("second", "A02", "a.txt", depends_on=["first"])
+                mutate(second)
+                control.create_plan(self.repo, self.brief([first, second]))
+                first_action = control.next_wave(
+                    capacity=1, native_catalog=catalog("gpt-5.6-terra")
+                )["dispatches"][0]
+                first_id, owner = self.start_dispatch(control, first_action["tool_input"])
+                control.record_result(
+                    owner,
+                    result_text(first_id, evidence={"A01": "first complete"}),
+                )
+
+                second_action = control.next_wave(
+                    capacity=1, native_catalog=catalog("gpt-5.6-terra")
+                )["dispatches"][0]
+
+                self.assertEqual(second_action["action"], "spawn_new_owner")
+                control.restart()
+                control.cleanup()
+
+    def test_stale_unexecuted_reuse_wave_is_recaptured(self) -> None:
+        control, first_id, _owner = self.ready_reuse_chain("reuse-stale-baseline")
+        stale = control.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        stale_id = parse_task_message(stale["tool_input"]["message"])["dispatch_id"]
+        (self.repo / "a.txt").write_text("changed before reuse\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ControlPlaneError, "call next again"):
+            control.preflight_reuse(
+                {"tool_input": stale["tool_input"], "tool_use_id": "stale-reuse"}
+            )
+
+        refreshed = control.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        refreshed_id = parse_task_message(refreshed["tool_input"]["message"])["dispatch_id"]
+        self.assertEqual(refreshed["action"], "reuse_owner")
+        self.assertNotEqual(refreshed_id, stale_id)
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["dispatches"][refreshed_id]["reused_from"], first_id)
+
+    def test_reuse_spawn_fallback_can_consume_a_rejected_route(self) -> None:
+        control = self.control("reuse-route-fallback")
+        nodes = [
+            self.node("first", "A01", "a.txt"),
+            self.node("second", "A02", "a.txt", depends_on=["first"]),
+        ]
+        routes = catalog("gpt-5.6-luna", "gpt-5.6-terra")
+        control.create_plan(self.repo, self.brief(nodes))
+        first = control.next_wave(capacity=1, native_catalog=routes)["dispatches"][0]
+        first_id, owner = self.start_dispatch(control, first["tool_input"])
+        control.record_result(
+            owner,
+            result_text(first_id, evidence={"A01": "first complete"}),
+        )
+        reuse = control.next_wave(capacity=1, native_catalog=routes)["dispatches"][0]
+        dispatch_id = parse_task_message(reuse["tool_input"]["message"])["dispatch_id"]
+        control.preflight_reuse(
+            {"tool_input": reuse["tool_input"], "tool_use_id": "reuse-unavailable"}
+        )
+        spawned = control.settle_native_failure(dispatch_id, "owner_unavailable")
+        control.preflight_spawn(
+            {"tool_input": spawned["tool_input"], "tool_use_id": "spawn-rejected"}
+        )
+
+        fallback = control.settle_native_failure(dispatch_id, "route_rejected")
+
+        self.assertEqual(fallback["action"], "fallback_route")
+        self.assertNotEqual(
+            fallback["tool_input"]["model"], spawned["tool_input"]["model"]
+        )
+        control.preflight_spawn(
+            {"tool_input": fallback["tool_input"], "tool_use_id": "fallback-route"}
+        )
+
+    def test_transient_reuse_failure_retries_the_unchanged_task_on_same_owner(self) -> None:
+        control, _first_id, owner = self.ready_reuse_chain("reuse-transient")
+        reuse = control.next_wave(
+            capacity=1, native_catalog=catalog("gpt-5.6-terra")
+        )["dispatches"][0]
+        dispatch_id = parse_task_message(reuse["tool_input"]["message"])["dispatch_id"]
+        control.preflight_reuse(
+            {"tool_input": reuse["tool_input"], "tool_use_id": "reuse-network"}
+        )
+
+        retry = control.settle_native_failure(dispatch_id, "network")
+
+        self.assertEqual(retry["action"], "reuse_owner")
+        self.assertEqual(retry["tool_name"], "followup_task")
+        self.assertEqual(retry["tool_input"], reuse["tool_input"])
+        self.assertEqual(retry["tool_input"]["target"], owner)
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["dispatches"][dispatch_id]["tool_kind"], "reuse")
+        self.assertEqual(state["dispatches"][dispatch_id]["transient_retries"], 1)
+
     def test_plan_is_stable_and_does_not_accept_primary_owned_lifecycle_fields(self) -> None:
         control = self.control()
         node = self.node("n01", "A01", "a.txt")
@@ -262,9 +536,15 @@ class V9ControlPlaneTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         batch = json.loads(completed.stdout)
-        self.assertEqual(batch["protocol"], "cco.wave-batch.v1")
+        self.assertEqual(batch["protocol"], "cco.wave-batch.v2")
         self.assertEqual(len(batch["dispatches"]), 1)
-        self.assertEqual(batch["dispatches"][0]["model"], "gpt-5.6-terra")
+        self.assertEqual(
+            set(batch["dispatches"][0]),
+            {"action", "tool_name", "tool_input"},
+        )
+        self.assertEqual(batch["dispatches"][0]["action"], "spawn_new_owner")
+        self.assertEqual(batch["dispatches"][0]["tool_name"], "spawn_agent")
+        self.assertEqual(batch["dispatches"][0]["tool_input"]["model"], "gpt-5.6-terra")
         self.assertFalse(list(self.repo.glob("cco-*.json")))
 
     def test_prepare_cli_compiles_compact_multi_node_graph_in_one_call(self) -> None:
@@ -328,7 +608,10 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         batch = json.loads(completed.stdout)
         self.assertEqual(len(batch["dispatches"]), 2)
-        messages = [parse_task_message(item["message"]) for item in batch["dispatches"]]
+        messages = [
+            parse_task_message(item["tool_input"]["message"])
+            for item in batch["dispatches"]
+        ]
         self.assertEqual(len({item["dispatch_id"] for item in messages}), 2)
         state = json.loads(self.control("multi-prepare").state_path.read_text(encoding="utf-8"))
         plan = json.loads(Path(state["plan_path"]).read_text(encoding="utf-8"))
@@ -392,7 +675,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
         )
-        native = batch["dispatches"][0]
+        native = batch["dispatches"][0]["tool_input"]
         self.assertEqual(native["model"], "gpt-5.6-luna")
         self.assertEqual(native["reasoning_effort"], "max")
         self.assertIn("luna_max", native["task_name"])
@@ -411,7 +694,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             capacity=2,
             native_catalog=catalog("gpt-5.6-terra"),
         )
-        names = [item["task_name"] for item in batch["dispatches"]]
+        names = [item["tool_input"]["task_name"] for item in batch["dispatches"]]
         self.assertEqual(len(names), 2)
         self.assertEqual(len(set(names)), 2)
 
@@ -425,7 +708,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         control.create_plan(self.repo, self.brief(nodes))
         batch = control.next_wave(capacity=3, native_catalog=catalog("gpt-5.6-terra"))
         self.assertEqual(len(batch["dispatches"]), 2)
-        roles = [item["agent_type"] for item in batch["dispatches"]]
+        roles = [item["tool_input"]["agent_type"] for item in batch["dispatches"]]
         self.assertEqual(roles.count("cost_orchestrator_write_leaf"), 1)
         self.assertEqual(roles.count("cost_orchestrator_read_leaf"), 1)
 
@@ -466,7 +749,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
         )
         self.assertEqual(len(batch["dispatches"]), 1)
-        task = parse_task_message(batch["dispatches"][0]["message"])
+        task = parse_task_message(batch["dispatches"][0]["tool_input"]["message"])
         self.assertEqual([item["id"] for item in task["members"]], ["n01", "n02", "n03"])
         self.assertEqual(sorted(task["acceptance"]), ["A01", "A02", "A03"])
         for member in task["members"]:
@@ -512,7 +795,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = reader.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.start_dispatch(reader, native)
 
         with self.assertRaisesRegex(ControlPlaneError, "overlapping reader"):
@@ -549,7 +832,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = writer.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.start_dispatch(writer, native)
 
         with self.assertRaisesRegex(ControlPlaneError, "workspace writer"):
@@ -576,7 +859,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = legacy.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         _dispatch_id, owner = self.start_dispatch(legacy, native)
         state = json.loads(legacy.state_path.read_text(encoding="utf-8"))
         dispatch = next(iter(state["dispatches"].values()))
@@ -631,7 +914,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = legacy.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         _dispatch_id, owner = self.start_dispatch(legacy, native)
         legacy.state_path.replace(self.state_root / "legacy-race.json")
         legacy = self.control("legacy-race")
@@ -741,7 +1024,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = legacy.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.start_dispatch(legacy, native)
         legacy.state_path.replace(self.state_root / "legacy-writer.json")
         (self.state_root / ".cco-state-root-v1").unlink()
@@ -783,7 +1066,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         (self.state_root / "unrelated.json").write_text("{}", encoding="utf-8")
 
         with (
@@ -804,6 +1087,93 @@ class V9ControlPlaneTests(unittest.TestCase):
         state = json.loads(control.state_path.read_text(encoding="utf-8"))
         dispatch = next(iter(state["dispatches"].values()))
         self.assertIsNone(dispatch["tool_use_id"])
+
+    def test_state_root_at_capacity_rejects_plan_before_writing_artifacts(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
+        (self.state_root / "occupied.json").write_text("{}", encoding="utf-8")
+        control = self.control("capacity-before-plan")
+
+        with (
+            patch.object(control_plane_module, "MAX_STATE_FILES", 1),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "file limit"),
+        ):
+            control.create_plan(
+                self.repo,
+                self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+            )
+
+        self.assertEqual(
+            list((self.state_root / "artifacts").glob("capacity-before-plan-*.json"))
+            if (self.state_root / "artifacts").exists()
+            else [],
+            [],
+        )
+        self.assertEqual(len(list(self.state_root.glob("*.json"))), 1)
+
+    def test_state_root_capacity_is_atomic_across_sessions(self) -> None:
+        self.state_root.mkdir(parents=True, exist_ok=True)
+        (self.state_root / ".cco-state-root-v1").write_bytes(b"cco.state-root.v1\n")
+        controls = [self.control("capacity-one"), self.control("capacity-two")]
+        barrier = threading.Barrier(2)
+        original_atomic_write = control_plane_module._atomic_write
+        outcomes: list[str] = []
+
+        def synchronized_state_write(path: Path, value: object) -> None:
+            if path.parent == self.state_root and path.suffix == ".json":
+                try:
+                    barrier.wait(timeout=0.25)
+                except threading.BrokenBarrierError:
+                    pass
+            original_atomic_write(path, value)
+
+        def create(control: ControlPlane) -> None:
+            try:
+                control.create_plan(
+                    self.repo,
+                    self.brief(
+                        [self.node("reader", "A01", "a.txt", role="explorer")]
+                    ),
+                )
+            except ControlPlaneUnavailable:
+                outcomes.append("full")
+            else:
+                outcomes.append("created")
+
+        with (
+            patch.object(control_plane_module, "MAX_STATE_FILES", 1),
+            patch.object(
+                control_plane_module,
+                "_atomic_write",
+                side_effect=synchronized_state_write,
+            ),
+        ):
+            threads = [threading.Thread(target=create, args=(control,)) for control in controls]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertCountEqual(outcomes, ["created", "full"])
+        self.assertEqual(len(list(self.state_root.glob("*.json"))), 1)
+
+    def test_over_capacity_root_still_allows_current_status_and_cleanup(self) -> None:
+        control = self.control("over-capacity-recovery")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        state_path = control.state_path
+        (self.state_root / "overflow.json").write_text("{}", encoding="utf-8")
+        recovered = self.control("over-capacity-recovery")
+
+        with patch.object(control_plane_module, "MAX_STATE_FILES", 1):
+            self.assertEqual(recovered.status()["state"], "ready")
+            self.assertGreaterEqual(recovered.cleanup(), 2)
+
+        self.assertFalse(state_path.exists())
+        self.assertTrue((self.state_root / "overflow.json").exists())
 
     def test_quarantine_never_overwrites_an_earlier_payload(self) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
@@ -870,9 +1240,105 @@ class V9ControlPlaneTests(unittest.TestCase):
         ):
             candidates = source._workspace_state_candidates(self.repo)
 
-        self.assertTrue(legacy.exists())
-        self.assertEqual(legacy.read_bytes(), repaired)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(source.state_path.exists())
+        self.assertEqual(source.state_path.read_bytes(), repaired)
         self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
+
+    def test_quarantine_failure_keeps_a_recovered_writer_visible(self) -> None:
+        source = self.control("quarantine-crash-safe-writer")
+        brief = self.brief([self.node("writer", "A01", "a.txt")])
+        source.create_plan(self.repo, brief)
+        native = source.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(source, native)
+        repaired = source.state_path.read_bytes()
+        source.state_path.unlink()
+        legacy = self.state_root / "repair-before-link.json"
+        legacy.write_text('{"broken":', encoding="utf-8")
+        original_replace = os.replace
+
+        def repair_then_replace(source_path: object, destination: object) -> None:
+            if Path(source_path) == legacy:
+                legacy.write_bytes(repaired)
+            original_replace(source_path, destination)
+
+        with (
+            patch.object(
+                control_plane_module.os,
+                "replace",
+                side_effect=repair_then_replace,
+            ),
+            patch.object(
+                control_plane_module.os,
+                "link",
+                side_effect=OSError("simulated publication failure"),
+                create=True,
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "could not be restored"),
+        ):
+            source._workspace_state_candidates(self.repo)
+
+        recovery_files = list(self.state_root.glob(".cco-recovery-*.json"))
+        self.assertEqual(len(recovery_files), 1)
+        contender = self.control("quarantine-crash-safe-contender")
+        contender.create_plan(self.repo, brief)
+        with self.assertRaisesRegex(ControlPlaneError, "writer lease"):
+            contender.next_wave(
+                capacity=1,
+                native_catalog=catalog("gpt-5.6-terra"),
+            )
+
+    def test_recovery_publication_replays_after_finalization_failure(self) -> None:
+        source = self.control("quarantine-replay-writer")
+        source.create_plan(
+            self.repo,
+            self.brief([self.node("writer", "A01", "a.txt")]),
+        )
+        native = source.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        self.start_dispatch(source, native)
+        repaired = source.state_path.read_bytes()
+        source.state_path.unlink()
+        legacy = self.state_root / "repair-before-finalize.json"
+        legacy.write_text('{"broken":', encoding="utf-8")
+        original_replace = os.replace
+        original_unlink = Path.unlink
+        failed = False
+
+        def repair_then_replace(source_path: object, destination: object) -> None:
+            if Path(source_path) == legacy:
+                legacy.write_bytes(repaired)
+            original_replace(source_path, destination)
+
+        def fail_recovery_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal failed
+            if path.name.startswith(".cco-recovery-") and path.suffix == ".json" and not failed:
+                failed = True
+                raise OSError("simulated finalization failure")
+            original_unlink(path, *args, **kwargs)
+
+        with (
+            patch.object(
+                control_plane_module.os,
+                "replace",
+                side_effect=repair_then_replace,
+            ),
+            patch.object(Path, "unlink", new=fail_recovery_unlink),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "finalization failed"),
+        ):
+            source._workspace_state_candidates(self.repo)
+
+        self.assertEqual(len(list(self.state_root.glob(".cco-recovery-*.json"))), 1)
+        recovered = self.control("recovery-reader")
+        candidates = recovered._workspace_state_candidates(self.repo)
+        self.assertIn(source.session_id, {state["session_id"] for _, state in candidates})
+        self.assertTrue(source.state_path.exists())
+        self.assertEqual(list(self.state_root.glob(".cco-recovery-*.json")), [])
 
     def test_invalid_indexed_same_workspace_state_blocks_admission(self) -> None:
         control = self.control("indexed-corruption")
@@ -907,7 +1373,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = reader.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(reader, native)
         reader.record_result(
             owner,
@@ -978,7 +1444,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             native = first.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
-            )["dispatches"][0]
+            )["dispatches"][0]["tool_input"]
 
             def run_spawn() -> None:
                 try:
@@ -1018,7 +1484,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         original = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         original_id = parse_task_message(original["message"])["dispatch_id"]
         state = json.loads(control.state_path.read_text(encoding="utf-8"))
         state["dispatches"][original_id]["claim_expires_at"] = 1
@@ -1027,7 +1493,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         rearmed = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.assertEqual(parse_task_message(rearmed["message"])["dispatch_id"], original_id)
 
         with self.assertRaisesRegex(ControlPlaneError, "call next again"):
@@ -1038,7 +1504,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         refreshed = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.assertNotEqual(
             parse_task_message(refreshed["message"])["dispatch_id"],
             original_id,
@@ -1056,14 +1522,14 @@ class V9ControlPlaneTests(unittest.TestCase):
         first = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         first_id = parse_task_message(first["message"])["dispatch_id"]
         control.preflight_spawn({"tool_input": first, "tool_use_id": "reject-first"})
         control.settle_native_failure(first_id, "route_rejected")
         fallback = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.assertEqual(fallback["model"], "gpt-5.6-terra")
         (self.repo / "a.txt").write_text("changed before fallback\n", encoding="utf-8")
 
@@ -1075,7 +1541,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         refreshed = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.assertEqual(refreshed["model"], "gpt-5.6-terra")
 
     def test_git_result_inspection_failure_does_not_fence_the_owner(self) -> None:
@@ -1087,7 +1553,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
 
         with (
@@ -1120,7 +1586,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         (self.repo / "a.txt").write_text("a1\n", encoding="utf-8")
         accepted = control.record_result(
@@ -1143,7 +1609,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         control.preflight_spawn(
             {"tool_input": native, "tool_use_id": "spawn-without-owner"}
         )
@@ -1172,7 +1638,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         control.preflight_spawn({"tool_input": native, "tool_use_id": "missing-postflight"})
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         owner = "/root/" + native["task_name"]
@@ -1192,7 +1658,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             native = control.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
-            )["dispatches"][0]
+            )["dispatches"][0]["tool_input"]
             control.cleanup()
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
@@ -1209,7 +1675,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         (self.repo / "b.txt").write_text("outside\n", encoding="utf-8")
         with self.assertRaisesRegex(ControlPlaneError, "workspace verification failed"):
@@ -1225,7 +1691,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=2,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
             owner,
@@ -1261,7 +1727,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = first.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         _dispatch_id, owner = self.start_dispatch(first, native)
 
         first.preflight_interrupt(
@@ -1306,7 +1772,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.preflight_interrupt(
             {"tool_input": {"target": owner}, "tool_use_id": "interrupt-race"}
@@ -1333,7 +1799,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = first.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         _dispatch_id, owner = self.start_dispatch(first, native)
 
         first.preflight_interrupt(
@@ -1367,7 +1833,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
             owner,
@@ -1395,7 +1861,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
             owner,
@@ -1428,7 +1894,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         original_verify = control_plane_module.verify_workspace
         observations: list[bool] = []
@@ -1493,7 +1959,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         self.assertEqual(control.restart(), 1)
         self.assertEqual(control.status()["state"], "blocked")
@@ -1509,7 +1975,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         first = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         control.preflight_spawn({"tool_input": first, "tool_use_id": "rejected-call"})
         action = control.settle_native_failure(
             parse_task_message(first["message"])["dispatch_id"],
@@ -1519,7 +1985,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         fallback = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.assertEqual(fallback["model"], "gpt-5.6-terra")
         self.assertNotEqual(
             parse_task_message(first["message"])["dispatch_id"],
@@ -1535,7 +2001,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         first = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         control.preflight_spawn({"tool_input": first, "tool_use_id": "capacity-call"})
         control.settle_native_failure(
             parse_task_message(first["message"])["dispatch_id"],
@@ -1545,7 +2011,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         retried = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         self.assertEqual(retried["model"], "gpt-5.6-luna")
         self.assertEqual(
             parse_task_message(retried["message"])["dispatch_id"],
@@ -1563,7 +2029,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             native = control.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-            )["dispatches"][0]
+            )["dispatches"][0]["tool_input"]
             self.assertEqual(native["model"], "gpt-5.6-luna")
             dispatch_id = parse_task_message(native["message"])["dispatch_id"]
             first_dispatch_id = first_dispatch_id or dispatch_id
@@ -1585,7 +2051,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
             owner,
@@ -1617,7 +2083,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-luna", "gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         control.preflight_spawn({"tool_input": native, "tool_use_id": "failed-call"})
 
@@ -1642,7 +2108,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         wave_path = next((self.state_root / "artifacts").glob("*-wave-*.json"))
         wave = json.loads(wave_path.read_text(encoding="utf-8"))
         wave["units"][0]["route_candidates"][0]["model"] = "gpt-5.6-luna"
@@ -1656,7 +2122,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         wave_path = next((self.state_root / "artifacts").glob("*-wave-*.json"))
         wave = json.loads(wave_path.read_text(encoding="utf-8"))
         wave["baseline"]["snapshot"]["head"] = "corrupted"
@@ -1681,7 +2147,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
             owner,
@@ -1699,7 +2165,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         control.record_result(
             owner,
@@ -1718,7 +2184,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         native = control.next_wave(
             capacity=1,
             native_catalog=catalog("gpt-5.6-terra"),
-        )["dispatches"][0]
+        )["dispatches"][0]["tool_input"]
         dispatch_id, owner = self.start_dispatch(control, native)
         retries = [control.settle_native_failure(dispatch_id, "rate_limit")]
         with self.assertRaisesRegex(ControlPlaneError, "no unsettled native call"):
@@ -1757,13 +2223,13 @@ class V9ControlPlaneTests(unittest.TestCase):
             native = control.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
-            )["dispatches"][0]
+            )["dispatches"][0]["tool_input"]
         with patch.object(control_plane_module.time, "time", return_value=1000.0):
             retried = control.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
             )
-        self.assertEqual(retried["dispatches"], [native])
+        self.assertEqual(retried["dispatches"][0]["tool_input"], native)
 
     def test_failed_native_claim_keeps_lease_until_explicit_settlement(self) -> None:
         first = self.control("failed-native-claim")
@@ -1775,7 +2241,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             native = first.next_wave(
                 capacity=1,
                 native_catalog=catalog("gpt-5.6-terra"),
-            )["dispatches"][0]
+            )["dispatches"][0]["tool_input"]
             first.preflight_spawn(
                 {"tool_input": native, "tool_use_id": "failed-native-call"}
             )

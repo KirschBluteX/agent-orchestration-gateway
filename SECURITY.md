@@ -18,6 +18,9 @@ account permissions.
 
 Read leaves request a read-only sandbox. Workers receive one CCO write lease, but the
 host sandbox remains the enforcement authority. Primary must inspect the final delta.
+Owner reuse does not inherit the prior node's authority: it is limited to a clean direct
+dependency with matching role, route, assurance, and narrower scopes, and receives a new
+dispatch, task contract, workspace baseline, and acceptance check. Reviewers never reuse.
 
 ## Local state
 
@@ -34,8 +37,8 @@ temporary-directory protections.
 ## Hooks
 
 CCO ships five synchronous definitions with exact matchers. There is no global
-`PreToolUse: .*` Hook. PreToolUse validates only native spawn, continuation, message,
-and interrupt tools; success-only PostToolUse settles spawn, continuation, and interrupt
+`PreToolUse: .*` Hook. PreToolUse validates only native spawn, owner reuse, continuation,
+message, and interrupt tools; success-only PostToolUse settles spawn, reuse, continuation, and interrupt
 outcomes.
 SessionStart fences work at host `resume` or `clear` recovery boundaries, never during
 context compaction. Stop is an exceptional fallback for a Primary attempting to end

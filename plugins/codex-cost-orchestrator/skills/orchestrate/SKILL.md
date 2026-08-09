@@ -8,46 +8,46 @@ description: >-
 
 # Orchestrate with CCO
 
-Keep unresolved product, architecture, integration, and final acceptance choices in Primary.
-Route every requested native child through CCO. Never add a direct-spawn bypass.
+Keep unresolved product, architecture, integration, and final acceptance choices in Primary. Route
+every requested native child through CCO; never add a direct-spawn bypass.
 
-For the first wave, run one command and pipe compact JSON directly to stdin; do not inspect CCO
-source, call `--help`, or create a temporary contract file:
+For the first wave, pipe compact JSON directly to one command. Do not inspect CCO source, call
+`--help`, or create a temporary contract file:
 
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --capacity <N>
 ```
 
-A single-child contract requires `role` (`explorer|worker|reviewer`), `objective`, string-list
-`acceptance`, and `scopes` entries shaped as `{"kind":"file|tree","path":"repo/relative"}`.
-Optional fields are `goal`, `decision`, `verification`, `risks`, `pin`, and `context_turns`;
-`decision` defaults to bounded and is mechanical only when every allowed choice is equivalent.
-A compact DAG has `goal` and `nodes`; every node has `id` plus the same required fields and may
-also declare `depends_on` or `review_of`. A full DAG may instead add top-level `acceptance` and use
-its IDs in nodes when evidence is shared. CCO compiles either form, captures one baseline, derives
-the first ready wave, and returns complete `spawn_agent` inputs.
-If `prepare` fails before its first wave, retry the identical command and brief.
+A single-child contract requires `role` (`explorer|worker|reviewer`), `objective`, acceptance
+strings, and `scopes` shaped as `{"kind":"file|tree","path":"repo/relative"}`. Optional fields
+include `goal`, `decision`, `verification`, `risks`, `pin`, and `context_turns`. A compact DAG adds
+`goal`, `nodes`, per-node `id`, and optional `depends_on` or `review_of`; use a full DAG with
+top-level acceptance IDs only for shared evidence. Mechanical means every allowed choice is
+acceptance-equivalent; omitted `decision` is bounded.
 
-Do not pass a session ID. Dispatch every returned input unchanged and use its exact profile,
-model, effort, name, and message. Mechanical explorer/worker prefers Luna; bounded work prefers
-Terra; guarded work and reviewer use Terra. Effort order is `max`, `xhigh`, then `high`. Only a
-current explicit user pin may select Sol. Never inherit Primary's route silently.
+Do not pass a session ID. Invoke only each returned `tool_name` with its exact `tool_input`.
+Mechanical explorer/worker prefers Luna; bounded, guarded, and reviewer work prefer Terra. Effort
+order is `max`, `xhigh`, then `high`. Only a current explicit user pin may select Sol.
+
+CCO may reuse an idle owner with `followup_task` only for one explorer or worker whose direct
+dependency used the same role, model, effort, and assurance, has a clean result, and covers every
+new scope. Explicit inherited context, aggregates, ambiguity, retries, scope expansion, and all
+reviewers spawn fresh. Reuse still receives a fresh task, dispatch, baseline, and acceptance check.
 
 After dispatch, enter one long `wait_agent`. Do not poll, duplicate a child, do overlapping
 Primary work, or forward protected payloads. `{"timed_out":true}` means only that the wait window
 ended; start another long wait. It is not a native timeout and must not call `native-failure`.
 
-For a typed native failure, run `native-failure`. If its `tool_name` is non-null, invoke only that
-tool with the exact `tool_input`. Map typed host status only: unsupported model to
-`route_rejected`, 429 to `rate_limit`, transport to `network`, deadline to `timeout`, temporary
-5xx to `service`, and non-retryable failure to `other`. Never infer failure from assistant prose.
-Transient kinds retry the same owner at most three times.
+For a typed native failure, run `native-failure` and follow its envelope. Map only typed host
+status: unsupported model=`route_rejected`, unavailable reused owner=`owner_unavailable`,
+429=`rate_limit`, transport=`network`, deadline=`timeout`, temporary 5xx=`service`, and
+non-retryable=`other`. Never infer failure from prose. Unavailable reuse falls back once to a fresh
+spawn; transient failures retry the unchanged call at most three times.
 
 Treat child results as claims. Hooks bind dispatch, cursor, baseline, scopes, acceptance IDs, and
-owner. Call `next` only after the current wave settles. Primary inspects the actual delta and owns
-final acceptance. Use a reviewer only for semantic/manual evidence, risk, deviation,
-Primary-owned changes, or explicit user request; only reviewer `accept` satisfies its downstream
-gate.
+owner. Call `next` only after the wave settles. Primary inspects the delta and owns final
+acceptance. Use reviewer only for semantic/manual evidence, risk, deviation, Primary changes, or
+explicit request; only reviewer `accept` satisfies its gate.
 
 Use `$codex-cost-orchestrator:manage-cco` only for installation, doctor, policy, status,
 continuation, retry, restart recovery, or cleanup.

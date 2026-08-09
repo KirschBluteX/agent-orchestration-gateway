@@ -2,6 +2,28 @@
 
 The project follows semantic versioning.
 
+## 4.0.0 - 2026-08-09
+
+- Return every prepared native operation as one exact `action` / `tool_name` /
+  `tool_input` envelope instead of exposing bare spawn arguments.
+- Reuse an idle explorer or worker owner only across a direct dependency inside the
+  same plan when role, route, assurance, and narrowed scope all match. Reviewers,
+  aggregates, ambiguous candidates, explicit inherited context, and expanded scopes
+  always receive a fresh owner.
+- Bind reused work to a fresh dispatch, task contract, acceptance set, workspace
+  baseline, and result verification. A typed unavailable owner falls back once to a
+  fresh spawn; transient failures retry the unchanged task on that same owner at most
+  three times.
+
+- Reserve lifecycle capacity under one root-wide lock before writing a plan, while
+  keeping current-task `status` and `cleanup` usable when an old root is already over
+  the 4,096-state limit.
+- Keep quarantine recovery objects visible at the state-root level and replay them with
+  atomic no-replace links, so a crash or filesystem failure cannot hide an active lease
+  in a maintenance subdirectory or expose a partial restored JSON file.
+- Share one 100,000-entry budget across the complete Git-control inspection, including
+  every resolved reparse target, instead of granting each nested digest a fresh budget.
+
 ## 3.0.1 - 2026-08-09
 
 - Bounded lifecycle-root discovery at 4,096 JSON files using incremental directory

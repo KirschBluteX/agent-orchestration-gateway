@@ -75,6 +75,36 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             ):
                 workspace_state_module.directory_digest(root)
 
+    def test_git_control_reparse_targets_share_the_outer_entry_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            scanned = base / "scanned"
+            target = base / "target"
+            scanned.mkdir()
+            target.mkdir()
+            (target / "nested").write_text("bounded", encoding="utf-8")
+            link = scanned / "linked"
+            if os.name == "nt":
+                created = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(created.returncode, 0, created.stderr)
+            else:
+                link.symlink_to(target, target_is_directory=True)
+
+            with (
+                mock.patch.object(
+                    workspace_state_module,
+                    "MAX_GIT_CONTROL_ENTRIES",
+                    1,
+                ),
+                self.assertRaisesRegex(StateUnavailable, "control entry limit"),
+            ):
+                workspace_state_module.directory_digest(scanned)
+
     def test_head_oid_rejects_an_unexpected_git_failure(self) -> None:
         failed = subprocess.CompletedProcess(
             ["git", "rev-parse"],

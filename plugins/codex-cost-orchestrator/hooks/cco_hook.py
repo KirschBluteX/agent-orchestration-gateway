@@ -276,6 +276,14 @@ def evaluate(value: object) -> dict[str, Any]:
                     target = tool_input.get("target")
                     control = _control(value)
                     if isinstance(message, str) and message.startswith(
+                        TASK_HEADER + "\n"
+                    ):
+                        if tool not in FOLLOWUP_TOOLS:
+                            raise ControlPlaneError(
+                                "a CCO owner reuse must use followup_task"
+                            )
+                        control.preflight_reuse(value)
+                    elif isinstance(message, str) and message.startswith(
                         CONTINUE_HEADER + "\n"
                     ):
                         if tool not in FOLLOWUP_TOOLS:
