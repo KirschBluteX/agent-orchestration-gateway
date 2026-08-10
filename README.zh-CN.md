@@ -2,9 +2,11 @@
 
 [English](README.md)
 
+> **预 1.0（pre-1.0）发布政策：**公开、安装程序和清单的发布标识均为无构建元数据的 `0.9.0`。在 1.0 之前，次版本可能包含破坏性变更。历史的 2.x 至 5.x 标签已压缩为 0.9 之前的开发历史；Git 历史保持不变。
+
 Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的本地控制面。Primary 保留意图、
-集成和最终验收；CCO 负责已闭合、已定范围工作的派发与验收证据。当前破坏性版本为
-`5.0.0+codex.20260810093311`。
+集成和最终验收；CCO 负责已闭合、已定范围工作的派发与验收证据。当前预 1.0 版本为
+`0.9.0`。
 
 ## 派发契约
 
@@ -47,7 +49,7 @@ guarded plan 在所有非 reviewer 源节点之后有一个独立最终 reviewer
 ## 状态与升级
 
 当前协议为 `cco.wave.v3`、`cco.lifecycle.v2` 与 `cco.receipt.v2`。早期活动状态、wave、
-lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 5.0.0 前必须清理，再开始
+lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 0.9.0 前必须清理，再开始
 新任务。不存在迁移命令，也不存在活动状态兼容层。
 
 只读任务只扫描声明的范围。对于同一规范工作区，CCO 只允许一个普通 writer，并会对

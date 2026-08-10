@@ -16,10 +16,12 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 Python 3.11+ is required; `zstandard` is required on Python versions below 3.14. Review and trust
 the five CCO entries in `/hooks`, then start a new Codex task.
 
-Version `5.0.0+codex.20260810093311` is breaking. Current records are `cco.wave.v3`,
-`cco.lifecycle.v2`, and `cco.receipt.v2`. If predecessor state, wave, lifecycle, or receipt
-artifacts exist, first ensure their work is inactive, clean them up, and then start a new task.
-There is no compatibility mode or migration command.
+CCO is pre-1.0. Version `0.9.0` is the plain public, installer, and manifest identity: it has no
+build metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
+through 5.x are compressed into pre-0.9 development history; Git history remains unchanged.
+Current records are `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. If predecessor state,
+wave, lifecycle, or receipt artifacts exist, first ensure their work is inactive, clean them up,
+and then start a new task. There is no compatibility mode or migration command.
 
 ## Normal flow
 

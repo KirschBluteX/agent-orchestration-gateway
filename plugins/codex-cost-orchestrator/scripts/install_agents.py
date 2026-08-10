@@ -30,9 +30,8 @@ from workspace_guard import WorkspaceGuardError, discover_workspace
 
 
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "5.0.0"
-PLUGIN_BUILD_METADATA = "codex.20260810093311"
-PLUGIN_RELEASE = f"{PLUGIN_VERSION}+{PLUGIN_BUILD_METADATA}"
+PLUGIN_VERSION = "0.9.0"
+PLUGIN_RELEASE = PLUGIN_VERSION
 PROFILES = {
     "read": ("codex-cost-orchestrator-read-leaf.toml", "cost_orchestrator_read_leaf"),
     "write": ("codex-cost-orchestrator-write-leaf.toml", "cost_orchestrator_write_leaf"),

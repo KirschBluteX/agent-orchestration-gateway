@@ -12,7 +12,16 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
 ORCHESTRATE = PLUGIN / "skills" / "orchestrate"
 MANAGE = PLUGIN / "skills" / "manage-cco"
-RELEASE = "5.0.0+codex.20260810093311"
+RELEASE = "0.9.0"
+RELEASE_DOCUMENTS = (
+    "CHANGELOG.md",
+    "README.md",
+    "README.zh-CN.md",
+    "ROADMAP.md",
+    "docs/OPERATIONS.md",
+    "plugins/codex-cost-orchestrator/skills/manage-cco/SKILL.md",
+    "plugins/codex-cost-orchestrator/skills/manage-cco/references/operations.md",
+)
 
 
 def text(path: Path) -> str:
@@ -26,17 +35,26 @@ class ProjectContractTests(unittest.TestCase):
         changelog = text(ROOT / "CHANGELOG.md")
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
         installer = text(PLUGIN / "scripts" / "install_agents.py")
+        release_documents = [text(ROOT / path) for path in RELEASE_DOCUMENTS]
+        release_surface = "\n".join([*release_documents, json.dumps(manifest), installer])
 
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertEqual(manifest["version"], RELEASE)
-        self.assertIn('PLUGIN_VERSION = "5.0.0"', installer)
-        self.assertIn('PLUGIN_BUILD_METADATA = "codex.20260810093311"', installer)
-        self.assertIn("PLUGIN_RELEASE", installer)
-        for public in (english, chinese, changelog):
-            self.assertIn(RELEASE, public)
-        self.assertRegex(changelog, r"(?m)^## 5\.0\.0 - 2026-08-10$")
+        self.assertIn('PLUGIN_VERSION = "0.9.0"', installer)
+        self.assertIn("PLUGIN_RELEASE = PLUGIN_VERSION", installer)
+        self.assertNotIn("PLUGIN_BUILD_METADATA", installer)
+        for document in release_documents:
+            self.assertIn(RELEASE, document)
+        self.assertNotRegex(release_surface, r"\b0\.9\.0\+[A-Za-z0-9.-]+\b")
+        self.assertNotRegex(release_surface, r"\bcodex\.\d{14}\b")
+        self.assertNotRegex(release_surface, r"\b[1-9]\d*\.\d+\.\d+(?:\+[A-Za-z0-9.-]+)?\b")
+        self.assertRegex(changelog, r"(?m)^## 0\.9\.0 - 2026-08-10$")
+        self.assertIn("pre-1.0", changelog)
+        self.assertIn("2.x through 5.x", changelog)
+        self.assertIn("pre-0.9 development history", changelog)
+        self.assertIn("Git history remains unchanged", changelog)
 
     def test_hot_path_uses_one_prepare_command_and_a_quiet_wait(self) -> None:
         agents = text(ROOT / "AGENTS.md")
