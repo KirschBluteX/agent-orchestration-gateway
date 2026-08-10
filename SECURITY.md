@@ -2,122 +2,43 @@
 
 ## Report a vulnerability
 
-Use GitHub's private vulnerability reporting for this repository. Include the CCO
-version, Codex version, operating system, reproduction, affected workspace type, and
-whether a Hook or native Agent was involved. Do not attach credentials, private source,
-full task transcripts, or Codex state databases to a public issue.
+Use GitHub's private vulnerability reporting for this repository. Include the CCO version,
+Codex version, operating system, a minimal reproduction, workspace type, and whether a Hook or
+native Agent was involved. Do not attach credentials, private source, full task transcripts, or
+local state files to a public issue.
 
-## Trust model
+## Trust boundary
 
-CCO is a local workflow guardrail, not an authentication system or OS security boundary.
-The user and Primary are trusted. Codex remains the only Agent runtime. Child task
-messages, artifact IDs, lifecycle state, workspace snapshots, and tombstones protect
-against accidental scope drift, duplicate ownership, stale continuation, and late
-results; they do not defend against a malicious Primary or process with the same local
-account permissions.
+CCO is a local workflow guardrail, not an authentication system or OS security boundary. Primary,
+the local user, and the host process are trusted. Native read leaves request a read-only sandbox;
+writer leases, exact scopes, baselines, receipts, and state records prevent accidental drift, but
+do not contain a malicious process.
 
-Read leaves request a read-only sandbox. Workers receive one CCO write lease, but the
-host sandbox remains the enforcement authority. Primary must inspect the final delta.
-Owner reuse does not inherit the prior node's authority: it is limited to a clean direct
-dependency with matching role, route, assurance, and narrower scopes, and receives a new
-dispatch, task contract, workspace baseline, and acceptance check. Reviewers never reuse.
+Experimental cooperative writers are especially not a sandbox. Clean Git workspaces use managed
+worktrees; dirty Git and directory workspaces use bounded copies. Before integration CCO records
+exact backups in a bounded apply journal. Completed journal material is cleaned up; incomplete
+journals and their backups remain until a safe rollback or explicit intervention.
 
-## Local state
+## State and Hooks
 
-The default runtime root is the operating-system temporary directory under
-`codex-cost-orchestrator/v9`. It contains one immutable plan, at most one active wave
-baseline, one mutable lifecycle state per Codex task, and bounded owner tombstones.
-Wave artifacts are removed immediately after their physical dispatches settle.
+Current state uses `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. Predecessor state,
+wave, lifecycle, and receipt artifacts are rejected before use and require cleanup before a new
+task. State can reveal repository paths, objectives, routes, changed paths, and acceptance
+evidence; protect the local state directory accordingly.
 
-State may reveal repository paths, task objectives, model routes, changed paths, and
-acceptance evidence. It does not intentionally store source file contents, API keys,
-token usage, billing history, or network credentials. Apply normal local-account and
-temporary-directory protections.
+CCO ships five exact Hook definitions. It has no global all-tool matcher. Hooks bind native calls
+and results to an exact dispatch, scope, baseline, owner, and receipt. A host Hook crash or timeout
+can remain fail-open at the host boundary; retain Hook trust and inspect failures.
 
-## Hooks
+Scoped readers inspect only declared exact/prefix scopes. Normal writers are admitted one at a time
+for a canonical workspace and conflicting live work fails closed. An exact initialized-submodule
+scope treats that submodule as one bounded unit and includes its ignored content.
 
-CCO ships five synchronous definitions with exact matchers. There is no global
-`PreToolUse: .*` Hook. PreToolUse validates only native spawn, owner reuse, continuation,
-message, and interrupt tools; success-only PostToolUse settles spawn, reuse, continuation, and interrupt
-outcomes.
-SessionStart fences work at host `resume` or `clear` recovery boundaries, never during
-context compaction. Stop is an exceptional fallback for a Primary attempting to end
-while a native child turn is active. SubagentStop binds the native owner, cco.v9 result,
-cursor, wave, scopes, and workspace state. It never interprets arbitrary child prose as
-a retryable failure. Primary-observed typed native failures use explicit lifecycle
-settlement, with at most three exact same-owner retries for transient kinds. Prepared
-reservations expire defensively, but a PreToolUse-claimed call retains its lease until
-typed settlement, a terminal result, or restart recovery because Codex has no native
-tool-failure Hook.
+## Offline host-edge repair
 
-Current Codex treats a PreToolUse command crash or host timeout as fail-open. CCO keeps
-its own admission budget below the manifest timeout, bounds Git and directory inspection,
-and reserves time to roll back an unfinished claim, so ordinary deadline exhaustion
-returns an explicit block. A process killed before it can return that block cannot be
-made fail-closed by a plugin and remains part of the trusted-host boundary.
-PostToolUse uses one 3.5-second internal deadline within the host's five-second timeout;
-interrupt ownership and settlement share one workspace-coordinated transaction instead
-of consuming separate lock budgets.
-SessionStart and Stop also use 3.5-second internal deadlines. One-shot SessionStart,
-successful PostToolUse, and SubagentStop payloads are written to bounded receipt files
-before lifecycle settlement. Receipts are not a second authority: lifecycle JSON remains
-authoritative, successful receipts are deleted immediately, and exact replay is
-idempotent. An unresolved receipt prevents cleanup or a replacement plan.
-Authoritative lifecycle decisions hold the workspace and session locks. The shared
-state-root lock covers only the final path rescan and selected state load. Recovery filenames
-carry a session digest, so that scan never parses unrelated recovery payloads. Older random
-names make Hooks fail closed without opening their payloads and require the explicit
-`migrate-recoveries` cold path. Recovery staging cannot appear inside that linearization
-point while unrelated workspaces remain parallel.
-A changed workspace identity is rejected before recovery replay. Workspace verification
-also remains outside the lifecycle locks.
-Lifecycle roots are limited to 4,096 ordinary JSON files, 32 recovery files, 32 visible
-migration staging files, and 128 pending event receipts. Git output is limited to 64 MiB
-and 200,000 records; each Git control-directory digest is limited to 100,000 entries.
-Limit violations block admission and never authorize truncated evidence.
-SubagentStop has a separate internal budget below its manifest timeout. Git, filesystem,
-deadline, and state-lock unavailability request an exact result replay; they do not fence
-the owner as though it violated scope.
-
-Review and trust Hook hashes in `/hooks` after every update. Doctor never changes trust.
-
-Opaque host collaboration payloads, including encrypted reasoning objects, must remain
-in their typed host field. CCO rejects attempts to copy them through plain message or
-follow-up text.
-
-## Workspace protection
-
-Git workspaces protect the canonical root, Git directory identities, HEAD, refs, config,
-hooks, info, index, typed scopes, ignored in-scope files, path spellings, hidden status
-entries, reparses, and submodule control state. Non-Git workspaces bind the exact root,
-reject reparses and special files, enforce entry/byte budgets before hashing, and never
-run `git init`.
-
-Only one physical worker is admitted across all Codex tasks sharing a canonical
-workspace. Active prepared claims, running workers, and paused workers keep the lease.
-Cross-task readers are also excluded from overlapping active writers. Compatible read
-leaves may run beside a non-overlapping writer; their results
-permit only the known sibling writer scope and must show no read-scope delta.
-Legacy state migration is scanned from one directory snapshot. A duplicate left between
-the canonical write and legacy unlink is removed only when its normalized state and
-revision prove it is the same migration. The state-root ownership marker authorizes
-all invalid-file quarantine. An invalid random `.cco-recovery-*` file in an unmarked
-shared root remains in place and fails closed; a valid legacy lifecycle file retains
-lease authority without the marker. Stable recovery names bind the session, while exact
-content or a hash-proven direct-parent transition controls deduplication.
-Quarantine atomically stages the exact pathname object before validation and finalization,
-so it never performs a validation-then-unlink against a replaceable original pathname.
-
-## Host maintenance
-
-Hooks never edit Codex's host database. The explicit host-edge repair tool is outside
-the Hook path, requires a proof-backed retired lifecycle result, writes a minimal
-permission-restricted rollback journal under the database transaction, and operates
-only on explicitly selected spawn edges. Journals contain task identifiers; protect and
-remove them according to local policy.
-
-## Unsupported claims
-
-CCO does not guarantee a specific cost reduction, measure the real bill for a task,
-encrypt local state, or make a weak model suitable for an open contract. Benchmark
-results must state their workload, versions, route policy, and token fields.
+Codex Desktop owns its task-card database. CCO does not mutate it from a Hook. The repair utility
+is offline-only: leave the active task, keep `CODEX_THREAD_ID` unset, pass
+`--offline-confirm`, and specify exact parent and child IDs. It writes an owner-only rollback
+journal before a verified repair and retains its bounded journal history.
+The proof reader scans the complete bounded rollout lifecycle rather than trusting a terminal
+window, so an earlier interruption remains fail-closed.

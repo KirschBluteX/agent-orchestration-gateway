@@ -3,7 +3,7 @@
 
 The module has one deep interface: resolve a complete node route plan from a
 static policy, explicit user pins, and the host's native capability catalogue.
-It never contacts a network service, records billing data, or invokes another model.
+It never contacts a network service, records usage data, or invokes another model.
 """
 
 from __future__ import annotations
@@ -23,10 +23,10 @@ except ModuleNotFoundError:  # pragma: no cover - installer requires Python 3.11
 
 ROUTE_PLAN_PROTOCOL = "cco.route.v1"
 NATIVE_CATALOG_MAX_BYTES = 4 * 1024 * 1024
-MAX_FALLBACK_CANDIDATES = 4
+MAX_FALLBACK_CANDIDATES = 6
 ASSURANCES = frozenset({"mechanical", "bounded", "guarded"})
 ROLES = frozenset({"explorer", "worker", "reviewer"})
-NATIVE_MULTI_AGENT_VERSIONS = frozenset({"v1", "v2"})
+NATIVE_MULTI_AGENT_VERSION = "v2"
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EFFORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 NODE_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
@@ -34,21 +34,17 @@ NODE_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
 DEFAULT_ROUTE_MODELS: dict[tuple[str, str], tuple[str, ...]] = {
     ("explorer", "mechanical"): ("gpt-5.6-luna", "gpt-5.6-terra"),
     ("worker", "mechanical"): ("gpt-5.6-luna", "gpt-5.6-terra"),
-    ("explorer", "bounded"): ("gpt-5.6-terra", "gpt-5.6-luna"),
-    ("worker", "bounded"): ("gpt-5.6-terra", "gpt-5.6-luna"),
+    ("explorer", "bounded"): ("gpt-5.6-terra",),
+    ("worker", "bounded"): ("gpt-5.6-terra",),
     ("explorer", "guarded"): ("gpt-5.6-terra",),
     ("worker", "guarded"): ("gpt-5.6-terra",),
     ("reviewer", "guarded"): ("gpt-5.6-terra",),
 }
 EFFORT_PRIORITY = ("max", "xhigh", "high")
+
+
 class RoutingCatalogError(ValueError):
     """A route cannot be safely resolved from local facts."""
-
-
-def _text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise RoutingCatalogError(f"{label} must be non-empty text")
-    return value
 
 
 def _unique_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -90,7 +86,7 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
         if "visibility" in model and model.get("visibility") not in {"list", "visible", "picker"}:
             continue
         version = model.get("multi_agent_version")
-        if version not in NATIVE_MULTI_AGENT_VERSIONS:
+        if version != NATIVE_MULTI_AGENT_VERSION:
             continue
         slug = model.get("slug")
         if not isinstance(slug, str) or MODEL_RE.fullmatch(slug) is None:
@@ -131,6 +127,28 @@ def _sol_family(model: str) -> bool:
 
 def _luna_family(model: str) -> bool:
     return "luna" in model.casefold()
+
+
+def _terra_family(model: str) -> bool:
+    return "terra" in model.casefold()
+
+
+def _automatic_model_allowed(role: str, assurance: str, model: str) -> bool:
+    if _sol_family(model):
+        return False
+    if role in {"explorer", "worker"} and assurance == "mechanical":
+        return _luna_family(model) or _terra_family(model)
+    return _terra_family(model)
+
+
+def _automatic_candidate_order(
+    role: str, assurance: str, pair: Mapping[str, str]
+) -> tuple[int, str, int]:
+    model = pair["model"]
+    family = 0 if _luna_family(model) else 1
+    if role not in {"explorer", "worker"} or assurance != "mechanical":
+        family = 0
+    return (family, model, EFFORT_PRIORITY.index(pair["effort"]))
 
 
 def _normalize_constraints(value: object, label: str) -> dict[str, str | None]:
@@ -197,13 +215,20 @@ def _validate_policy_candidates(role: str, assurance: str, candidates: object, l
             raise RoutingCatalogError(
                 "automatic configuration effort must be max, xhigh, or high"
             )
-        if _sol_family(pair["model"]):
-            raise RoutingCatalogError("automatic configuration cannot include Sol")
-        if (role == "reviewer" or assurance == "guarded") and _luna_family(pair["model"]):
-            raise RoutingCatalogError("reviewer/guarded configuration cannot include Luna")
+        if not _automatic_model_allowed(role, assurance, pair["model"]):
+            raise RoutingCatalogError(
+                "automatic configuration violates the Luna/Terra route policy"
+            )
         normalized.append(pair)
     if len({(item["model"], item["effort"]) for item in normalized}) != len(normalized):
         raise RoutingCatalogError(f"{label}.candidates must be duplicate-free")
+    if normalized != sorted(
+        normalized,
+        key=lambda item: _automatic_candidate_order(role, assurance, item),
+    ):
+        raise RoutingCatalogError(
+            f"{label}.candidates must preserve automatic route preference"
+        )
     return normalized
 
 
@@ -261,49 +286,47 @@ def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, 
         supported.setdefault(record["model"], set()).add(record["effort"])
 
     policy_key = f"{request['role']}.{request['assurance']}"
-    if constraints["source"] == "automatic" and policy_key in policy:
-        exact = [
-            dict(pair)
-            for pair in policy[policy_key]
-            if pair["effort"] in supported.get(pair["model"], set())
-        ][:MAX_FALLBACK_CANDIDATES]
-        if not exact:
-            raise RoutingCatalogError(
-                "configured route has no supported native Agent candidate; keep the node in Primary"
-            )
-        return exact
-
-    if constraints["source"] == "user" and fixed_model is not None:
-        model_candidates = [fixed_model]
-    else:
-        configured = _policy_models(policy, request["role"], request["assurance"])
-        model_candidates = [item["model"] for item in configured]
-
-    candidates: list[dict[str, str]] = []
-    for model in model_candidates:
-        efforts = supported.get(model, set())
-        requested_effort = fixed_effort
-        if constraints["source"] == "user" and fixed_model is None:
-            # An effort-only pin still permits the policy's model order.
-            requested_effort = fixed_effort
-        elif constraints["source"] == "automatic" and policy_key in policy:
-            # A project/global policy entry is an exact user-authored pair.  The
-            # built-in table is model-only and therefore adapts effort locally.
-            configured_pair = next(
-                (item for item in _policy_models(policy, request["role"], request["assurance"]) if item["model"] == model),
-                None,
-            )
-            requested_effort = configured_pair["effort"] if configured_pair else None
-        for effort in _effort_order(efforts, requested_effort):
-            pair = {"effort": effort, "model": model}
-            if pair not in candidates:
-                candidates.append(pair)
-            if constraints["source"] == "automatic":
-                # Automatic routes choose one effort per model.  A model-only user
-                # pin keeps the model fixed while precompiling its effort fallback.
+    if constraints["source"] == "automatic":
+        if policy_key in policy:
+            exact = [
+                dict(pair)
+                for pair in policy[policy_key]
+                if pair["effort"] in supported.get(pair["model"], set())
+            ][:MAX_FALLBACK_CANDIDATES]
+            if not exact:
+                raise RoutingCatalogError(
+                    "configured route has no supported native Agent candidate; keep the node in Primary"
+                )
+            return exact
+        candidates: list[dict[str, str]] = []
+        for model in _default_models(request["role"], request["assurance"]):
+            for effort in _effort_order(supported.get(model, set())):
+                candidates.append({"effort": effort, "model": model})
+                if len(candidates) >= MAX_FALLBACK_CANDIDATES:
+                    break
+            if len(candidates) >= MAX_FALLBACK_CANDIDATES:
                 break
-        if len(candidates) >= MAX_FALLBACK_CANDIDATES:
-            break
+    else:
+        if fixed_model is not None:
+            model_candidates = [fixed_model]
+        else:
+            configured = _policy_models(
+                policy, request["role"], request["assurance"]
+            )
+            model_candidates = []
+            for configured_pair in configured:
+                if configured_pair["model"] not in model_candidates:
+                    model_candidates.append(configured_pair["model"])
+        candidates = []
+        for model in model_candidates:
+            for effort in _effort_order(supported.get(model, set()), fixed_effort):
+                pair = {"effort": effort, "model": model}
+                if pair not in candidates:
+                    candidates.append(pair)
+                if len(candidates) >= MAX_FALLBACK_CANDIDATES:
+                    break
+            if len(candidates) >= MAX_FALLBACK_CANDIDATES:
+                break
 
     if constraints["source"] == "user" and route_pair_is_fully_fixed(constraints):
         if not candidates:

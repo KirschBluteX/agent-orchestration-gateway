@@ -1,58 +1,35 @@
 ---
 name: orchestrate
 description: >-
-  Local control plane for any Codex native subagent requested by the user, AGENTS.md, or another
-  skill. Route closed work through static Luna/Terra profiles while Primary keeps intent and final
-  authority; never call spawn_agent directly around this skill.
+  Route closed Codex work through one local CCO prepare command while Primary keeps intent and
+  final authority. Do not call native spawn tools directly around this skill.
 ---
 
 # Orchestrate with CCO
 
-Keep unresolved product, architecture, integration, and final acceptance choices in Primary.
-Route every requested native child through CCO; never add a direct-spawn bypass.
+Delegate closed, typed-scope work by default. Keep only Primary authority or clarification,
+an explicit direct request, and one declared tool bounded below 30 seconds in Primary.
 
-For the first wave, pipe compact JSON directly to one command; do not inspect source, call
-`--help`, or create a contract file:
+Send one schema-validated `cco.delegation.v1` request to this command. Its scopes are
+repository-relative `exact` or `prefix` objects; `work` is an atomic task, a closed DAG,
+or a stateless `cco.planner-proposal.v1` DAG input.
 
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --capacity <N>
 ```
 
-A single child requires `role` (`explorer|worker|reviewer`), `objective`, acceptance strings, and
-`scopes` as `{"kind":"file|tree","path":"repo/relative"}`. Optional fields are `goal`,
-`decision`, `verification`, `risks`, `pin`, and `context_turns`. A DAG adds `nodes`, per-node `id`,
-and optional `depends_on` or `review_of`; use top-level acceptance IDs only for shared evidence.
-Mechanical means every allowed choice is acceptance-equivalent.
+For complex unresolved work, one ordinary Terra/max read-only planner task may produce the
+proposal before this command. Do not create a planner route, planner lifecycle, contract file,
+or direct-spawn bypass.
 
-Delegate only closed, scoped, independently verifiable work with no user interaction or
-irreversible external action. Structural value exists when it is likely to wake Primary more than
-once, compress a long or compacted thread into a short capsule, reuse a compatible idle owner, run
-conflict-free beside another node, or isolate a probe. Predictive signals include at least two tool
-round trips, more than two files not already in context, over 60 seconds, or over 64 KiB of output;
-a single long deterministic test, build, lint, benchmark, or probe qualifies. Use explorer for
-read-only work and worker for declared writes. Keep one-wakeup microtasks and unresolved choices in
-Primary. Mechanical work prefers the cheapest supported route, normally Luna/max; bounded,
-guarded, and reviewer work prefer Terra. Effort order is `max`, `xhigh`, then `high`; only a current
-explicit user pin may select Sol. Primary must not rerun successful delegated evidence.
+Invoke every returned `tool_name` with only its exact `tool_input`. Do not expose model or
+cost reasoning in normal output. CCO applies static routing, baselines, owner reuse, and the
+assurance ladder. Guarded work receives one final reviewer unless the current plan explicitly
+sets `accept_risk: true`.
 
-Do not pass a session ID. Invoke each returned `tool_name` with only its exact `tool_input`. CCO may
-reuse one idle explorer or worker only when its clean direct dependency has the same role, route,
-assurance, and covering scope. Aggregates, ambiguity, retry, scope expansion, inherited context,
-and reviewers spawn fresh; reuse still gets a new contract, baseline, and acceptance check.
+After dispatch, repeat long `wait_agent` windows without progress narration until completion or
+required attention. A `timed_out` result is only an expired wait window: do not retry the child or
+duplicate its work. Use typed `native-failure` only for a host-observed failure.
 
-After dispatch, enter one long `wait_agent`. Do not poll, duplicate work, overlap Primary work, or
-forward protected payloads. `{"timed_out":true}` is only a wait-window expiry; wait again and never
-report it as `native-failure`.
-
-For typed native failure, run `native-failure` and follow its envelope: unsupported model=
-`route_rejected`, missing reused owner=`owner_unavailable`, 429=`rate_limit`, transport=`network`,
-deadline=`timeout`, temporary 5xx=`service`, otherwise `other`. Never infer failure from prose.
-Unavailable reuse falls back once; transient failures retry the unchanged call at most three times.
-
-Hooks bind result claims to dispatch, cursor, baseline, scope, acceptance IDs, and owner. Call
-`next` only after settlement. Primary inspects the delta and owns final acceptance. Use reviewer
-only for semantic/manual evidence, risk, deviation, Primary changes, or explicit request; only
-`accept` satisfies its gate.
-
-Use `$codex-cost-orchestrator:manage-cco` only for installation, doctor, policy, status,
-continuation, retry, restart recovery, or cleanup.
+Use `$codex-cost-orchestrator:manage-cco` only for installation, trust, lifecycle commands,
+cleanup, or offline host-edge maintenance.

@@ -1,8 +1,12 @@
 # Repository agent policy
 
-Use `codex-cost-orchestrator:orchestrate` implicitly for work in this repository; the
-user does not need to name it. Its `SKILL.md` is the single orchestration policy.
+Use `codex-cost-orchestrator:orchestrate` implicitly for this repository.
 
-Every visible native Agent spawn must use CCO. Never fall back to an unrouted generic
-child. Primary retains intent, architecture, integration, verification, and final
-acceptance. Preserve pre-existing work and follow the repository's verified interfaces.
+Delegate closed, scoped, independently verifiable work by default through its one
+canonical `prepare` command. Keep work in Primary only for authority or clarification,
+an explicit direct request, or one declared tool bounded below 30 seconds. Invoke only
+the returned native action and exact input. After dispatch, repeat long `wait_agent`
+windows until completion or required attention; a timeout is only an expired wait window.
+Do not narrate unchanged progress or duplicate delegated work. Keep model and cost
+reasoning out of normal output. Primary retains intent, integration, and final
+acceptance; preserve pre-existing work and verified interfaces.

@@ -1,16 +1,12 @@
 # Contributing
 
-Issues and focused pull requests are welcome. Please do not include secrets, private
-task content, credentials, or unredacted Codex logs.
+Focused issues and pull requests are welcome. Do not include secrets, credentials,
+private task content, or unredacted Codex logs.
 
 ## Development
 
-Requirements:
-
-- Python 3.11 or newer;
-- dependencies from `requirements.txt` (needed for compressed rollouts before Python 3.14);
-- Git;
-- Codex CLI only for live native-catalog and end-to-end checks.
+Use Python 3.11+ and install `requirements.txt`; `zstandard` is required on Python versions
+below 3.14. Codex CLI is needed only for live native-catalog and end-to-end checks.
 
 Run before opening a pull request:
 
@@ -24,15 +20,17 @@ python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skill
 git diff --check
 ```
 
-## Design boundaries
+## Project boundaries
 
-- Codex native Agent tools remain the only Agent runtime.
-- Primary owns unresolved choices, integration conflicts, and final acceptance.
-- Only closed, typed-scope work is eligible for a leaf.
-- Runtime model routing remains static, local, network-free, and user-overridable.
-- Do not add billing/token history, telemetry, provider sessions, daemons, or a
-  database without an explicit project decision.
+- Keep the canonical `cco.delegation.v1` compiler input closed and schema validated.
+- Keep one deterministic assurance ladder and static Luna/Terra automatic routes.
+- Preserve exact/prefix scope handling, scoped reader scans, Primary final authority, and the
+  current wave/lifecycle/receipt protocols.
+- Treat cooperative writers as experimental copies/worktrees with bounded backup journals, never
+  as a security sandbox.
+- Do not add compatibility adapters, a second planner lifecycle, host background work, or external
+  accounting services without an explicit project decision.
 - Preserve user-owned files and unrelated worktree changes.
 
-Behavior changes should include focused public tests and matching English and Chinese
-documentation where they affect installation or normal use.
+Behavior changes need focused tests and matching English and Chinese documentation when they affect
+installation or normal use.

@@ -1,8 +1,8 @@
 # Reproducible benchmark protocol
 
-Benchmarking is an explicit development activity outside the CCO runtime. The
-plugin does not collect billing, token, or telemetry history. A benchmark run may
-read the local Codex JSONL events for that run and store a user-approved result file.
+Benchmarking is an explicit development activity outside the CCO runtime. A benchmark
+run may read local Codex JSONL events for that run and store a user-approved result
+file; it is not a runtime reporting service.
 
 ## Current pilot
 
@@ -20,8 +20,8 @@ Every task is run in two paired arms:
 
 The task statement, base commit, and acceptance hash are identical in each pair.
 The plan generator balances which arm runs first and produces 12 immutable run IDs.
-The pilot is a development set for finding orchestration defects; its score is not
-a public model or cost claim.
+The pilot is a development set for finding orchestration defects; its score is not a
+public model-performance or economic claim.
 
 ## Local workflow
 
@@ -80,9 +80,8 @@ python -m benchmarks.cco_benchmark summarize \
 
 Missing, mismatched, unexpected-model, or overwritten results fail closed. `summarize`
 still prints the machine-readable missing IDs but exits non-zero when any planned result
-is absent, so automation cannot publish an incomplete study. Cost is reported only when
-the host exposes a trustworthy usage value; otherwise the report must not infer a
-currency amount.
+is absent, so automation cannot publish an incomplete study. The report contains only
+host-provided usage values and never infers a price.
 
 ## Comparison discipline
 
@@ -95,4 +94,4 @@ set or combine runs from different Codex/model revisions.
 Record the exact task and acceptance IDs, repository and Codex revisions, model and
 effort, wall time, Primary/child generations, route rejections, reviewer findings,
 and scope/late-result violations. Publish raw manifests and exclusions alongside any
-future public result; do not advertise a fixed savings percentage from one pilot.
+future public result; do not advertise a fixed outcome from one pilot.

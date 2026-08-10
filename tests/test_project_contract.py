@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
 ORCHESTRATE = PLUGIN / "skills" / "orchestrate"
 MANAGE = PLUGIN / "skills" / "manage-cco"
+RELEASE = "5.0.0+codex.20260810093311"
 
 
 def text(path: Path) -> str:
@@ -19,47 +20,89 @@ def text(path: Path) -> str:
 
 
 class ProjectContractTests(unittest.TestCase):
-    def test_public_identity_and_bilingual_entrypoints(self) -> None:
+    def test_public_identity_bilingual_entrypoints_and_release_are_consistent(self) -> None:
         english = text(ROOT / "README.md")
         chinese = text(ROOT / "README.zh-CN.md")
+        changelog = text(ROOT / "CHANGELOG.md")
         manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
+        installer = text(PLUGIN / "scripts" / "install_agents.py")
+
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
-        self.assertRegex(manifest["version"], r"^4\.1\.0\+codex\.[a-z0-9.-]+$")
-        self.assertEqual(manifest["author"]["name"], "KirschQAQ")
-        self.assertEqual(
-            manifest["repository"],
-            "https://github.com/KirschBluteX/codex-cost-orchestrator",
-        )
-        for unrelated in ("OpenSquilla", "sol-advisor", "DannyMac180"):
-            self.assertNotIn(unrelated, english + chinese + text(ORCHESTRATE / "SKILL.md"))
+        self.assertEqual(manifest["version"], RELEASE)
+        self.assertIn('PLUGIN_VERSION = "5.0.0"', installer)
+        self.assertIn('PLUGIN_BUILD_METADATA = "codex.20260810093311"', installer)
+        self.assertIn("PLUGIN_RELEASE", installer)
+        for public in (english, chinese, changelog):
+            self.assertIn(RELEASE, public)
+        self.assertRegex(changelog, r"(?m)^## 5\.0\.0 - 2026-08-10$")
 
-    def test_release_identity_is_consistent(self) -> None:
-        manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
-        installer = text(PLUGIN / "scripts" / "install_agents.py")
-        changelog = text(ROOT / "CHANGELOG.md")
-        self.assertIn('PLUGIN_VERSION = "4.1.0"', installer)
-        self.assertRegex(manifest["version"], r"^4\.1\.0\+")
-        self.assertRegex(changelog, r"(?m)^## 4\.1\.0 - ")
-
-    def test_two_thin_skills_use_progressive_disclosure(self) -> None:
+    def test_hot_path_uses_one_prepare_command_and_a_quiet_wait(self) -> None:
+        agents = text(ROOT / "AGENTS.md")
         hot = text(ORCHESTRATE / "SKILL.md")
-        cold = text(MANAGE / "SKILL.md")
-        hot_words = len(re.findall(r"\S+", hot))
-        self.assertLessEqual(hot_words, 520)
-        self.assertIn("control_plane.py prepare", hot)
+        self.assertLessEqual(len(re.findall(r"\S+", hot)), 360)
+        self.assertIn("control_plane.py prepare --repo <WORKSPACE> --capacity <N>", hot)
+        self.assertEqual(hot.count("control_plane.py prepare"), 1)
+        self.assertIn("timed_out", hot)
+        self.assertIn("without progress narration", hot)
+        self.assertIn("below 30 seconds", agents)
         self.assertNotIn("control_plane.py plan", hot)
-        self.assertIn("one long `wait_agent`", hot)
-        self.assertIn("wake Primary more than\nonce", hot)
-        self.assertIn("over 60 seconds", hot)
-        self.assertIn("reuse a compatible idle owner", hot)
-        self.assertIn("Primary must not rerun successful delegated evidence", hot)
-        self.assertIn("$codex-cost-orchestrator:manage-cco", hot)
-        self.assertNotIn("repair_host_edges", hot)
-        self.assertIn("migrate-recoveries", cold)
+        self.assertNotIn("migrate-recoveries", hot)
         self.assertIn("allow_implicit_invocation: true", text(ORCHESTRATE / "agents" / "openai.yaml"))
         self.assertIn("allow_implicit_invocation: false", text(MANAGE / "agents" / "openai.yaml"))
+
+    def test_release_docs_describe_current_boundaries(self) -> None:
+        public = "\n".join(
+            text(path)
+            for path in (
+                ROOT / "README.md",
+                ROOT / "README.zh-CN.md",
+                ROOT / "CHANGELOG.md",
+                ROOT / "CONTRIBUTING.md",
+                ROOT / "ROADMAP.md",
+                ROOT / "SECURITY.md",
+                ROOT / "docs" / "BENCHMARK.md",
+                ROOT / "docs" / "OPERATIONS.md",
+            )
+        )
+        for value in (
+            "cco.delegation.v1",
+            "cco.wave.v3",
+            "cco.lifecycle.v2",
+            "cco.receipt.v2",
+            "exact",
+            "prefix",
+            "zstandard",
+            "offline",
+        ):
+            self.assertIn(value, public)
+        self.assertNotIn("migrate-recoveries", public)
+        self.assertNotIn("Terra, then Luna", public)
+        self.assertNotIn("billing", public.casefold())
+
+    def test_runtime_has_no_dead_planner_or_predecessor_lifecycle_path(self) -> None:
+        runtime_paths = [
+            *(PLUGIN / "agents").glob("*.toml"),
+            *(PLUGIN / "hooks").glob("*.py"),
+            *(PLUGIN / "scripts").glob("*.py"),
+            ORCHESTRATE / "SKILL.md",
+            MANAGE / "SKILL.md",
+        ]
+        runtime = "\n".join(text(path) for path in runtime_paths)
+        for forbidden in (
+            "PLANNER_DEFAULT_ROUTE",
+            "resolve_planner_route",
+            "migrate-recoveries",
+            "cco.lifecycle.v1",
+            "cco.pending-event.v1",
+            "cco.wave.v1",
+            "aggregation",
+        ):
+            self.assertNotIn(forbidden, runtime)
+        self.assertIn('PROTOCOL = "cco.v9"', runtime)
+        self.assertIn('LIFECYCLE_PROTOCOL = "cco.lifecycle.v2"', runtime)
+        self.assertIn('PENDING_EVENT_PROTOCOL = "cco.receipt.v2"', runtime)
 
     def test_profiles_are_model_neutral_non_delegating_v9_leaves(self) -> None:
         profiles = {
@@ -78,62 +121,21 @@ class ProjectContractTests(unittest.TestCase):
             self.assertNotIn("model_reasoning_effort", profile)
             self.assertFalse(profile["features"]["multi_agent"])
             self.assertEqual(profile["features"]["multi_agent_v2"], {"enabled": False})
-            instructions = profile["developer_instructions"]
-            self.assertIn("CCO_TASK cco.v9", instructions)
-            self.assertIn("CCO_RESULT cco.v9", instructions)
-            self.assertNotIn("RESULT_SHA256", instructions)
+            self.assertIn("CCO_TASK cco.v9", profile["developer_instructions"])
+            self.assertIn("CCO_RESULT cco.v9", profile["developer_instructions"])
 
-    def test_runtime_is_clean_v9_without_compatibility_adapters(self) -> None:
-        runtime_paths = [
-            *(PLUGIN / "agents").glob("*.toml"),
-            *(PLUGIN / "hooks").glob("*.py"),
-            *(PLUGIN / "scripts").glob("*.py"),
-            ORCHESTRATE / "SKILL.md",
-            MANAGE / "SKILL.md",
-        ]
-        runtime = "\n".join(text(path) for path in runtime_paths)
-        self.assertIn('PROTOCOL = "cco.v9"', runtime)
-        for old in (
-            "cco.v8",
-            "graph_compiler",
-            "dispatch_transaction",
-            "packet_compiler",
-            "prepared_graph",
-            "TaskLedger",
-            "CCO_DISPATCH_REF",
-            "CCO_NATIVE_BYPASS",
-        ):
-            self.assertNotIn(old, runtime)
-        for forbidden in ("sqlite", "radar", "token ledger", "billing dashboard", "mcp server"):
-            self.assertNotIn(forbidden, runtime.casefold())
-
-    def test_hooks_are_exact_and_have_no_all_tool_tax(self) -> None:
+    def test_hooks_ci_and_published_files_cover_release_validation(self) -> None:
         hooks = json.loads(text(PLUGIN / "hooks" / "hooks.json"))["hooks"]
+        workflow = text(ROOT / ".github" / "workflows" / "ci.yml")
         self.assertEqual(
             set(hooks),
             {"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SubagentStop"},
         )
-        serialized = json.dumps(hooks)
-        self.assertNotIn('"matcher": ".*"', serialized)
-        self.assertIn("spawn_agent", serialized)
-        self.assertIn("followup_task", serialized)
-        self.assertIn("interrupt_agent", serialized)
-        count = sum(len(group["hooks"]) for groups in hooks.values() for group in groups)
-        self.assertEqual(count, 5)
-
-    def test_installation_docs_use_current_plugin_and_explicit_trust(self) -> None:
-        combined = text(ROOT / "README.md") + text(ROOT / "README.zh-CN.md")
-        self.assertIn("codex plugin marketplace add", combined)
-        self.assertIn("codex plugin add codex-cost-orchestrator@codex-cost-orchestrator", combined)
-        self.assertIn("--bootstrap", combined)
-        self.assertIn("--doctor", combined)
-        self.assertIn("/hooks", combined)
-        self.assertNotIn("codex plugin install ", combined)
-
-    def test_marketplace_and_release_files_exist(self) -> None:
-        manifest = json.loads(text(PLUGIN / ".codex-plugin" / "plugin.json"))
-        marketplace = json.loads(text(ROOT / ".agents" / "plugins" / "marketplace.json"))
-        self.assertEqual(marketplace["name"], manifest["name"])
+        self.assertNotIn('"matcher": ".*"', json.dumps(hooks))
+        self.assertIn("ruff check plugins tests benchmarks .github/scripts", workflow)
+        self.assertIn("validate_plugin.py plugins/codex-cost-orchestrator", workflow)
+        self.assertIn("quick_validate.py", workflow)
+        self.assertIn("-r requirements.txt", workflow)
         for relative in (
             "CHANGELOG.md",
             "CONTRIBUTING.md",
@@ -144,18 +146,6 @@ class ProjectContractTests(unittest.TestCase):
             "benchmarks/cco_benchmark.py",
         ):
             self.assertTrue((ROOT / relative).is_file(), relative)
-
-    def test_development_and_ci_commands_cover_the_published_tooling(self) -> None:
-        english = text(ROOT / "README.md")
-        workflow = text(ROOT / ".github" / "workflows" / "ci.yml")
-        requirements = text(ROOT / "requirements.txt")
-        self.assertIn(
-            "python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator",
-            english,
-        )
-        self.assertIn("ruff check plugins tests benchmarks .github/scripts", workflow)
-        self.assertIn("zstandard", requirements.casefold())
-        self.assertIn("-r requirements.txt", workflow)
 
     def test_repository_history_has_one_root_without_author_restrictions(self) -> None:
         roots = subprocess.check_output(

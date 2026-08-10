@@ -24,8 +24,11 @@ from protocol_hash import (
     require_repository_scope,
 )
 from workspace_state import (
+    IGNORED_POLICY_GLOBAL_V1,
+    IGNORED_POLICY_SCOPED_READER_V1,
     StateError,
     StateUnavailable,
+    ignored_scope_digest,
     normalize_allow,
     repository_control_roots,
     repository_gitlinks,
@@ -33,6 +36,7 @@ from workspace_state import (
     repository_path_spelling_map,
     repository_root,
     state_payload,
+    snapshot_ignored_policy,
     validate_snapshot,
     verify,
 )
@@ -190,6 +194,8 @@ def capture(
 ) -> dict[str, Any]:
     """Capture one immutable wave baseline."""
 
+    if type(writable) is not bool:
+        raise WorkspaceGuardError("wave baseline writable flag is invalid")
     backend, workspace = discover_workspace(root)
     control_roots = None
     index_records = None
@@ -210,11 +216,17 @@ def capture(
     )[0]
     try:
         if backend == "git":
+            ignored_policy = (
+                IGNORED_POLICY_GLOBAL_V1
+                if writable
+                else IGNORED_POLICY_SCOPED_READER_V1
+            )
             snapshot = state_payload(
                 workspace,
                 control_roots=control_roots,
                 index_records=index_records,
                 ignored_mode=workspace_mode,
+                ignored_policy=ignored_policy,
                 scopes=normalized,
             )
         else:
@@ -275,6 +287,18 @@ def validate_baseline(value: object) -> dict[str, Any]:
         raise WorkspaceGuardError(str(error)) from error
     if snapshot.get("state_id") != value.get("state_id"):
         raise WorkspaceGuardError("wave baseline identity is inconsistent")
+    if value["backend"] == "git":
+        ignored_policy = snapshot_ignored_policy(snapshot)
+        if ignored_policy == IGNORED_POLICY_SCOPED_READER_V1 and value["writable"]:
+            raise WorkspaceGuardError(
+                "writable wave cannot use the scoped reader ignored policy"
+            )
+        if ignored_policy == IGNORED_POLICY_SCOPED_READER_V1 and snapshot.get(
+            "ignored_scope_digest"
+        ) != ignored_scope_digest(scopes):
+            raise WorkspaceGuardError(
+                "scoped reader ignored policy does not match wave scopes"
+            )
     return {
         "backend": value["backend"],
         "protocol": PROTOCOL,

@@ -30,7 +30,9 @@ from workspace_guard import WorkspaceGuardError, discover_workspace
 
 
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "4.1.0"
+PLUGIN_VERSION = "5.0.0"
+PLUGIN_BUILD_METADATA = "codex.20260810093311"
+PLUGIN_RELEASE = f"{PLUGIN_VERSION}+{PLUGIN_BUILD_METADATA}"
 PROFILES = {
     "read": ("codex-cost-orchestrator-read-leaf.toml", "cost_orchestrator_read_leaf"),
     "write": ("codex-cost-orchestrator-write-leaf.toml", "cost_orchestrator_write_leaf"),
@@ -295,7 +297,7 @@ def load_hook_inventory(
                     "clientInfo": {
                         "name": "cco_doctor",
                         "title": "CCO Doctor",
-                        "version": PLUGIN_VERSION,
+                        "version": PLUGIN_RELEASE,
                     },
                 },
             }
@@ -342,7 +344,7 @@ def doctor(
     hooks = plugin_root / "hooks" / "hooks.json"
     try:
         manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
-        if not str(manifest_value.get("version", "")).startswith(PLUGIN_VERSION):
+        if manifest_value.get("version") != PLUGIN_RELEASE:
             errors.append("plugin manifest version does not match the installer")
         hook_value = json.loads(hooks.read_text(encoding="utf-8"))["hooks"]
         if set(hook_value) != {"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SubagentStop"}:

@@ -1,99 +1,39 @@
 # CCO operations
 
-Normal tasks use the thin `orchestrate` skill. This document covers installation,
-configuration, lifecycle recovery, and explicit host maintenance.
+Normal tasks use the thin `orchestrate` skill. This guide covers installation, lifecycle
+commands, cooperative isolation, and explicit host maintenance.
 
 ## Install or update
 
-From the repository root:
-
 ```text
+python -m pip install -r requirements.txt
 codex plugin marketplace add .
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
-python -m pip install -r requirements.txt
 python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --bootstrap
-```
-
-Add `--replace` only when intentionally replacing the two exact CCO profile files.
-The installer stages both profiles before replacement and rolls back a partial write.
-It does not overwrite another filename or remove modified content.
-
-An update may leave an already active `cco.wave.v1` artifact. CCO accepts that artifact
-only until its existing work settles; continuation context is recovered from the
-immutable wave instead of the mutable follow-up input. Every newly created wave uses
-v2, so updating does not require interrupting active v1 children first.
-
-Open `/hooks`, review and trust these five definitions:
-
-1. SessionStart
-2. exact PreToolUse for native spawn, continuation, message, and interrupt tools
-3. exact success-only PostToolUse for spawn, continuation, and interrupt settlement
-4. Stop fallback
-5. SubagentStop for the two CCO leaf profiles
-
-Session recovery runs only for `resume` or `clear`; context compaction does not fence
-live child work. A terminal CCO result returns `continue:false` so another matching Hook
-cannot accidentally run the completed child again.
-
-Start a new Codex task, then run:
-
-```text
 python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
 ```
 
-Doctor is read-only. It verifies Python, exact profiles, manifest identity, Hook
-discovery/trust, and at least one route under the workspace-effective static policy.
+Python 3.11+ is required; `zstandard` is required on Python versions below 3.14. Review and trust
+the five CCO entries in `/hooks`, then start a new Codex task.
 
-## Normal control-plane flow
+Version `5.0.0+codex.20260810093311` is breaking. Current records are `cco.wave.v3`,
+`cco.lifecycle.v2`, and `cco.receipt.v2`. If predecessor state, wave, lifecycle, or receipt
+artifacts exist, first ensure their work is inactive, clean them up, and then start a new task.
+There is no compatibility mode or migration command.
 
-`control_plane.py` reads the current task from `CODEX_THREAD_ID`. Do not pass another
-task's ID.
+## Normal flow
+
+Use the single canonical preparation command:
 
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <PROJECT> --capacity <N>
 ```
 
-`prepare` reads a compact brief from stdin, creates the plan, captures one baseline, and
-returns `action`, `tool_name`, and `tool_input` envelopes for the first ready wave. A
-single child needs `role`, `objective`, acceptance criterion strings, and scopes. A compact DAG uses `goal` and
-`nodes`; every node adds `id` and may add `depends_on` or `review_of`. External scopes use
-`file` or `tree`.
-
-```json
-{
-  "goal": "Update and verify the parser",
-  "nodes": [
-    {
-      "id": "parser_change",
-      "role": "worker",
-      "objective": "Implement the closed parser change",
-      "acceptance": [
-        "The parser accepts the new form",
-        "Existing forms remain valid"
-      ],
-      "scopes": [{"kind": "tree", "path": "src/parser"}]
-    }
-  ]
-}
-```
-
-When nodes must share named acceptance IDs, submit a full brief with top-level
-`acceptance` to the same `prepare` command. An exact retry resumes an identical plan only
-while it has not produced a wave; replacing a plan still requires explicit inactive
-cleanup. No form needs a temporary contract file.
-
-Omitted `decision` means bounded judgment. Set `decision` to `mechanical` only when
-all allowed choices are acceptance-equivalent. `verification=semantic|manual` or a
-non-empty `risks` list raises the route to guarded.
-
-`prepare` and `next` return the same action envelope for a fresh spawn or strict owner reuse.
-Invoke only `tool_name` with the exact `tool_input`, then enter
-one long `wait_agent`. Call `next` only after the current wave settles. It advances
-logical dependencies from lifecycle evidence; Primary never supplies completed nodes.
-`wait_agent` returning `timed_out:true` means only that the wait window ended. The child
-is still active: enter another long wait and do not call `native-failure`.
-
-## Lifecycle operations
+Send a closed `cco.delegation.v1` envelope on stdin. Each repository scope is an exact or prefix
+object. Invoke returned `tool_name` values only with their supplied `tool_input`. `next` advances a
+settled plan. After dispatch, repeat long `wait_agent` windows until completion or required
+attention. A `timed_out` result means another long wait, not a retry, progress report, or duplicate
+execution.
 
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py status
@@ -103,163 +43,28 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py abandon --node <node_id>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py retry --node <node_id>
 python -B <PLUGIN_ROOT>/scripts/control_plane.py restart
 python -B <PLUGIN_ROOT>/scripts/control_plane.py cleanup
-python -B <PLUGIN_ROOT>/scripts/control_plane.py migrate-recoveries
 ```
 
-- `continue` reads a non-empty JSON evidence delta from stdin and returns
-  `action`, `tool_name`, and `tool_input`. Invoke `tool_name` with only `tool_input`;
-  do not pass the outer metadata to the native tool.
-- `native-failure` settles one Primary-observed typed host failure. Supported kinds are
-  `rate_limit`, `network`, `timeout`, `service`, `route_rejected`, `owner_unavailable`,
-  and `other`. When its
-  result has a non-null `tool_name`, invoke it with only the returned `tool_input`.
-  Transient failures permit at most three exact retries of the same native owner.
-- `owner_unavailable` applies only to a prepared reused owner and converts that dispatch
-  once to a fresh `spawn_agent` action without weakening its task or workspace contract.
-- `abandon` fences paused work and releases its write lease.
-- `retry` creates a guarded newer generation for a fenced logical node.
-- `restart` fences active prepared claims, running turns, and paused turns. Inspect the
-  workspace before retrying.
-- `cleanup` deletes only the current task's inactive state and artifacts. It refuses
-  active or paused child work; retain state until host-card maintenance is unnecessary.
-- `migrate-recoveries` is a root-wide, cold-path recovery operation and does not require
-  `CODEX_THREAD_ID`. Run it when a Hook reports random recovery, visible staging, or an
-  unsettled one-shot event. It merges each session's exact parent-hash chain, publishes
-  only its unique tip, then replays pending events in safe lifecycle order.
-- `status` includes compact counts and direct identities for paused, fenced, and
-  owner-pending dispatches.
+`retry` creates a guarded newer generation. `cleanup` is current-task-only and refuses active or
+paused work. Do not edit lifecycle JSON by hand.
 
-State transitions are `waiting → ready → starting → running → retired`, with
-`running → paused → starting` for continuation. Interrupt PreToolUse is validation-only;
-the dispatch is fenced only when the successful native result says its previous status
-was active or already interrupted. A terminal result may therefore win the interrupt race.
-The existing `starting` claim is persisted before lock-free workspace verification and
-revalidated afterward; verification failure rolls it back. Prepared claims,
-running writers, and paused writers keep the sole canonical-workspace lease across every
-Codex task. Overlapping readers and writers are mutually excluded across tasks. A reviewer
-dependency is satisfied only by `outcome=accept`.
+## Experimental cooperative writers
 
-Lifecycle v1 files left by 2.0.1 with `interrupting` state recover the recorded prior
-`running` or `paused` state. If that field is absent, CCO conservatively restores
-`running`; the uncertain native owner keeps its lease until restart, a terminal result,
-or explicit interrupt settlement. New lifecycle filenames carry canonical workspace and
-task digests, so an invalid indexed state blocks only its workspace. Unindexable malformed
-legacy files move to content-addressed, no-replace files under `quarantine` only when the
-state root carries CCO's ownership marker. Unmarked shared directories are never used to
-quarantine unrelated JSON, but every valid legacy lifecycle file still participates in
-reader/writer lease checks.
+Cooperative isolation is opt-in and accepts only two independent, non-overlapping fresh writers,
+optionally followed by the compiler's single final reviewer.
+Clean Git workspaces receive managed worktrees; dirty Git and directory workspaces receive bounded
+copies. CCO stages exact backups and a bounded apply journal before integration. Successful cleanup
+removes completed isolate and journal material; incomplete journals and backups are retained until
+rollback or explicit intervention. This is a coordination boundary, not a sandbox.
 
-Lifecycle discovery uses incremental `scandir` and admits no new task after 4,096 ordinary
-root-level lifecycle JSON files. It separately limits recovery files to 32, visible
-migration staging to 32, and pending one-shot event receipts to 128. Slot creation is
-serialized across tasks. Git inspection spools output outside process memory, refuses
-more than 64 MiB or 200,000 parsed records, and shares one 100,000-entry budget across
-every Git control-directory and resolved reparse target. These are admission limits: CCO
-blocks instead of truncating evidence.
-Legacy quarantine first atomically moves the pathname to top-level recovery staging and
-validates the object actually moved. A concurrent replacement at the original path is never
-deleted. Staging uses a non-JSON filename, so normal Hooks fail closed from its bounded
-name without parsing the payload. The explicit cold path reads one file at a time, keeps
-only compact lineage metadata, validates full exact-parent chains independently of
-filename order, and rejects sibling branches or cross-plan state. Oversized invalid files
-are content-hashed as a stream before no-replace quarantine. A unique valid tip receives
-one stable session-addressed filename under workspace, session, and state-root locks.
-Invalid recovery in an unmarked shared root remains untouched and fail-closed; the
-ownership sentinel authorizes quarantine, never valid lease discovery.
-The same state-root lock serializes capacity changes and recovery publication. An
-authoritative lifecycle operation holds it only for its final path rescan and state load,
-then releases it before plan/wave work, state calculation, persistence, or artifact cleanup.
-The workspace and session locks retain authority for the operation, and any lock-time
-workspace change is rejected before recovery replay. Bounded workspace verification still
-runs outside the lifecycle locks.
+## Offline host-edge repair
 
-Current Codex emits PostToolUse only after a successful native tool call and does not emit
-SubagentStop for sampling failures. An unclaimed dispatch reservation expires after two
-minutes and is rearmed only after admission is checked again. Once PreToolUse records a
-native call identity, its lease stays fail-closed; overdue `status` output reports
-`native_settlement_required`. Use `native-failure` as soon as Primary observes a typed host
-error; never infer a retry from arbitrary assistant prose. A successful spawn response
-without a canonical owner stays running as owner-pending; trusted UUID/rollout evidence may
-bind it when the result stops.
-
-SessionStart, successful PostToolUse, and SubagentStop write a bounded receipt before
-settlement. A successful receipt is deleted immediately. Exact replay is idempotent;
-distinct resume/clear occurrences have distinct identities, and unresolved receipts
-block cleanup or plan replacement. If a restart arrives while an older receipt remains,
-both are preserved and the Hook requests `migrate-recoveries`; the cold path settles
-child results and native successes before restart fencing.
-
-CCO PreToolUse work uses a shared internal deadline, bounded Git subprocesses, and short
-lock waits with rollback reserve below the 30-second manifest timeout. Current Codex logs
-a Hook command crash or timeout but still allows the native tool; this host-level
-fail-open behavior is outside a plugin's enforcement authority. Treat CCO as a workflow
-guardrail, keep Hooks trusted, and inspect host Hook failures.
-SessionStart, Stop, and PostToolUse each use a 3.5-second internal deadline below their
-five-second host timeout. SubagentStop uses its own budget below the 120-second host
-timeout. Temporary workspace or state infrastructure failures preserve the exact receipt
-and return `decision:block`, so the child repeats the same `CCO_RESULT`; only a verified
-scope or result-contract violation is fenced. Stop detects a retained receipt without
-running heavy workspace verification and directs the user to the cold path.
-
-Wave artifacts contain the fresh baseline and are deleted as soon as every physical
-dispatch in that wave becomes terminal. The compact plan, lifecycle result evidence,
-and bounded tombstones remain available for recovery and host proof.
-
-## Static route policy
-
-Global configuration: `~/.codex/cco.toml`.
-
-Project configuration: `<PROJECT>/.codex/cco.toml`, loaded only when the canonical
-project root is present in global `trusted_project_roots`.
-
-```toml
-trusted_project_roots = ["C:/work/project"]
-
-[routes.explorer.mechanical]
-candidates = [
-  { model = "gpt-5.6-luna", effort = "max" },
-  { model = "gpt-5.6-terra", effort = "max" },
-]
-```
-
-Automatic policy may use `max`, `xhigh`, or `high`, cannot select Sol, and cannot use
-Luna for guarded or reviewer work. A current explicit user pin can select any native
-supported pair and has no silent fallback when fully fixed.
-
-## Workspace rules
-
-Git plans bind the canonical worktree root and protect Git control state, index, refs,
-typed scopes, path aliases, ignored in-scope files, submodules, and hidden status
-entries. A worker result must report the exact verified delta in its logical scopes.
-
-Non-Git plans bind the exact directory root and never initialize Git. A write wave
-captures the complete root; read-only waves capture declared scopes. Defaults are
-20,000 total entries and 1 GiB.
-
-## Host task-card maintenance
-
-Codex Desktop owns task cards separately from CCO. CCO Hooks never modify the host
-database. If a proof-backed terminal child remains displayed as processing, audit it:
+Codex Desktop owns persisted task-card edges. The repair tool is an offline fallback and is never
+called by a Hook. Leave the active task, keep `CODEX_THREAD_ID` unset, use `--offline-confirm`, and
+name the exact parent and every child that may be closed. It creates an owner-only rollback journal
+before repair.
 
 ```text
-python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --state-root <CCO_STATE_DIR> --check
+python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --check
+python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --repair --offline-confirm --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID>
 ```
-
-Repair only explicitly named edges after inspecting the audit and backup:
-
-```text
-python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --state-root <CCO_STATE_DIR> --parent-thread-id <PARENT_UUID> --child-thread-id <CHILD_UUID> --repair
-```
-
-The tool requires matching native session metadata, `task_complete`, a valid cco.v9
-result, and a matching retired lifecycle dispatch. Paused, blocked, stale, malformed,
-or hash-mismatched work is not repairable.
-
-## Remove profiles
-
-```text
-python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --uninstall
-codex plugin remove codex-cost-orchestrator@codex-cost-orchestrator
-```
-
-Uninstall removes only files that exactly match the current templates.

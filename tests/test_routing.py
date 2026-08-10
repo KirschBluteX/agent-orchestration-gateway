@@ -45,9 +45,14 @@ class RoutingTests(unittest.TestCase):
         reviewer = resolve_route_plan([request("reviewer", "guarded")], CATALOG)
         self.assertEqual(mechanical["routes"][0]["candidates"][0]["model"], "gpt-5.6-luna")
         self.assertEqual(bounded["routes"][0]["candidates"][0]["model"], "gpt-5.6-terra")
-        self.assertEqual(reviewer["routes"][0]["candidates"], [
-            {"effort": "max", "model": "gpt-5.6-terra"}
-        ])
+        self.assertEqual(
+            reviewer["routes"][0]["candidates"],
+            [
+                {"effort": "max", "model": "gpt-5.6-terra"},
+                {"effort": "xhigh", "model": "gpt-5.6-terra"},
+                {"effort": "high", "model": "gpt-5.6-terra"},
+            ],
+        )
 
     def test_sol_requires_explicit_current_pin(self) -> None:
         automatic = resolve_route_plan([request("worker", "guarded")], CATALOG)

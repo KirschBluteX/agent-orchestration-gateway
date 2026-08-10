@@ -76,6 +76,360 @@ class V9HookTests(unittest.TestCase):
             ):
                 cco_hook._owner(payload)
 
+    def test_protected_subagent_result_is_recovered_from_trusted_rollout(self) -> None:
+        agent_id = "00000000-0000-4000-8000-000000000004"
+        result = "CCO_RESULT cco.v9\n{\"status\":\"complete\"}"
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir()
+            rollout = sessions / f"rollout-test-{agent_id}.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "agent_path": "/root/worker_n01",
+                        "id": agent_id,
+                        "parent_thread_id": "parent-task",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": result,
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": result}],
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            calls: list[tuple[str, object]] = []
+
+            class Control:
+                @staticmethod
+                def process_result_event(owner: str, raw_result: object) -> None:
+                    calls.append((owner, raw_result))
+
+            with (
+                patch.object(cco_hook, "_sessions_root", return_value=sessions.resolve()),
+                patch.object(cco_hook, "_control", return_value=Control()),
+            ):
+                outcome = cco_hook.evaluate(
+                    {
+                        "agent_id": agent_id,
+                        "agent_transcript_path": str(rollout),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": "gAAAA" + ("a" * 100),
+                        "session_id": "parent-task",
+                    }
+                )
+
+        self.assertEqual(calls, [("/root/worker_n01", result)])
+        self.assertEqual(outcome, {"continue": False})
+
+    def test_protected_subagent_stop_uses_latest_rollout_result_for_reused_owner(self) -> None:
+        agent_id = "00000000-0000-4000-8000-000000000005"
+        historical = "CCO_RESULT cco.v9\n{\"status\":\"historical\"}"
+        current = "CCO_RESULT cco.v9\n{\"status\":\"current\"}"
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir()
+            rollout = sessions / f"rollout-test-{agent_id}.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "agent_path": "/root/worker_n01",
+                        "id": agent_id,
+                        "parent_thread_id": "parent-task",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": historical,
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": current}],
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            calls: list[tuple[str, object]] = []
+
+            class Control:
+                @staticmethod
+                def process_result_event(owner: str, raw_result: object) -> None:
+                    calls.append((owner, raw_result))
+
+            with (
+                patch.object(cco_hook, "_sessions_root", return_value=sessions.resolve()),
+                patch.object(cco_hook, "_control", return_value=Control()),
+            ):
+                outcome = cco_hook.evaluate(
+                    {
+                        "agent_id": agent_id,
+                        "agent_transcript_path": str(rollout),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": "gAAAA" + ("a" * 100),
+                        "session_id": "parent-task",
+                    }
+                )
+
+        self.assertEqual(calls, [("/root/worker_n01", current)])
+        self.assertEqual(outcome, {"continue": False})
+
+    def test_protected_subagent_stop_fences_non_cco_latest_rollout_final(self) -> None:
+        agent_id = "00000000-0000-4000-8000-000000000007"
+        historical = "CCO_RESULT cco.v9\n{\"status\":\"historical\"}"
+        current = "I completed the work, but omitted the required result protocol."
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir()
+            rollout = sessions / f"rollout-test-{agent_id}.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "agent_path": "/root/worker_n01",
+                        "id": agent_id,
+                        "parent_thread_id": "parent-task",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": historical,
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": historical}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": current,
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": current}],
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            processed: list[tuple[str, object]] = []
+            fenced: list[str] = []
+
+            class Control:
+                @staticmethod
+                def process_result_event(owner: str, raw_result: object) -> None:
+                    processed.append((owner, raw_result))
+
+                @staticmethod
+                def fence_invalid_result(owner: str) -> None:
+                    fenced.append(owner)
+
+            with (
+                patch.object(cco_hook, "_sessions_root", return_value=sessions.resolve()),
+                patch.object(cco_hook, "_control", return_value=Control()),
+            ):
+                outcome = cco_hook.evaluate(
+                    {
+                        "agent_id": agent_id,
+                        "agent_transcript_path": str(rollout),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": "gAAAA" + ("a" * 100),
+                        "session_id": "parent-task",
+                    }
+                )
+
+        self.assertEqual(processed, [])
+        self.assertEqual(fenced, ["/root/worker_n01"])
+        self.assertEqual(outcome["continue"], False)
+        self.assertIn("rejected and fenced", outcome["systemMessage"])
+
+    def test_missing_protected_transcript_result_fences_managed_owner(self) -> None:
+        fenced: list[str] = []
+
+        class Control:
+            @staticmethod
+            def process_result_event(_owner: str, _raw_result: object) -> None:
+                raise AssertionError("missing transcript output must not be processed")
+
+            @staticmethod
+            def fence_invalid_result(owner: str) -> None:
+                fenced.append(owner)
+
+        with (
+            patch.object(cco_hook, "_control", return_value=Control()),
+            patch.object(cco_hook, "_owner", return_value="/root/worker_n01"),
+            patch.object(
+                cco_hook,
+                "_result_from_transcript",
+                side_effect=cco_hook.ControlPlaneError(
+                    "protected child result has no final CCO_RESULT"
+                ),
+            ),
+        ):
+            outcome = cco_hook.evaluate(
+                {
+                    "hook_event_name": "SubagentStop",
+                    "last_assistant_message": "gAAAA" + ("a" * 100),
+                }
+            )
+
+        self.assertEqual(fenced, ["/root/worker_n01"])
+        self.assertEqual(outcome["continue"], False)
+        self.assertIn("rejected and fenced", outcome["systemMessage"])
+
+    def test_protected_subagent_result_accepts_canonical_agent_path_identity(self) -> None:
+        agent_id = "/root/worker_n01"
+        rollout_id = "00000000-0000-4000-8000-000000000006"
+        result = "CCO_RESULT cco.v9\n{\"status\":\"complete\"}"
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir()
+            rollout = sessions / f"rollout-test-{rollout_id}.jsonl"
+            records = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "agent_path": agent_id,
+                        "id": rollout_id,
+                        "parent_thread_id": "parent-task",
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "phase": "final_answer",
+                        "message": result,
+                    },
+                },
+            ]
+            rollout.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            calls: list[tuple[str, object]] = []
+
+            class Control:
+                @staticmethod
+                def process_result_event(owner: str, raw_result: object) -> None:
+                    calls.append((owner, raw_result))
+
+            with (
+                patch.object(cco_hook, "_sessions_root", return_value=sessions.resolve()),
+                patch.object(cco_hook, "_control", return_value=Control()),
+            ):
+                outcome = cco_hook.evaluate(
+                    {
+                        "agent_id": agent_id,
+                        "agent_transcript_path": str(rollout),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": "gAAAA" + ("a" * 100),
+                        "session_id": "parent-task",
+                    }
+                )
+
+        self.assertEqual(calls, [(agent_id, result)])
+        self.assertEqual(outcome, {"continue": False})
+
+    def test_protected_managed_followup_uses_prepared_preflight(self) -> None:
+        calls: list[object] = []
+
+        class Control:
+            @staticmethod
+            def owner_is_managed(_target: str) -> bool:
+                return True
+
+            @staticmethod
+            def preflight_opaque_followup(payload: object) -> None:
+                calls.append(payload)
+
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "opaque-followup",
+            "tool_input": {
+                "message": "gAAAA" + ("a" * 100),
+                "target": "/root/worker_n01",
+            },
+            "tool_name": "followup_task",
+            "tool_use_id": "opaque-followup-call",
+        }
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            self.assertEqual(cco_hook.evaluate(payload), {})
+        self.assertEqual(calls, [payload])
+
+    def test_unmappable_owner_closes_unresolved_leases(self) -> None:
+        calls: list[str] = []
+
+        class Control:
+            @staticmethod
+            def close_unmappable_owner_leases() -> int:
+                calls.append("closed")
+                return 1
+
+        payload = {
+            "agent_id": "00000000-0000-4000-8000-000000000003",
+            "hook_event_name": "SubagentStop",
+            "session_id": "unmappable-owner-hook",
+        }
+        with (
+            patch.object(cco_hook, "_control", return_value=Control()),
+            patch.object(
+                cco_hook,
+                "_owner",
+                side_effect=cco_hook.ControlPlaneError("missing trusted owner"),
+            ),
+        ):
+            outcome = cco_hook.evaluate(payload)
+
+        self.assertEqual(calls, ["closed"])
+        self.assertFalse(outcome["continue"])
+        self.assertIn("closed", outcome["systemMessage"])
+
     def test_protected_payload_guard_handles_nested_host_reasoning(self) -> None:
         protected = {
             "type": "reasoning",
@@ -95,6 +449,35 @@ class V9HookTests(unittest.TestCase):
         )
         self.assertEqual(outcome["decision"], "block")
         self.assertIn("opaque collaboration", outcome["reason"])
+
+    def test_host_opaque_spawn_uses_prepared_preflight(self) -> None:
+        calls: list[tuple[object, bool]] = []
+
+        class Control:
+            @staticmethod
+            def preflight_spawn(payload: object, *, opaque_message: bool = False) -> None:
+                calls.append((payload, opaque_message))
+
+        payload = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "hook-session",
+            "tool_input": {
+                "agent_type": "cost_orchestrator_write_leaf",
+                "fork_turns": "none",
+                "message": "gAAAA" + ("c" * 100),
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "max",
+                "task_name": "worker_task_deadbeef_terra_max_g01",
+            },
+            "tool_name": "spawn_agent",
+            "tool_use_id": "opaque-spawn",
+        }
+
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            outcome = cco_hook.evaluate(payload)
+
+        self.assertEqual(outcome, {})
+        self.assertEqual(calls, [(payload, True)])
 
     def test_native_bypass_cannot_forward_embedded_protected_content(self) -> None:
         outcome = cco_hook.evaluate(
@@ -422,24 +805,24 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(outcome["decision"], "block")
         self.assertIn("multiple workspaces", outcome["reason"])
 
-    def test_migration_instruction_is_preserved_for_one_shot_hook_events(self) -> None:
+    def test_predecessor_artifacts_require_cleanup_for_one_shot_hook_events(self) -> None:
         class Control:
             @staticmethod
             def process_restart_event(_source: str) -> int:
                 raise cco_hook.ControlPlaneUnavailable(
-                    "legacy lifecycle recovery requires explicit migrate-recoveries"
+                    "unsupported predecessor CCO artifact; clean up the old CCO state"
                 )
 
             @staticmethod
             def process_postflight_event(_payload: object) -> bool:
                 raise cco_hook.ControlPlaneUnavailable(
-                    "legacy lifecycle recovery requires explicit migrate-recoveries"
+                    "unsupported predecessor CCO artifact; clean up the old CCO state"
                 )
 
             @staticmethod
             def process_result_event(_owner: str, _result: object) -> None:
                 raise cco_hook.ControlPlaneUnavailable(
-                    "legacy lifecycle recovery requires explicit migrate-recoveries"
+                    "unsupported predecessor CCO artifact; clean up the old CCO state"
                 )
 
         with (
@@ -463,9 +846,9 @@ class V9HookTests(unittest.TestCase):
                 }
             )
 
-        self.assertIn("migrate-recoveries", session["systemMessage"])
-        self.assertIn("replay this pending lifecycle event", post["reason"])
-        self.assertIn("migrate-recoveries", result["reason"])
+        self.assertIn("clean up", session["systemMessage"])
+        self.assertIn("clean up", post["reason"])
+        self.assertIn("exact same result", result["reason"])
 
 
 if __name__ == "__main__":

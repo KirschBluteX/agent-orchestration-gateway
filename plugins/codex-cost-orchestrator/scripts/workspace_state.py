@@ -27,8 +27,13 @@ from protocol_hash import (
 )
 
 
-SCHEMA = "cco.workspace-state.v3"
+SCHEMA = "cco.workspace-state.v4"
 WORKSPACE_MODES = frozenset({"light", "strict"})
+IGNORED_POLICY_GLOBAL_V1 = "global-v1"
+IGNORED_POLICY_SCOPED_READER_V1 = "scoped-reader-v1"
+IGNORED_POLICIES = frozenset(
+    {IGNORED_POLICY_GLOBAL_V1, IGNORED_POLICY_SCOPED_READER_V1}
+)
 DEFAULT_IGNORED_MAX_FILES = 10_000
 DEFAULT_IGNORED_MAX_BYTES = 256 * 1024 * 1024
 MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
@@ -81,6 +86,8 @@ SNAPSHOT_FIELDS = frozenset(
         "schema",
         "state_id",
         "symbolic_head",
+        "ignored_policy",
+        "ignored_scope_digest",
     }
 )
 
@@ -293,6 +300,55 @@ def sha256_file(path: Path) -> str:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def normalized_snapshot_scopes(
+    scopes: object,
+    *,
+    require_nonempty: bool = False,
+) -> list[dict[str, str]] | None:
+    """Return the canonical scope sequence used by a scoped snapshot."""
+
+    if scopes is None:
+        if require_nonempty:
+            raise StateError("scoped ignored policy requires reader scopes")
+        return None
+    if not isinstance(scopes, list):
+        raise StateError("workspace scopes must be a list")
+    try:
+        normalized = [
+            require_repository_scope(scope, f"workspace scope[{index}]")
+            for index, scope in enumerate(scopes)
+        ]
+    except ProtocolHashError as error:
+        raise StateError(str(error)) from error
+    identities = {(scope["kind"], scope["path"]): scope for scope in normalized}
+    if len(identities) != len(normalized):
+        raise StateError("workspace scopes contain duplicates")
+    canonical = [identities[key] for key in sorted(identities)]
+    if require_nonempty and not canonical:
+        raise StateError("scoped ignored policy requires reader scopes")
+    return canonical
+
+
+def ignored_scope_digest(scopes: object) -> str:
+    """Digest canonical reader scopes before a scoped ignored scan."""
+
+    canonical = normalized_snapshot_scopes(scopes, require_nonempty=True)
+    assert canonical is not None
+    encoded = json.dumps(
+        canonical,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return "sha256:" + sha256_bytes(encoded)
+
+
+def snapshot_ignored_policy(snapshot: dict[str, Any]) -> str:
+    """Return the only policy compatible with one validated snapshot."""
+
+    return snapshot["ignored_policy"]
 
 
 def git_config_digest(root: Path) -> str:
@@ -607,13 +663,39 @@ def ignored_entries(
 
     if max_files < 0 or max_bytes < 0:
         raise StateError("ignored scan limits must be non-negative")
-    raw = git(
-        root,
+    if scopes == []:
+        return {}
+    pathspecs: list[str] | None = None
+    if scopes is not None:
+        pathspecs = []
+        for scope in scopes:
+            candidate = root / Path(scope["path"])
+            try:
+                metadata = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise StateUnavailable(
+                    "ignored scope inspection is unavailable"
+                ) from error
+            if scope["kind"] == "exact" and stat.S_ISDIR(metadata.st_mode):
+                continue
+            pathspecs.append(f":(top,literal){scope['path']}")
+        if not pathspecs:
+            return {}
+    arguments = [
         "ls-files",
         "--others",
         "--ignored",
         "--exclude-standard",
         "-z",
+    ]
+    if pathspecs is not None:
+        arguments.append("--")
+        arguments.extend(pathspecs)
+    raw = git(
+        root,
+        *arguments,
     )
     paths: list[str] = []
     for value in _git_records(raw, b"\0", "Git ignored paths"):
@@ -747,6 +829,7 @@ def tracked_entries(
     )
     for path, records in sorted(selected_records.items()):
         checkpoint()
+        selected_by_scope = scopes is not None and is_allowed(path, scopes)
         ordered_records = sorted(
             records,
             key=lambda item: (item["stage"], item["mode"], item["object_id"]),
@@ -764,9 +847,14 @@ def tracked_entries(
                     "git_marker": fingerprint(nested, ".git"),
                     "state": state_payload(
                         nested_root,
-                        ignored_mode=ignored_mode,
+                        # An outer exact gitlink scope represents the complete
+                        # initialized submodule: inner paths cannot be leased
+                        # separately.  Capture all bounded ignored content so a
+                        # scoped reader or writer cannot mutate an invisible file.
+                        ignored_mode=("strict" if selected_by_scope else ignored_mode),
                         ignored_max_files=ignored_max_files,
                         ignored_max_bytes=ignored_max_bytes,
+                        ignored_policy=IGNORED_POLICY_GLOBAL_V1,
                     ),
                 }
             else:
@@ -788,15 +876,14 @@ def workspace_entries(
     ignored_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
+    ignored_policy: str = IGNORED_POLICY_GLOBAL_V1,
     scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    normalized_scopes = (
-        [
-            require_repository_scope(scope, f"workspace scope[{index}]")
-            for index, scope in enumerate(scopes)
-        ]
-        if scopes is not None
-        else None
+    if type(ignored_policy) is not str or ignored_policy not in IGNORED_POLICIES:
+        raise StateError("ignored scan policy is invalid")
+    normalized_scopes = normalized_snapshot_scopes(
+        scopes,
+        require_nonempty=(ignored_policy == IGNORED_POLICY_SCOPED_READER_V1),
     )
     status = status_entries(root)
     tracked = tracked_entries(
@@ -812,10 +899,11 @@ def workspace_entries(
             root,
             max_files=ignored_max_files,
             max_bytes=ignored_max_bytes,
-            # Git status cannot reveal ignored changes outside typed scopes.
-            # Capture the bounded ignored set globally so "writes only in scope"
-            # remains an exact promise rather than a heuristic.
-            scopes=None,
+            scopes=(
+                normalized_scopes
+                if ignored_policy == IGNORED_POLICY_SCOPED_READER_V1
+                else None
+            ),
         )
         if ignored_mode == "strict" or normalized_scopes is not None
         else {}
@@ -905,12 +993,19 @@ def state_payload(
     ignored_mode: str = "light",
     ignored_max_files: int = DEFAULT_IGNORED_MAX_FILES,
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
+    ignored_policy: str = IGNORED_POLICY_GLOBAL_V1,
     scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     if ignored_mode not in WORKSPACE_MODES:
         raise StateError("workspace mode must be light or strict")
     if ignored_max_files < 0 or ignored_max_bytes < 0:
         raise StateError("ignored scan limits must be non-negative")
+    if type(ignored_policy) is not str or ignored_policy not in IGNORED_POLICIES:
+        raise StateError("ignored scan policy is invalid")
+    normalized_scopes = normalized_snapshot_scopes(
+        scopes,
+        require_nonempty=(ignored_policy == IGNORED_POLICY_SCOPED_READER_V1),
+    )
     control_roots = (
         repository_control_roots(root) if control_roots is None else control_roots
     )
@@ -948,9 +1043,16 @@ def state_payload(
             ignored_mode=ignored_mode,
             ignored_max_files=ignored_max_files,
             ignored_max_bytes=ignored_max_bytes,
-            scopes=scopes,
+            ignored_policy=ignored_policy,
+            scopes=normalized_scopes,
         ),
     }
+    payload["ignored_policy"] = ignored_policy
+    payload["ignored_scope_digest"] = (
+        ignored_scope_digest(normalized_scopes)
+        if ignored_policy == IGNORED_POLICY_SCOPED_READER_V1
+        else None
+    )
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
@@ -959,10 +1061,17 @@ def state_payload(
 
 
 def validate_snapshot(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or value.get("schema") != SCHEMA:
+    if not isinstance(value, dict):
         raise StateError("baseline uses an unsupported schema")
-    if set(value) != SNAPSHOT_FIELDS:
-        raise StateError("baseline does not contain the exact v3 required fields")
+    schema = value.get("schema")
+    if schema != SCHEMA:
+        raise StateError("baseline uses an unsupported schema")
+    fields = SNAPSHOT_FIELDS
+    if set(value) != fields:
+        raise StateError(
+            "baseline does not contain the exact "
+            f"{schema.rsplit('.', 1)[-1]} required fields"
+        )
     state_id = value.get("state_id")
     unsigned = {key: item for key, item in value.items() if key != "state_id"}
     canonical = json.dumps(
@@ -975,6 +1084,20 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
         raise StateError("baseline entries are invalid")
     if value.get("ignored_mode") not in WORKSPACE_MODES:
         raise StateError("baseline workspace mode is invalid")
+    ignored_policy = value.get("ignored_policy")
+    ignored_scope = value.get("ignored_scope_digest")
+    if type(ignored_policy) is not str or ignored_policy not in IGNORED_POLICIES:
+        raise StateError("baseline ignored scan policy is invalid")
+    if ignored_policy == IGNORED_POLICY_GLOBAL_V1:
+        if ignored_scope is not None:
+            raise StateError("global ignored policy must not bind reader scopes")
+    elif (
+        not isinstance(ignored_scope, str)
+        or len(ignored_scope) != 71
+        or not ignored_scope.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in ignored_scope[7:])
+    ):
+        raise StateError("scoped ignored policy has an invalid scope digest")
     limits = value.get("ignored_limits")
     if (
         not isinstance(limits, dict)
@@ -1165,7 +1288,15 @@ def submodule_control_violations(
             violations.append(f"submodule_control_changed:{path}:git_marker")
         baseline_state = baseline_fingerprint.get("state", {})
         current_state = current_fingerprint.get("state", {})
-        for field in sorted(set(SNAPSHOT_FIELDS) - {"entries", "state_id"}):
+        baseline_schema = baseline_state.get("schema")
+        current_schema = current_state.get("schema")
+        if baseline_schema != current_schema:
+            violations.append(f"submodule_control_changed:{path}:schema")
+            continue
+        if baseline_schema != SCHEMA:
+            raise StateError("submodule snapshot uses an unsupported schema")
+        fields = SNAPSHOT_FIELDS
+        for field in sorted(fields - {"entries", "state_id"}):
             if baseline_state.get(field) != current_state.get(field):
                 violations.append(f"submodule_control_changed:{path}:{field}")
     return violations
@@ -1189,12 +1320,19 @@ def verify(
     without accidentally treating an unleased graph path as absent.
     """
 
+    baseline = validate_snapshot(baseline)
     limits = baseline["ignored_limits"]
     captured_scopes = (
         entry_scopes
         if entry_scopes is not None
         else allowed if scope_entries else None
     )
+    ignored_policy = snapshot_ignored_policy(baseline)
+    if ignored_policy == IGNORED_POLICY_SCOPED_READER_V1:
+        if captured_scopes is None:
+            raise StateError("scoped ignored baseline has no captured reader scopes")
+        if baseline["ignored_scope_digest"] != ignored_scope_digest(captured_scopes):
+            raise StateError("scoped ignored baseline reader scopes do not match")
     current = state_payload(
         root,
         control_roots=control_roots,
@@ -1202,6 +1340,7 @@ def verify(
         ignored_mode=baseline["ignored_mode"],
         ignored_max_files=limits["max_files"],
         ignored_max_bytes=limits["max_bytes"],
+        ignored_policy=ignored_policy,
         scopes=captured_scopes,
     )
     baseline_entries = baseline["entries"]

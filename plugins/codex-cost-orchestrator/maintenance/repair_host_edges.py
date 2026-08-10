@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Audit stale Codex host spawn edges without changing CCO runtime state."""
+"""Offline audit and repair for stale Codex Desktop spawn edges.
+
+This is deliberately outside the Hook path.  Codex Desktop owns its task-card
+registry; this tool only closes an exact persisted ``open`` edge after the
+child's own trusted rollout proves that its host lifecycle reached
+``task_complete``.
+"""
 
 from __future__ import annotations
 
@@ -7,15 +13,17 @@ import argparse
 from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
+from itertools import chain
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import stat
 import sys
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -23,21 +31,14 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from host_paths import HostPathError, host_path, is_within  # noqa: E402
-from control_plane import (  # noqa: E402
-    ControlPlane,
-    ControlPlaneError,
-    RESULT_HEADER,
-    parse_result,
-)
 from rollout_io import (  # noqa: E402
     RolloutError,
-    first_record,
     is_rollout_path,
-    iter_tail_records,
+    iter_records,
 )
 
 
-PROTOCOL = "cco.host-edge-repair.v1"
+PROTOCOL = "cco.host-edge-repair.v2"
 THREAD_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 AGENT_PATH = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]{0,127})+$")
 CCO_ROLES = frozenset(
@@ -47,22 +48,40 @@ CCO_ROLES = frozenset(
     }
 )
 MAX_SESSION_META_BYTES = 64 * 1024
-MAX_TERMINAL_TAIL_BYTES = 1024 * 1024
-ROLLBACK_PROTOCOL = "cco.host-edge-rollback.v1"
+ROLLBACK_PROTOCOL = "cco.host-edge-rollback.v2"
 ROLLBACK_RETENTION = 3
+JOURNAL_PREFIX = "cco-host-edge-"
+JOURNAL_SUFFIX = ".rollback.json"
+
+# Codex has used more than one spelling while reporting a native turn's start
+# and interruption.  Starts after completion and any interruption make the
+# current edge unsafe to close.  Other active-turn events are allowed only
+# before the eventual task_complete event, so error completion stays supported.
+START_EVENTS = frozenset(
+    {
+        "agent_start",
+        "agent_started",
+        "task_start",
+        "task_started",
+        "turn_start",
+        "turn_started",
+    }
+)
+INTERRUPTION_EVENTS = frozenset(
+    {
+        "agent_aborted",
+        "agent_interrupted",
+        "interrupted",
+        "task_aborted",
+        "task_interrupted",
+        "turn_aborted",
+        "turn_interrupted",
+    }
+)
 
 
 class HostEdgeRepairError(RuntimeError):
-    """Raised when host state cannot be audited safely."""
-
-
-def _default_state_root() -> Path:
-    configured = os.environ.get("CCO_STATE_DIR")
-    return (
-        Path(configured).expanduser()
-        if configured
-        else Path(tempfile.gettempdir()) / "codex-cost-orchestrator" / "v9"
-    )
+    """Raised when host state cannot be audited or repaired safely."""
 
 
 def _is_reparse(path: Path) -> bool:
@@ -110,6 +129,19 @@ def _resolved_plain_directory(path: Path, *, label: str) -> Path:
     return resolved
 
 
+def _trusted_codex_home(codex_home: Path) -> Path:
+    return _resolved_plain_directory(codex_home, label="Codex home")
+
+
+def _sessions_root(codex_home: Path) -> Path:
+    sessions = _resolved_plain_directory(
+        codex_home / "sessions", label="Codex sessions root"
+    )
+    if not is_within(codex_home, sessions):
+        raise HostEdgeRepairError("Codex sessions root is outside Codex home")
+    return sessions
+
+
 def _discover_state_db(codex_home: Path) -> Path:
     candidates: list[tuple[int, Path]] = []
     for path in codex_home.glob("state_*.sqlite"):
@@ -140,99 +172,105 @@ def _require_schema(connection: sqlite3.Connection) -> None:
             raise HostEdgeRepairError(f"Codex state database has no supported {table} schema")
 
 
-def _text_values(value: object) -> list[str]:
-    if isinstance(value, Mapping):
-        return [text for child in value.values() for text in _text_values(child)]
-    if isinstance(value, list):
-        return [text for child in value for text in _text_values(child)]
-    return [value] if isinstance(value, str) else []
-
-
-def _assistant_result_messages(record: Mapping[str, Any]) -> list[str]:
-    payload = record.get("payload")
-    if not isinstance(payload, Mapping):
-        return []
-    response_message = (
-        record.get("type") == "response_item"
-        and payload.get("type") == "message"
-        and payload.get("role") == "assistant"
-    )
-    event_message = (
-        record.get("type") == "event_msg"
-        and payload.get("type") == "agent_message"
-    )
-    if not response_message and not event_message:
-        return []
-    return [
-        text.strip()
-        for text in _text_values(payload)
-        if text.strip().startswith(RESULT_HEADER + "\n")
-    ]
-
-
-def _rollout_proof(path: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
+def _canonical_digest(value: Mapping[str, Any]) -> str:
     try:
-        first = first_record(path)
+        encoded = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise HostEdgeRepairError("agent rollout proof is invalid") from error
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_host_lifecycle(records: Iterable[Mapping[str, Any]]) -> None:
+    """Accept only a terminal host lifecycle with harmless trailing usage.
+
+    ``task_complete`` is authoritative whether it represents normal completion,
+    an ordinary error, or a usage-limit error.  Codex can append token_count
+    records after that event; those records describe accounting, not a new turn.
+    Every other record after completion is rejected fail-closed.
+    """
+
+    completed = False
+    for record in records:
+        record_type = record.get("type")
+        if isinstance(record_type, str) and record_type in INTERRUPTION_EVENTS:
+            raise HostEdgeRepairError("agent rollout is interrupted or aborted")
+        if completed:
+            if record_type == "token_count":
+                continue
+            if isinstance(record_type, str) and record_type in START_EVENTS:
+                raise HostEdgeRepairError("agent rollout starts after task_complete")
+            payload = record.get("payload")
+            if record_type == "event_msg" and isinstance(payload, Mapping):
+                event_type = payload.get("type")
+                if not isinstance(event_type, str) or not event_type:
+                    raise HostEdgeRepairError("agent rollout has a malformed tail")
+                if event_type == "token_count":
+                    continue
+                if event_type in START_EVENTS:
+                    raise HostEdgeRepairError("agent rollout starts after task_complete")
+                if event_type in INTERRUPTION_EVENTS:
+                    raise HostEdgeRepairError(
+                        "agent rollout is interrupted after task_complete"
+                    )
+            raise HostEdgeRepairError("agent rollout has an unknown tail after task_complete")
+
+        if record_type != "event_msg":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, Mapping):
+            raise HostEdgeRepairError("agent rollout has a malformed host lifecycle")
+        event_type = payload.get("type")
+        if not isinstance(event_type, str) or not event_type:
+            raise HostEdgeRepairError("agent rollout has a malformed host lifecycle")
+        if event_type in INTERRUPTION_EVENTS:
+            raise HostEdgeRepairError("agent rollout is interrupted or aborted")
+        if event_type == "task_complete":
+            completed = True
+
+    if not completed:
+        raise HostEdgeRepairError("agent rollout has no authoritative task_complete tail")
+
+
+def _rollout_proof(path: Path) -> tuple[Mapping[str, Any], str]:
+    records = iter_records(path)
+    try:
+        first = next(records)
+    except StopIteration as error:
+        raise HostEdgeRepairError("agent rollout is empty") from error
     except RolloutError as error:
         raise HostEdgeRepairError("agent rollout cannot be read") from error
     try:
         first_size = len(
-            json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode(
-                "utf-8"
-            )
+            json.dumps(first, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
     except (TypeError, ValueError) as error:
         raise HostEdgeRepairError("agent session metadata is invalid") from error
     if first_size > MAX_SESSION_META_BYTES:
         raise HostEdgeRepairError("agent session metadata exceeds the size limit")
-    last: Mapping[str, Any] | None = None
-    result_messages: list[str] = []
+    digest = hashlib.sha256()
+
+    def observed() -> Iterable[Mapping[str, Any]]:
+        for record in chain((first,), records):
+            try:
+                encoded = json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            except (TypeError, ValueError) as error:
+                raise HostEdgeRepairError("agent rollout proof is invalid") from error
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            yield record
+
     try:
-        for record in iter_tail_records(path, max_bytes=MAX_TERMINAL_TAIL_BYTES):
-            last = record
-            result_messages.extend(_assistant_result_messages(record))
+        _validate_host_lifecycle(observed())
     except RolloutError as error:
         raise HostEdgeRepairError("agent rollout cannot be read") from error
-    if first is None or last is None:
-        raise HostEdgeRepairError("agent rollout is empty")
-    terminal_payload = last.get("payload")
-    if (
-        last.get("type") != "event_msg"
-        or not isinstance(terminal_payload, Mapping)
-        or terminal_payload.get("type") != "task_complete"
-    ):
-        raise HostEdgeRepairError("agent rollout has no authoritative task_complete tail")
-    if not result_messages:
-        raise HostEdgeRepairError("agent rollout has no assistant CCO_RESULT")
-    try:
-        parsed = parse_result(result_messages[-1])
-    except ControlPlaneError as error:
-        raise HostEdgeRepairError("agent rollout CCO_RESULT is invalid") from error
-    return first, parsed
-
-
-def _validate_lifecycle_result(
-    *,
-    agent_path: str,
-    agent_role: str,
-    parent_thread_id: str,
-    state_root: Path,
-    result: Mapping[str, Any],
-) -> None:
-    try:
-        proof = ControlPlane(parent_thread_id, root=state_root).terminal_proof(
-            agent_path,
-            result,
-        )
-    except (ControlPlaneError, OSError, ValueError) as error:
-        raise HostEdgeRepairError("CCO lifecycle has no exact terminal owner") from error
-    expected_role = (
-        "cost_orchestrator_write_leaf"
-        if proof.get("role") == "worker"
-        else "cost_orchestrator_read_leaf"
-    )
-    if agent_role != expected_role:
-        raise HostEdgeRepairError("CCO lifecycle role does not match the host edge")
+    return first, "sha256:" + digest.hexdigest()
 
 
 def _session_source(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -246,29 +284,62 @@ def _session_source(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return spawn if isinstance(spawn, Mapping) else None
 
 
+def _source_matches_edge(
+    source: Mapping[str, Any],
+    *,
+    child_thread_id: str,
+    parent_thread_id: str,
+    agent_path: str,
+    agent_role: str,
+) -> bool:
+    if (
+        source.get("agent_path") != agent_path
+        or source.get("agent_role") != agent_role
+    ):
+        return False
+    optional_bindings = {
+        "child_thread_id": child_thread_id,
+        "id": child_thread_id,
+        "parent_thread_id": parent_thread_id,
+    }
+    return all(
+        key not in source or source.get(key) == expected
+        for key, expected in optional_bindings.items()
+    )
+
+
 def _validate_terminal_edge(
     row: sqlite3.Row,
     *,
-    state_root: Path,
     sessions_root: Path,
+    all_native: bool = False,
+    state_root: Path | None = None,
 ) -> dict[str, Any]:
-    parent = str(row["parent_thread_id"])
-    child = str(row["child_thread_id"])
+    del state_root
+    parent_value = row["parent_thread_id"]
+    child_value = row["child_thread_id"]
+    parent = parent_value if isinstance(parent_value, str) else ""
+    child = child_value if isinstance(child_value, str) else ""
     agent_path = row["agent_path"]
     agent_role = row["agent_role"]
-    result = {
+    result: dict[str, Any] = {
         "agent_path": agent_path if isinstance(agent_path, str) else None,
         "agent_role": agent_role if isinstance(agent_role, str) else None,
-        "child_thread_id": child,
+        "child_thread_id": child or str(child_value),
         "evidence": None,
-        "parent_thread_id": parent,
+        "parent_thread_id": parent or str(parent_value),
+        "prior_status": row["status"] if isinstance(row["status"], str) else None,
+        "proof_digest": None,
         "reason": None,
+        "rollout_path": None,
         "verdict": "skipped",
     }
     try:
         if THREAD_ID.fullmatch(parent) is None or THREAD_ID.fullmatch(child) is None:
             raise HostEdgeRepairError("thread identity is not canonical")
-        if agent_role not in CCO_ROLES:
+        if not isinstance(agent_role, str) or not agent_role:
+            raise HostEdgeRepairError("agent role is missing")
+        if not all_native and agent_role not in CCO_ROLES:
             raise HostEdgeRepairError("agent role is not CCO-owned")
         if not isinstance(agent_path, str) or AGENT_PATH.fullmatch(agent_path) is None:
             raise HostEdgeRepairError("agent path is not canonical")
@@ -282,7 +353,7 @@ def _validate_terminal_edge(
         )
         if not is_rollout_path(rollout):
             raise HostEdgeRepairError("agent rollout has an unsupported suffix")
-        first, cco_result = _rollout_proof(rollout)
+        first, proof_digest = _rollout_proof(rollout)
         payload = first.get("payload")
         if first.get("type") != "session_meta" or not isinstance(payload, Mapping):
             raise HostEdgeRepairError("agent rollout does not begin with session metadata")
@@ -293,27 +364,41 @@ def _validate_terminal_edge(
             or payload.get("agent_path") != agent_path
             or payload.get("agent_role") != agent_role
             or source is None
-            or source.get("agent_path") != agent_path
-            or source.get("agent_role") != agent_role
+            or not _source_matches_edge(
+                source,
+                child_thread_id=child,
+                parent_thread_id=parent,
+                agent_path=agent_path,
+                agent_role=agent_role,
+            )
         ):
             raise HostEdgeRepairError("agent session metadata does not match the spawn edge")
-        _validate_lifecycle_result(
-            agent_path=agent_path,
-            agent_role=agent_role,
-            parent_thread_id=parent,
-            state_root=state_root,
-            result=cco_result,
-        )
     except HostEdgeRepairError as error:
         result["reason"] = str(error)
         return result
     result.update(
         {
-            "evidence": "CCO_RESULT+Lifecycle+event_msg/task_complete",
+            "evidence": "session_meta+host_lifecycle/task_complete",
+            "proof_digest": proof_digest,
+            "rollout_path": str(rollout),
             "verdict": "repairable",
         }
     )
     return result
+
+
+def _validated_child_ids(child_thread_ids: list[str] | None) -> list[str] | None:
+    if child_thread_ids is None:
+        return None
+    if any(
+        not isinstance(child, str) or THREAD_ID.fullmatch(child) is None
+        for child in child_thread_ids
+    ):
+        raise HostEdgeRepairError("child thread identities are invalid or duplicated")
+    children = sorted(child_thread_ids)
+    if len(set(children)) != len(children):
+        raise HostEdgeRepairError("child thread identities are invalid or duplicated")
+    return children
 
 
 def _edge_rows(
@@ -321,7 +406,14 @@ def _edge_rows(
     *,
     parent_thread_id: str | None,
     child_thread_ids: list[str] | None,
+    all_native: bool = False,
 ) -> list[sqlite3.Row]:
+    if parent_thread_id is not None and (
+        not isinstance(parent_thread_id, str)
+        or THREAD_ID.fullmatch(parent_thread_id) is None
+    ):
+        raise HostEdgeRepairError("parent thread identity is invalid")
+    children = _validated_child_ids(child_thread_ids)
     query = """
         SELECT
             edge.parent_thread_id,
@@ -333,20 +425,15 @@ def _edge_rows(
         FROM thread_spawn_edges AS edge
         JOIN threads ON threads.id = edge.child_thread_id
         WHERE edge.status = 'open'
-          AND threads.agent_role IN (?, ?)
     """
-    parameters: list[object] = sorted(CCO_ROLES)
+    parameters: list[object] = []
+    if not all_native:
+        query += " AND threads.agent_role IN (?, ?)"
+        parameters.extend(sorted(CCO_ROLES))
     if parent_thread_id is not None:
-        if THREAD_ID.fullmatch(parent_thread_id) is None:
-            raise HostEdgeRepairError("parent thread identity is invalid")
         query += " AND edge.parent_thread_id = ?"
         parameters.append(parent_thread_id)
-    if child_thread_ids:
-        children = sorted(set(child_thread_ids))
-        if len(children) != len(child_thread_ids) or any(
-            THREAD_ID.fullmatch(child) is None for child in children
-        ):
-            raise HostEdgeRepairError("child thread identities are invalid or duplicated")
+    if children:
         query += " AND edge.child_thread_id IN (" + ",".join("?" for _ in children) + ")"
         parameters.extend(children)
     query += " ORDER BY edge.child_thread_id"
@@ -356,19 +443,22 @@ def _edge_rows(
 def audit_edges(
     *,
     codex_home: Path,
-    state_root: Path,
     parent_thread_id: str | None,
     child_thread_ids: list[str] | None = None,
+    all_native: bool = False,
+    state_root: Path | None = None,
 ) -> dict[str, Any]:
-    try:
-        home = host_path(codex_home).resolve(strict=True)
-    except (HostPathError, OSError) as error:
-        raise HostEdgeRepairError("Codex home is unavailable") from error
-    if _is_reparse(home):
-        raise HostEdgeRepairError("Codex home cannot be a reparse point")
-    state = _resolved_plain_directory(state_root, label="CCO state root")
+    """Read only the current persisted edge state and trusted child rollouts.
+
+    ``state_root`` remains an ignored compatibility argument.  Host liveness no
+    longer depends on CCO lifecycle state, so a missing or stale state root must
+    not suppress a valid host audit.
+    """
+
+    del state_root
+    home = _trusted_codex_home(codex_home)
     database = _discover_state_db(home)
-    sessions_root = (home / "sessions").resolve(strict=True)
+    sessions_root = _sessions_root(home)
     uri = database.as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True)) as connection:
         connection.row_factory = sqlite3.Row
@@ -377,17 +467,22 @@ def audit_edges(
             connection,
             parent_thread_id=parent_thread_id,
             child_thread_ids=child_thread_ids,
+            all_native=all_native,
         )
     edges = [
-        _validate_terminal_edge(row, state_root=state, sessions_root=sessions_root)
+        _validate_terminal_edge(
+            row,
+            sessions_root=sessions_root,
+            all_native=all_native,
+        )
         for row in rows
     ]
     return {
-        "backup": None,
+        "all_native": all_native,
         "edges": edges,
         "examined": len(edges),
+        "journal": None,
         "mode": "check",
-        "state_root": str(state),
         "protocol": PROTOCOL,
         "repairable": sum(edge["verdict"] == "repairable" for edge in edges),
         "repaired": 0,
@@ -395,56 +490,98 @@ def audit_edges(
     }
 
 
+def _ensure_owner_only(path: Path, *, mode: int, label: str) -> None:
+    try:
+        os.chmod(path, mode)
+        current_mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as error:
+        raise HostEdgeRepairError(f"{label} permissions could not be secured") from error
+    # Windows maps POSIX modes onto its owner/read-only model.  chmod is still
+    # the available owner-only request there; POSIX modes can be verified exactly.
+    if os.name != "nt" and current_mode & 0o077:
+        raise HostEdgeRepairError(f"{label} permissions are not owner-only")
+
+
+def _journal_root(codex_home: Path) -> Path:
+    root = codex_home / "backups" / "cco-host-edge-repair"
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as error:
+        raise HostEdgeRepairError("host-edge rollback journal directory failed") from error
+    if any(_is_reparse(candidate) for candidate in (root, *root.parents)):
+        raise HostEdgeRepairError("host-edge rollback journal directory cannot use a reparse ancestor")
+    _ensure_owner_only(root, mode=0o700, label="host-edge rollback journal directory")
+    try:
+        return root.resolve(strict=True)
+    except OSError as error:
+        raise HostEdgeRepairError("host-edge rollback journal directory failed") from error
+
+
+def _journal_edge(edge: Mapping[str, Any]) -> dict[str, str]:
+    fields = (
+        "parent_thread_id",
+        "child_thread_id",
+        "prior_status",
+        "rollout_path",
+        "proof_digest",
+    )
+    values = {field: edge.get(field) for field in fields}
+    if any(not isinstance(value, str) or not value for value in values.values()):
+        raise HostEdgeRepairError("host-edge rollback journal has incomplete edge proof")
+    return {field: str(values[field]) for field in fields}
+
+
 def _write_rollback_journal(
     database: Path,
     *,
     codex_home: Path,
     edges: list[Mapping[str, Any]],
+    parent_thread_id: str | None = None,
+    all_native: bool = False,
 ) -> Path:
-    """Persist only the rows needed to undo this repair while the DB is locked."""
+    """Atomically persist the minimum undo record before any DB update."""
 
-    backup_root = codex_home / "backups" / "cco-host-edge-repair"
-    backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(backup_root, 0o700)
-    except OSError:
-        pass
-    if any(_is_reparse(candidate) for candidate in (backup_root, *backup_root.parents)):
-        raise HostEdgeRepairError("host-edge backup directory cannot use a reparse ancestor")
+    root = _journal_root(codex_home)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    backup = backup_root / f"{database.stem}-{timestamp}.rollback.json"
-    unsigned = {
-        "created_at": timestamp,
-        "edges": [
-            {
-                "child_thread_id": str(edge["child_thread_id"]),
-                "parent_thread_id": str(edge["parent_thread_id"]),
-                "prior_status": "open",
-            }
-            for edge in sorted(edges, key=lambda item: str(item["child_thread_id"]))
-        ],
+    operation_id = "sha256:" + hashlib.sha256(
+        f"{timestamp}:{secrets.token_hex(16)}".encode("utf-8")
+    ).hexdigest()
+    journal_edges = [
+        _journal_edge(edge)
+        for edge in sorted(edges, key=lambda item: str(item["child_thread_id"]))
+    ]
+    if parent_thread_id is None:
+        parent_ids = {edge["parent_thread_id"] for edge in journal_edges}
+        if len(parent_ids) != 1:
+            raise HostEdgeRepairError("host-edge rollback journal needs one exact parent")
+        parent_thread_id = parent_ids.pop()
+    unsigned: dict[str, Any] = {
+        "edges": journal_edges,
+        "operation": {
+            "all_native": all_native,
+            "created_at": timestamp,
+            "id": operation_id,
+            "kind": "close_open_edges",
+            "parent_thread_id": parent_thread_id,
+            "state_db": database.name,
+        },
         "protocol": ROLLBACK_PROTOCOL,
-        "state_db": database.name,
     }
-    encoded = json.dumps(
-        unsigned, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
-    document = {
-        **unsigned,
-        "sha256": "sha256:" + hashlib.sha256(encoded).hexdigest(),
-    }
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=backup_root,
-        prefix=".cco-host-edge-",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
+    document = {**unsigned, "sha256": _canonical_digest(unsigned)}
+    journal = root / f"{JOURNAL_PREFIX}{timestamp}-{secrets.token_hex(8)}{JOURNAL_SUFFIX}"
+    descriptor = -1
+    temporary: Path | None = None
+    published = False
     try:
-        try:
-            os.chmod(temporary, 0o600)
-        except OSError:
-            pass
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=root,
+            prefix=f".{JOURNAL_PREFIX}",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        _ensure_owner_only(temporary, mode=0o600, label="host-edge rollback journal")
         with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
             stream.write(
                 json.dumps(
                     document,
@@ -456,27 +593,38 @@ def _write_rollback_journal(
             )
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, backup)
+        os.replace(temporary, journal)
+        published = True
+        _ensure_owner_only(journal, mode=0o600, label="host-edge rollback journal")
+    except (HostEdgeRepairError, OSError) as error:
+        if descriptor >= 0:
+            os.close(descriptor)
         try:
-            os.chmod(backup, 0o600)
-        except OSError:
-            pass
-    except OSError as error:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            if published:
+                journal.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            raise HostEdgeRepairError(
+                "host-edge rollback journal could not be cleaned up; no repair was committed"
+            ) from cleanup_error
+        if isinstance(error, HostEdgeRepairError):
+            raise
         raise HostEdgeRepairError("host-edge rollback journal failed") from error
-    finally:
-        temporary.unlink(missing_ok=True)
-    return backup.resolve(strict=True)
+    return journal.resolve(strict=True)
 
 
-def _prune_rollback_journals(backup: Path) -> None:
-    pattern = re.compile(
-        rf"^{re.escape(backup.name.split('-', 1)[0])}-.*\.rollback\.json$"
-    )
+def _prune_rollback_journals(journal: Path) -> None:
     candidates = sorted(
         (
             path
-            for path in backup.parent.iterdir()
-            if path.is_file() and not path.is_symlink() and pattern.fullmatch(path.name)
+            for path in journal.parent.iterdir()
+            if (
+                path.name.startswith(JOURNAL_PREFIX)
+                and path.name.endswith(JOURNAL_SUFFIX)
+                and path.is_file()
+                and not _is_reparse(path)
+            )
         ),
         key=lambda path: (path.stat().st_mtime_ns, path.name),
         reverse=True,
@@ -485,31 +633,57 @@ def _prune_rollback_journals(backup: Path) -> None:
         stale.unlink(missing_ok=True)
 
 
-def _post_commit_warnings(backup: Path) -> list[str]:
+def _post_commit_warnings(journal: Path) -> list[str]:
     try:
-        _prune_rollback_journals(backup)
+        _prune_rollback_journals(journal)
     except OSError:
         return ["repair committed, but old rollback journals could not be pruned"]
     return []
 
 
+def _require_offline_repair(offline_confirmed: bool) -> None:
+    if os.environ.get("CODEX_THREAD_ID", "").strip():
+        raise HostEdgeRepairError("repair cannot run from an active Codex task")
+    if not offline_confirmed:
+        raise HostEdgeRepairError("repair requires explicit --offline-confirm")
+
+
+def _discard_uncommitted_journal(journal: Path | None) -> None:
+    if journal is None:
+        return
+    try:
+        journal.unlink(missing_ok=True)
+    except OSError as error:
+        raise HostEdgeRepairError(
+            "repair rolled back, but its uncommitted rollback journal could not be removed"
+        ) from error
+
+
 def repair_edges(
     *,
     codex_home: Path,
-    state_root: Path,
     parent_thread_id: str | None,
     child_thread_ids: list[str] | None,
+    all_native: bool = False,
+    offline_confirmed: bool = False,
+    state_root: Path | None = None,
 ) -> dict[str, Any]:
+    """Close exactly named proof-backed edges in one immediate transaction."""
+
+    del state_root
+    _require_offline_repair(offline_confirmed)
     if parent_thread_id is None:
         raise HostEdgeRepairError("--repair requires --parent-thread-id")
     if not child_thread_ids:
         raise HostEdgeRepairError("--repair requires at least one --child-thread-id")
-    requested = set(child_thread_ids)
+    requested_children = _validated_child_ids(child_thread_ids)
+    assert requested_children is not None
+    requested = set(requested_children)
     result = audit_edges(
         codex_home=codex_home,
-        state_root=state_root,
         parent_thread_id=parent_thread_id,
-        child_thread_ids=child_thread_ids,
+        child_thread_ids=requested_children,
+        all_native=all_native,
     )
     result["mode"] = "repair"
     reported = {edge["child_thread_id"] for edge in result["edges"]}
@@ -526,10 +700,12 @@ def repair_edges(
             "requested child edges are not proof-backed: " + ",".join(sorted(unproven))
         )
 
-    home = host_path(codex_home).resolve(strict=True)
-    state = Path(str(result["state_root"]))
-    database = Path(result["state_db"])
-    backup: Path | None = None
+    home = _trusted_codex_home(codex_home)
+    database = _resolved_plain_file(
+        Path(str(result["state_db"])), root=home, label="state database"
+    )
+    sessions_root = _sessions_root(home)
+    journal: Path | None = None
     repaired = 0
     with closing(sqlite3.connect(database, timeout=5.0)) as connection:
         connection.row_factory = sqlite3.Row
@@ -537,17 +713,17 @@ def repair_edges(
         connection.execute("BEGIN IMMEDIATE")
         try:
             _require_schema(connection)
-            sessions_root = (home / "sessions").resolve(strict=True)
             fresh_edges = [
                 _validate_terminal_edge(
                     row,
-                    state_root=state,
                     sessions_root=sessions_root,
+                    all_native=all_native,
                 )
                 for row in _edge_rows(
                     connection,
                     parent_thread_id=parent_thread_id,
-                    child_thread_ids=child_thread_ids,
+                    child_thread_ids=requested_children,
+                    all_native=all_native,
                 )
             ]
             candidates = {
@@ -559,12 +735,15 @@ def repair_edges(
                 raise HostEdgeRepairError(
                     "requested child edges changed before repair; no repair was committed"
                 )
-            backup = _write_rollback_journal(
+            journal = _write_rollback_journal(
                 database,
                 codex_home=home,
                 edges=list(candidates.values()),
+                parent_thread_id=parent_thread_id,
+                all_native=all_native,
             )
-            for child, edge in candidates.items():
+            for child in sorted(candidates):
+                edge = candidates[child]
                 changed = connection.execute(
                     """
                     UPDATE thread_spawn_edges
@@ -595,27 +774,24 @@ def repair_edges(
             connection.commit()
         except Exception:
             connection.rollback()
+            _discard_uncommitted_journal(journal)
             raise
-    if backup is None:
+    if journal is None:
         raise HostEdgeRepairError("host-edge rollback journal was not created")
-    result["backup"] = str(backup)
+    result["journal"] = str(journal)
     result["repaired"] = repaired
-    result["warnings"] = _post_commit_warnings(backup)
+    result["warnings"] = _post_commit_warnings(journal)
     return result
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Audit proof-backed stale CCO spawn edges in Codex Desktop state."
+        description="Audit persisted Codex Desktop spawn edges outside a live Codex task."
     )
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
-    parser.add_argument(
-        "--state-root",
-        dest="state_root",
-        type=Path,
-        default=_default_state_root(),
-        help="CCO v9 state directory used to prove terminal ownership",
-    )
+    # Kept only so existing offline runbooks do not fail at argument parsing.  The
+    # value is intentionally unused: liveness derives exclusively from host state.
+    parser.add_argument("--state-root", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--parent-thread-id")
     parser.add_argument(
         "--child-thread-id",
@@ -623,12 +799,24 @@ def _parser() -> argparse.ArgumentParser:
         dest="child_thread_ids",
         help="exact child to inspect or repair; repeat for several children",
     )
+    parser.add_argument(
+        "--all-native",
+        action="store_true",
+        help="include non-CCO native roles; repair still requires an exact parent and children",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="run the default read-only audit")
     mode.add_argument(
         "--repair",
         action="store_true",
-        help="write a minimal rollback journal, then close proof-backed edges for one parent",
+        help="write a rollback journal, then close exact proof-backed edges",
+    )
+    parser.add_argument(
+        "--offline-confirm",
+        "--confirm-offline",
+        dest="offline_confirmed",
+        action="store_true",
+        help="confirm that this repair is being run offline, outside an active Codex task",
     )
     parser.add_argument("--json", action="store_true", help="emit one JSON object")
     return parser
@@ -640,16 +828,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.repair:
             result = repair_edges(
                 codex_home=args.codex_home,
-                state_root=args.state_root,
                 parent_thread_id=args.parent_thread_id,
                 child_thread_ids=args.child_thread_ids,
+                all_native=args.all_native,
+                offline_confirmed=args.offline_confirmed,
+                state_root=args.state_root,
             )
         else:
             result = audit_edges(
                 codex_home=args.codex_home,
-                state_root=args.state_root,
                 parent_thread_id=args.parent_thread_id,
                 child_thread_ids=args.child_thread_ids,
+                all_native=args.all_native,
+                state_root=args.state_root,
             )
     except (HostEdgeRepairError, OSError, sqlite3.Error) as error:
         print(f"ERROR: {error}", file=sys.stderr)
@@ -662,8 +853,8 @@ def main(argv: list[str] | None = None) -> int:
             f"repairable={result['repairable']} repaired={result['repaired']} "
             f"state_db={result['state_db']}"
         )
-        if result["backup"] is not None:
-            print(f"BACKUP: {result['backup']}")
+        if result["journal"] is not None:
+            print(f"JOURNAL: {result['journal']}")
         for warning in result.get("warnings", []):
             print(f"WARNING: {warning}", file=sys.stderr)
         for edge in result["edges"]:

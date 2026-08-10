@@ -34,6 +34,7 @@ from rollout_io import (  # noqa: E402
     RolloutUnavailable,
     first_record,
     is_rollout_path,
+    iter_tail_records,
 )
 from state_lock import StateLockBusy  # noqa: E402
 
@@ -64,6 +65,7 @@ POSTTOOL_INTERNAL_BUDGET_SECONDS = 3.5
 SESSION_START_INTERNAL_BUDGET_SECONDS = 3.5
 STOP_INTERNAL_BUDGET_SECONDS = 3.5
 SUBAGENT_STOP_INTERNAL_BUDGET_SECONDS = 100.0
+RESULT_TAIL_BYTES = 8 * 1024 * 1024
 
 
 def _control(payload: Mapping[str, Any]) -> ControlPlane:
@@ -87,16 +89,6 @@ def _block(error: Exception | str) -> dict[str, str]:
 
 def _event_error(event: object, error: Exception) -> dict[str, Any]:
     message = f"CCO: {error}"
-    if "migrate-recoveries" in str(error):
-        instruction = (
-            f"{message}. Run `python -B <PLUGIN_ROOT>/scripts/control_plane.py "
-            "migrate-recoveries`; it will replay this pending lifecycle event."
-        )
-        if event == "SessionStart":
-            return {"systemMessage": instruction}
-        if event in {"Stop", "SubagentStop"}:
-            return {"decision": "block", "reason": instruction}
-        return {"decision": "block", "reason": instruction}
     if isinstance(
         error,
         (ControlPlaneUnavailable, OperationDeadlineExceeded, StateLockBusy, OSError),
@@ -166,6 +158,15 @@ def _protected(value: object) -> bool:
     return walk(value, 0)
 
 
+def _host_opaque_message(value: object) -> bool:
+    """Recognize the host's protected replacement for one whole tool message."""
+
+    return (
+        isinstance(value, str)
+        and PROTECTED_TOKEN.fullmatch(value.strip()) is not None
+    )
+
+
 def _sessions_root() -> Path:
     configured = os.environ.get("CODEX_HOME")
     home = Path(configured).expanduser() if configured else Path.home() / ".codex"
@@ -179,7 +180,9 @@ def _sessions_root() -> Path:
         raise ControlPlaneUnavailable("Codex sessions root is unavailable") from error
 
 
-def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
+def _trusted_transcript(payload: Mapping[str, Any], agent_id: str) -> Path:
+    if UUID_RE.fullmatch(agent_id) is None and TASK_PATH_RE.fullmatch(agent_id) is None:
+        raise ControlPlaneError("native child identity is unsupported")
     transcript_value = payload.get("agent_transcript_path")
     if not isinstance(transcript_value, str) or not transcript_value:
         raise ControlPlaneError("native child has no transcript identity")
@@ -193,11 +196,16 @@ def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
         raise ControlPlaneUnavailable("native child transcript is unavailable") from error
     if not is_within(_sessions_root(), transcript) or not is_rollout_path(transcript):
         raise ControlPlaneError("native child transcript is outside its trusted root")
-    if not (
+    if UUID_RE.fullmatch(agent_id) is not None and not (
         transcript.name.endswith(f"-{agent_id}.jsonl")
         or transcript.name.endswith(f"-{agent_id}.jsonl.zst")
     ):
         raise ControlPlaneError("native child transcript does not match its UUID")
+    return transcript
+
+
+def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
+    transcript = _trusted_transcript(payload, agent_id)
     try:
         record = first_record(transcript)
     except RolloutUnavailable as error:
@@ -207,7 +215,10 @@ def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
     metadata = record.get("payload") if isinstance(record, Mapping) else None
     if record.get("type") != "session_meta" or not isinstance(metadata, Mapping):
         raise ControlPlaneError("native child transcript has no session metadata")
-    if metadata.get("id") != agent_id or metadata.get("parent_thread_id") != payload.get("session_id"):
+    metadata_id = metadata.get("id")
+    if metadata.get("parent_thread_id") != payload.get("session_id"):
+        raise ControlPlaneError("native child metadata does not match this task")
+    if UUID_RE.fullmatch(agent_id) is not None and metadata_id != agent_id:
         raise ControlPlaneError("native child metadata does not match this task")
     owners: set[str] = set()
     if isinstance(metadata.get("agent_path"), str):
@@ -224,16 +235,92 @@ def _owner_from_transcript(payload: Mapping[str, Any], agent_id: str) -> str:
     owner = owners.pop()
     if TASK_PATH_RE.fullmatch(owner) is None:
         raise ControlPlaneError("native child owner is not canonical")
+    if TASK_PATH_RE.fullmatch(agent_id) is not None:
+        if owner != agent_id or not isinstance(metadata_id, str) or UUID_RE.fullmatch(
+            metadata_id
+        ) is None:
+            raise ControlPlaneError("native child metadata does not match this task")
+        if not (
+            transcript.name.endswith(f"-{metadata_id}.jsonl")
+            or transcript.name.endswith(f"-{metadata_id}.jsonl.zst")
+        ):
+            raise ControlPlaneError("native child transcript does not match its metadata")
     return owner
+
+
+def _result_from_transcript(payload: Mapping[str, Any], expected_owner: str) -> str:
+    """Recover the current turn's protected final result from a trusted rollout.
+
+    An owner can be reused, so its rollout may legitimately contain final
+    CCO_RESULT messages from earlier turns.  The terminal tail is ordered; the
+    last final-answer candidate is therefore authoritative for the stop event
+    currently being handled.  The two host record encodings for the same final
+    answer are intentionally treated the same way: the later encoding simply
+    confirms the same current result.
+    """
+
+    agent_id = payload.get("agent_id")
+    if (
+        not isinstance(agent_id, str)
+        or (
+            UUID_RE.fullmatch(agent_id) is None
+            and TASK_PATH_RE.fullmatch(agent_id) is None
+        )
+    ):
+        raise ControlPlaneError("protected child result has no trusted transcript identity")
+    recovered_owner = _owner_from_transcript(payload, agent_id)
+    if recovered_owner != expected_owner:
+        raise ControlPlaneError("native child transcript owner does not match the stop event")
+    transcript = _trusted_transcript(payload, agent_id)
+    latest_candidate: str | None = None
+    try:
+        for record in iter_tail_records(transcript, max_bytes=RESULT_TAIL_BYTES):
+            checkpoint()
+            record_type = record.get("type")
+            body = record.get("payload")
+            if not isinstance(body, Mapping):
+                continue
+            if (
+                record_type == "event_msg"
+                and body.get("type") == "agent_message"
+                and body.get("phase") == "final_answer"
+                and isinstance(body.get("message"), str)
+            ):
+                candidate = body["message"]
+            elif (
+                record_type == "response_item"
+                and body.get("type") == "message"
+                and body.get("role") == "assistant"
+                and body.get("phase") == "final_answer"
+            ):
+                content = body.get("content")
+                if not isinstance(content, list):
+                    continue
+                text_parts = [
+                    item.get("text")
+                    for item in content
+                    if isinstance(item, Mapping)
+                    and item.get("type") in {"output_text", "text"}
+                    and isinstance(item.get("text"), str)
+                ]
+                candidate = "".join(text_parts)
+            else:
+                continue
+            latest_candidate = candidate
+    except RolloutUnavailable as error:
+        raise ControlPlaneUnavailable("native child result transcript is unavailable") from error
+    except RolloutError as error:
+        raise ControlPlaneError("native child result transcript is invalid") from error
+    if latest_candidate is None or not latest_candidate.startswith("CCO_RESULT cco.v9\n"):
+        raise ControlPlaneError("native child transcript has no final CCO result")
+    return latest_candidate
 
 
 def _owner(payload: Mapping[str, Any]) -> str:
     agent_id = payload.get("agent_id")
     if not isinstance(agent_id, str):
         raise ControlPlaneError("native child has no identity")
-    if TASK_PATH_RE.fullmatch(agent_id) is not None:
-        return agent_id
-    if UUID_RE.fullmatch(agent_id) is not None:
+    if TASK_PATH_RE.fullmatch(agent_id) is not None or UUID_RE.fullmatch(agent_id) is not None:
         return _owner_from_transcript(payload, agent_id)
     raise ControlPlaneError("native child identity is unsupported")
 
@@ -269,29 +356,43 @@ def evaluate(value: object) -> dict[str, Any]:
                     if not isinstance(tool_input, Mapping):
                         raise ControlPlaneError("spawn input is missing")
                     message = tool_input.get("message")
-                    if _protected(message):
+                    opaque_message = _host_opaque_message(message)
+                    if not opaque_message and _protected(message):
                         raise ControlPlaneError(
                             "opaque collaboration content must remain in its protected host field"
                         )
-                    if not isinstance(message, str) or not message.startswith(
-                        TASK_HEADER + "\n"
+                    if not opaque_message and (
+                        not isinstance(message, str) or not message.startswith(
+                            TASK_HEADER + "\n"
+                        )
                     ):
                         raise ControlPlaneError(
                             "prepare every native child through the current cco.v9 plan"
                         )
-                    _control(value).preflight_spawn(value)
+                    _control(value).preflight_spawn(
+                        value,
+                        opaque_message=opaque_message,
+                    )
                     return {}
                 if tool in MESSAGE_TOOLS:
                     if not isinstance(tool_input, Mapping):
                         raise ControlPlaneError("message input is missing")
                     message = tool_input.get("message")
-                    if _protected(message):
+                    opaque_message = _host_opaque_message(message)
+                    if not opaque_message and _protected(message):
                         raise ControlPlaneError(
                             "opaque collaboration content must remain in its protected host field"
                         )
                     target = tool_input.get("target")
                     control = _control(value)
-                    if isinstance(message, str) and message.startswith(
+                    if opaque_message:
+                        if isinstance(target, str) and control.owner_is_managed(target):
+                            if tool not in FOLLOWUP_TOOLS:
+                                raise ControlPlaneError(
+                                    "a managed CCO owner can only receive a prepared followup_task"
+                                )
+                            control.preflight_opaque_followup(value)
+                    elif isinstance(message, str) and message.startswith(
                         TASK_HEADER + "\n"
                     ):
                         if tool not in FOLLOWUP_TOOLS:
@@ -331,10 +432,18 @@ def evaluate(value: object) -> dict[str, Any]:
                     if isinstance(tool_input, Mapping)
                     else None
                 )
-                if isinstance(message, str) and message.startswith(
-                    (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
+                opaque_message = _host_opaque_message(message)
+                if opaque_message or (
+                    isinstance(message, str)
+                    and message.startswith(
+                        (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
+                    )
                 ):
-                    _control(value).process_postflight_event(value)
+                    control = _control(value)
+                    if opaque_message:
+                        control.process_postflight_event(value, opaque_message=True)
+                    else:
+                        control.process_postflight_event(value)
                 return {}
         if event == "Stop":
             if value.get("stop_hook_active") is True:
@@ -356,14 +465,28 @@ def evaluate(value: object) -> dict[str, Any]:
                 ):
                     raise
                 except Exception:
+                    close = getattr(control, "close_unmappable_owner_leases", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except (
+                            ControlPlaneUnavailable,
+                            OperationDeadlineExceeded,
+                            StateLockBusy,
+                            OSError,
+                        ) as error:
+                            return _event_error(event, error)
                     return {
                         "continue": False,
                         "systemMessage": (
-                            "CCO could not map the native child result; Primary must inspect the actual state."
+                            "CCO could not map the native child result and closed its unresolved leases; "
+                            "Primary must inspect the actual state."
                         )
                     }
-                message = value.get("last_assistant_message")
                 try:
+                    message = value.get("last_assistant_message")
+                    if _host_opaque_message(message) or _protected(message):
+                        message = _result_from_transcript(value, owner)
                     control.process_result_event(owner, message)
                 except (
                     ControlPlaneUnavailable,

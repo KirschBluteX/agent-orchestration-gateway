@@ -25,11 +25,7 @@ from workspace_state import StateUnavailable  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 STATE_TOOL = (
-    REPO
-    / "plugins"
-    / "codex-cost-orchestrator"
-    / "scripts"
-    / "workspace_state.py"
+    REPO / "plugins" / "codex-cost-orchestrator" / "scripts" / "workspace_state.py"
 )
 
 
@@ -257,12 +253,210 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(result["changed_paths"], ["secret.txt"])
             self.assertEqual(result["violations"], ["outside_lease:secret.txt"])
 
+    def test_scoped_reader_policy_uses_literal_pathspecs_and_scoped_budgets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            reader = repo / "reader"
+            generated = repo / "generated"
+            reader.mkdir()
+            generated.mkdir()
+            (repo / ".gitignore").write_text(
+                "reader/*.cache\ngenerated/\n",
+                encoding="utf-8",
+            )
+            (reader / "snapshot.cache").write_text("reader\n", encoding="utf-8")
+            (generated / "dependency.cache").write_text(
+                "outside\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(self.git(repo, "add", ".gitignore").returncode, 0)
+            committed = self.git(
+                repo,
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-m",
+                "ignore generated trees",
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            scopes = [{"kind": "prefix", "path": "reader"}]
+            original_git = workspace_state_module.git
+            ignored_calls: list[tuple[str, ...]] = []
+
+            def observed_git(root_path: Path, *args: str) -> bytes:
+                if args[:1] == ("ls-files",) and "--ignored" in args:
+                    ignored_calls.append(args)
+                return original_git(root_path, *args)
+
+            with mock.patch.object(
+                workspace_state_module,
+                "git",
+                side_effect=observed_git,
+            ):
+                snapshot = workspace_state_module.state_payload(
+                    repo,
+                    ignored_policy=(
+                        workspace_state_module.IGNORED_POLICY_SCOPED_READER_V1
+                    ),
+                    scopes=scopes,
+                )
+
+            self.assertEqual(
+                snapshot["ignored_policy"],
+                workspace_state_module.IGNORED_POLICY_SCOPED_READER_V1,
+            )
+            self.assertEqual(
+                snapshot["ignored_scope_digest"],
+                workspace_state_module.ignored_scope_digest(scopes),
+            )
+            self.assertIn("reader/snapshot.cache", snapshot["entries"])
+            self.assertIn(
+                "sha256",
+                snapshot["entries"]["reader/snapshot.cache"]["ignored"]["fingerprint"],
+            )
+            self.assertNotIn("generated/dependency.cache", snapshot["entries"])
+            self.assertEqual(
+                ignored_calls,
+                [
+                    (
+                        "ls-files",
+                        "--others",
+                        "--ignored",
+                        "--exclude-standard",
+                        "-z",
+                        "--",
+                        ":(top,literal)reader",
+                    )
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                workspace_state_module.StateError,
+                "ignored scan exceeds the 0 file limit",
+            ):
+                workspace_state_module.state_payload(
+                    repo,
+                    ignored_max_files=0,
+                    ignored_policy=(
+                        workspace_state_module.IGNORED_POLICY_SCOPED_READER_V1
+                    ),
+                    scopes=scopes,
+                )
+            with self.assertRaisesRegex(
+                workspace_state_module.StateError,
+                "ignored scan exceeds the 1 byte limit",
+            ):
+                workspace_state_module.state_payload(
+                    repo,
+                    ignored_max_bytes=1,
+                    ignored_policy=(
+                        workspace_state_module.IGNORED_POLICY_SCOPED_READER_V1
+                    ),
+                    scopes=scopes,
+                )
+
+    def test_scoped_reader_policy_keeps_hidden_tracked_paths_authoritative(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            (repo / "reader").mkdir()
+            scopes = [{"kind": "prefix", "path": "reader"}]
+            marked = self.git(
+                repo,
+                "update-index",
+                "--assume-unchanged",
+                "notes.txt",
+            )
+            self.assertEqual(marked.returncode, 0, marked.stderr)
+            baseline = workspace_state_module.state_payload(
+                repo,
+                ignored_policy=workspace_state_module.IGNORED_POLICY_SCOPED_READER_V1,
+                scopes=scopes,
+            )
+            (repo / "notes.txt").write_text("hidden change\n", encoding="utf-8")
+            (repo / "src" / "owned.txt").write_text(
+                "ordinary outside change\n",
+                encoding="utf-8",
+            )
+
+            code, result, _current = workspace_state_module.verify(
+                repo,
+                baseline,
+                [],
+                entry_scopes=scopes,
+            )
+
+            self.assertEqual(code, 1)
+            self.assertEqual(result["changed_paths"], ["notes.txt", "src/owned.txt"])
+            self.assertEqual(
+                result["violations"],
+                ["outside_lease:notes.txt", "outside_lease:src/owned.txt"],
+            )
+
+    def test_scoped_reader_policy_binds_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            reader = repo / "reader"
+            generated = repo / "generated"
+            reader.mkdir()
+            generated.mkdir()
+            (repo / ".gitignore").write_text(
+                "reader/*.cache\ngenerated/\n",
+                encoding="utf-8",
+            )
+            (reader / "snapshot.cache").write_text("reader\n", encoding="utf-8")
+            (generated / "dependency.cache").write_text(
+                "outside\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(self.git(repo, "add", ".gitignore").returncode, 0)
+            committed = self.git(
+                repo,
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-m",
+                "ignore generated trees",
+            )
+            self.assertEqual(committed.returncode, 0, committed.stderr)
+            scopes = [{"kind": "prefix", "path": "reader"}]
+            scoped = workspace_state_module.state_payload(
+                repo,
+                ignored_policy=workspace_state_module.IGNORED_POLICY_SCOPED_READER_V1,
+                scopes=scopes,
+            )
+            with self.assertRaisesRegex(
+                workspace_state_module.StateError,
+                "reader scopes do not match",
+            ):
+                workspace_state_module.verify(
+                    repo,
+                    scoped,
+                    [],
+                    entry_scopes=[{"kind": "prefix", "path": "src"}],
+                )
+
+
     def test_verifies_only_the_allowed_delta_from_a_dirty_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
-            (repo / "notes.txt").write_text("pre-existing user edit\n", encoding="utf-8")
-            (repo / "scratch.tmp").write_text("pre-existing untracked\n", encoding="utf-8")
+            (repo / "notes.txt").write_text(
+                "pre-existing user edit\n", encoding="utf-8"
+            )
+            (repo / "scratch.tmp").write_text(
+                "pre-existing untracked\n", encoding="utf-8"
+            )
 
             capture = subprocess.run(
                 [sys.executable, str(STATE_TOOL), "capture", "--repo", str(repo)],
@@ -413,7 +607,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             emitted = json.loads(next_baseline.read_text(encoding="utf-8"))
             self.assertEqual(emitted["state_id"], result["current_state"])
 
-    def test_verify_rejects_a_legacy_untyped_allow_value(self) -> None:
+    def test_verify_rejects_an_untyped_allow_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -469,7 +663,10 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
 
             self.assertEqual(capture.returncode, 0, capture.stderr)
             self.assertEqual(capture.stdout, "")
-            self.assertEqual(json.loads(baseline.read_text(encoding="utf-8"))["schema"], "cco.workspace-state.v3")
+            self.assertEqual(
+                json.loads(baseline.read_text(encoding="utf-8"))["schema"],
+                workspace_state_module.SCHEMA,
+            )
 
             inside = repo / "baseline.json"
             refused = subprocess.run(
@@ -490,7 +687,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertFalse(inside.exists())
 
     @unittest.skipUnless(os.name == "nt", "Win32 device paths are Windows-specific")
-    def test_capture_rejects_device_aliases_that_resolve_inside_the_repository(self) -> None:
+    def test_capture_rejects_device_aliases_that_resolve_inside_the_repository(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -760,7 +959,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
 
     @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
-    def test_git_control_junction_target_change_updates_workspace_identity(self) -> None:
+    def test_git_control_junction_target_change_updates_workspace_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -816,7 +1017,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertIn("hooks_changed", json.loads(verify.stdout)["violations"])
 
     @unittest.skipUnless(os.name == "nt", "junctions are Windows-specific")
-    def test_git_control_junction_target_content_change_updates_workspace_identity(self) -> None:
+    def test_git_control_junction_target_content_change_updates_workspace_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -1114,7 +1317,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             baseline = root / "baseline.json"
             baseline.write_text(capture.stdout, encoding="utf-8")
 
-            (repo / "src" / "owned.txt").write_text("staged worker edit\n", encoding="utf-8")
+            (repo / "src" / "owned.txt").write_text(
+                "staged worker edit\n", encoding="utf-8"
+            )
             self.assertEqual(self.git(repo, "add", "src/owned.txt").returncode, 0)
             verify = subprocess.run(
                 [
@@ -1381,14 +1586,19 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 1, verify.stderr)
             self.assertIn("git_admin_changed", json.loads(verify.stdout)["violations"])
 
-    def test_git_admin_digest_covers_alternates_sequences_and_worktree_registry(self) -> None:
+    def test_git_admin_digest_covers_alternates_sequences_and_worktree_registry(
+        self,
+    ) -> None:
         mutations = (
             ("objects/info/alternates", "{alternate}\n"),
             ("sequencer/todo", "pick deadbeef test\n"),
             ("worktrees/ghost/gitdir", "{repo}/ghost/.git\n"),
         )
         for relative, template in mutations:
-            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                self.subTest(relative=relative),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
                 root = Path(temp_dir)
                 repo = self.make_repo(root)
                 alternate = root / "alternate-objects"
@@ -1503,9 +1713,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 1, verify.stderr)
             result = json.loads(verify.stdout)
             self.assertEqual(result["changed_paths"], ["src/owned.txt"])
-            self.assertEqual(
-                result["violations"], ["outside_lease:src/owned.txt"]
-            )
+            self.assertEqual(result["violations"], ["outside_lease:src/owned.txt"])
 
     def test_tracked_content_is_observed_despite_skip_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1544,11 +1752,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 1, verify.stderr)
             result = json.loads(verify.stdout)
             self.assertEqual(result["changed_paths"], ["src/owned.txt"])
-            self.assertEqual(
-                result["violations"], ["outside_lease:src/owned.txt"]
-            )
+            self.assertEqual(result["violations"], ["outside_lease:src/owned.txt"])
 
-    def test_v3_baseline_requires_every_security_identity_field(self) -> None:
+    def test_snapshot_requires_every_security_identity_field(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
@@ -1561,7 +1767,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(capture.returncode, 0, capture.stderr)
             snapshot = json.loads(capture.stdout)
             snapshot.pop("repo_identity")
-            unsigned = {key: value for key, value in snapshot.items() if key != "state_id"}
+            unsigned = {
+                key: value for key, value in snapshot.items() if key != "state_id"
+            }
             canonical = json.dumps(
                 unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
             ).encode("utf-8")
@@ -1585,7 +1793,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             )
 
             self.assertEqual(verify.returncode, 2)
-            self.assertIn("exact v3 required fields", verify.stderr)
+            self.assertIn("exact v4 required fields", verify.stderr)
 
     def test_already_dirty_submodule_content_remains_observed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1649,9 +1857,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(verify.returncode, 1, verify.stderr)
             result = json.loads(verify.stdout)
             self.assertEqual(result["changed_paths"], ["vendor/child"])
-            self.assertEqual(
-                result["violations"], ["outside_lease:vendor/child"]
-            )
+            self.assertEqual(result["violations"], ["outside_lease:vendor/child"])
 
             child_lease = subprocess.run(
                 [
@@ -1858,9 +2064,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             result = json.loads(verify.stdout)
             self.assertEqual(result["schema"], "cco.workspace-verification.v3")
             self.assertEqual(result["allowed_scopes"], [])
-            self.assertEqual(
-                result["violations"], ["outside_lease:src/owned.txt"]
-            )
+            self.assertEqual(result["violations"], ["outside_lease:src/owned.txt"])
 
 
 if __name__ == "__main__":
