@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,17 @@ class StateLockTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 with acquire(Path(directory), "session", timeout=-1):
                     pass
+
+    def test_identity_and_budget_inputs_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for identity in ("", "../outside", "session/child", "session\\child"):
+                with self.subTest(identity=identity), self.assertRaises(ValueError):
+                    lock_path(root, identity)
+            for timeout in (True, math.inf, math.nan):
+                with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                    with acquire(root, "session", timeout=timeout):
+                        pass
 
 
 if __name__ == "__main__":

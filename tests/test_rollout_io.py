@@ -73,6 +73,33 @@ class RolloutIoTests(unittest.TestCase):
                 [{"tail": True}],
             )
 
+    def test_partial_plain_tail_is_retryable_not_a_malformed_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_bytes(b'{"tail":true}')
+
+            with self.assertRaisesRegex(RolloutUnavailable, "still being written"):
+                list(iter_tail_records(path, max_bytes=64))
+
+    def test_partial_compressed_tail_is_retryable_not_a_malformed_result(self) -> None:
+        try:
+            from compression import zstd
+
+            encoded = zstd.compress(b'{"tail":true}\n')
+        except ImportError:
+            try:
+                import zstandard
+            except ImportError:
+                self.skipTest("no zstd decoder is available")
+            encoded = zstandard.ZstdCompressor().compress(b'{"tail":true}\n')
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl.zst"
+            path.write_bytes(encoded[:-1])
+
+            with self.assertRaisesRegex(RolloutUnavailable, "still being written"):
+                list(iter_tail_records(path, max_bytes=64))
+
 
 if __name__ == "__main__":
     unittest.main()

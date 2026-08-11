@@ -412,6 +412,46 @@ class HostEdgeRepairTests(unittest.TestCase):
         self.assertEqual(self.status(child), "open")
         self.assertFalse((self.home / "backups").exists())
 
+    def test_repair_binds_the_journalled_rollout_proof_before_commit(self) -> None:
+        child = child_id(141)
+        self.add_edge(child, [event("task_started"), event("task_complete")])
+        real_write = repair_host_edges._write_rollback_journal
+
+        def mutate_after_journal(*args: object, **kwargs: object) -> Path:
+            journal = real_write(*args, **kwargs)
+            self.write_rollout(child, [event("task_started")])
+            return journal
+
+        with patch.object(
+            repair_host_edges,
+            "_write_rollback_journal",
+            side_effect=mutate_after_journal,
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "proof changed before repair commit"):
+                self.repair([child])
+
+        self.assertEqual(self.status(child), "open")
+        journals = self.home / "backups" / "cco-host-edge-repair"
+        self.assertFalse(list(journals.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")))
+
+    def test_repair_checks_proof_after_retention_before_commit(self) -> None:
+        child = child_id(142)
+        self.add_edge(child, [event("task_started"), event("task_complete")])
+
+        def mutate_during_retention(_journal: Path) -> list[str]:
+            self.write_rollout(child, [event("task_started")])
+            return []
+
+        with patch.object(
+            repair_host_edges,
+            "_post_commit_warnings",
+            side_effect=mutate_during_retention,
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "proof changed before repair commit"):
+                self.repair([child])
+
+        self.assertEqual(self.status(child), "open")
+
     def test_journal_is_minimal_private_retained_and_journal_failure_rolls_back(self) -> None:
         child = child_id(15)
         self.add_edge(child, [event("task_complete")])
@@ -451,6 +491,8 @@ class HostEdgeRepairTests(unittest.TestCase):
             if path.name.startswith(JOURNAL_PREFIX) and path.name.endswith(JOURNAL_SUFFIX)
         ]
         self.assertEqual(len(retained), ROLLBACK_RETENTION)
+        self.assertTrue(journal.exists())
+        self.assertIn(journal, retained)
 
         rollback_child = child_id(16)
         self.add_edge(rollback_child, [event("task_complete")])

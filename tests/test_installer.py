@@ -132,6 +132,33 @@ class InstallerTests(unittest.TestCase):
                 1,
             )
 
+    def test_doctor_rejects_duplicate_and_unknown_cco_hook_definitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "agents"
+            install(target)
+            for event_name in ("stop", "sessionEnd"):
+                with self.subTest(event_name=event_name):
+                    inventory = hook_inventory()
+                    hooks = inventory["hooks"]
+                    assert isinstance(hooks, list)
+                    hooks.append(
+                        {
+                            "enabled": True,
+                            "eventName": event_name,
+                            "pluginId": "codex-cost-orchestrator@codex-cost-orchestrator",
+                            "trustStatus": "trusted",
+                        }
+                    )
+                    self.assertEqual(
+                        doctor(
+                            target,
+                            workspace=ROOT,
+                            native_loader=native_catalog,
+                            hook_loader=lambda _workspace, value=inventory: value,
+                        ),
+                        1,
+                    )
+
     def test_doctor_uses_canonical_repository_root_for_subdirectory(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

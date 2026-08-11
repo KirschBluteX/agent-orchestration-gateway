@@ -10,13 +10,19 @@ python -m pip install -r requirements.txt
 codex plugin marketplace add .
 codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
 python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --bootstrap
-python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
 ```
 
 Python 3.11+ is required; `zstandard` is required on Python versions below 3.14. Review and trust
-the five CCO entries in `/hooks`, then start a new Codex task.
+the five exact CCO entries in `/hooks`, then start a new Codex task and run doctor:
 
-CCO is pre-1.0. Version `0.9.0` is the plain public, installer, and manifest identity: it has no
+```text
+python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
+```
+
+Doctor rejects missing, duplicate, or unknown CCO Hook definitions from the authoritative host
+inventory.
+
+CCO is pre-1.0. Version `0.9.1` is the plain public, installer, and manifest identity: it has no
 build metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
 through 5.x are compressed into pre-0.9 development history; Git history remains unchanged.
 Current records are `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. If predecessor state,
@@ -36,6 +42,11 @@ object. Invoke returned `tool_name` values only with their supplied `tool_input`
 settled plan. After dispatch, repeat long `wait_agent` windows until completion or required
 attention. A `timed_out` result means another long wait, not a retry, progress report, or duplicate
 execution.
+
+CCO fails closed if a collaboration Hook receives an opaque Agent message without trusted metadata
+binding it to the prepared input digest. This host incompatibility cannot be repaired by trusting
+the Hook or copying the ciphertext. Use a Codex build that exposes plaintext or an authenticated
+binding; never weaken the check locally.
 
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py status
@@ -64,7 +75,8 @@ rollback or explicit intervention. This is a coordination boundary, not a sandbo
 Codex Desktop owns persisted task-card edges. The repair tool is an offline fallback and is never
 called by a Hook. Leave the active task, keep `CODEX_THREAD_ID` unset, use `--offline-confirm`, and
 name the exact parent and every child that may be closed. It creates an owner-only rollback journal
-before repair.
+before repair, retains that current journal despite clock anomalies, and rechecks the rollout proof
+immediately before the database commit.
 
 ```text
 python -B plugins/codex-cost-orchestrator/maintenance/repair_host_edges.py --check

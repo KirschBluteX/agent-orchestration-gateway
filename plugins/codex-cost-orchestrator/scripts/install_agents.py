@@ -30,7 +30,7 @@ from workspace_guard import WorkspaceGuardError, discover_workspace
 
 
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.1"
 PLUGIN_RELEASE = PLUGIN_VERSION
 PROFILES = {
     "read": ("codex-cost-orchestrator-read-leaf.toml", "cost_orchestrator_read_leaf"),
@@ -361,9 +361,20 @@ def doctor(
             for item in inventory.get("hooks", [])
             if isinstance(item, dict) and item.get("pluginId") == PLUGIN_ID
         ]
-        counts = Counter(item.get("eventName") for item in discovered)
+        counts: Counter[str] = Counter()
+        unknown_definitions = False
+        for item in discovered:
+            event = item.get("eventName")
+            if not isinstance(event, str) or event not in EXPECTED_HOOKS:
+                unknown_definitions = True
+                continue
+            counts[event] += 1
         if any(counts[event] < count for event, count in EXPECTED_HOOKS.items()):
             errors.append("Codex did not discover every current CCO Hook")
+        if any(counts[event] > count for event, count in EXPECTED_HOOKS.items()):
+            errors.append("Codex discovered duplicate CCO Hook definitions")
+        if unknown_definitions:
+            errors.append("Codex discovered unknown CCO Hook definitions")
         if any(
             item.get("enabled") is not True
             or str(item.get("trustStatus", "")).casefold() not in {"managed", "trusted"}

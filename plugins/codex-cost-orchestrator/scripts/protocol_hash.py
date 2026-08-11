@@ -14,7 +14,7 @@ MAX_SAFE_INTEGER = (1 << 53) - 1
 MAX_NESTING_LEVELS = 64
 SCOPE_KINDS = frozenset({"exact", "prefix"})
 WIN32_DEVICE_BASENAME = re.compile(
-    r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9]|LPT[1-9])$",
+    r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])$",
     re.IGNORECASE,
 )
 WIN32_FORBIDDEN_PATH_CHARACTERS = frozenset('<>"|?*')

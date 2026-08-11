@@ -5,8 +5,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import errno
+import math
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Iterator
@@ -20,12 +22,30 @@ _DEFAULT_WAIT_SECONDS = 5.0
 _LOCAL_GUARD = threading.RLock()
 _LOCAL_LOCKS: dict[str, threading.RLock] = {}
 _HELD: dict[str, tuple[int, int]] = {}
+_IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
+
+
+def _require_identity(value: object) -> str:
+    if not isinstance(value, str) or _IDENTITY_RE.fullmatch(value) is None:
+        raise ValueError("state lock identity is invalid")
+    return value
+
+
+def _require_timeout(value: object) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("state lock timeout must be a finite non-negative number")
+    return float(value)
 
 
 def lock_path(root: Path, identity: str) -> Path:
     """Return the lock path for one validated coordination identity."""
 
-    return Path(root) / f".{identity}.cco-state.lock"
+    return Path(root) / f".{_require_identity(identity)}.cco-state.lock"
 
 
 def _key(path: Path) -> str:
@@ -101,8 +121,7 @@ def acquire(
 ) -> Iterator[None]:
     """Acquire one re-entrant OS lock for a lifecycle or workspace identity."""
 
-    if timeout < 0:
-        raise ValueError("state lock timeout must be non-negative")
+    timeout = _require_timeout(timeout)
     path = lock_path(root, identity)
     key = _key(path)
     local = _local_lock(key)

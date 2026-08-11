@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 
+from benchmarks.cco_benchmark import BenchmarkError, _validate_result
+
 
 REPO = Path(__file__).resolve().parents[1]
 PILOT = REPO / "benchmarks" / "manifests" / "featurebench-pilot-v1.json"
@@ -464,7 +466,16 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     "models": {
                         "gpt-5.6-sol/max": counters(
                             input_tokens=100, cached=40, output=10, requests=1
-                        )
+                        ),
+                        **(
+                            {
+                                "gpt-5.6-terra/max": counters(
+                                    input_tokens=50, cached=20, output=5, requests=1
+                                )
+                            }
+                            if is_cco
+                            else {}
+                        ),
                     },
                     "families": {
                         "sol": counters(
@@ -537,6 +548,53 @@ class BenchmarkHarnessTests(unittest.TestCase):
             ],
             40,
         )
+
+    def test_result_rejects_inconsistent_model_and_family_usage(self) -> None:
+        def counter(*, input_tokens: int, requests: int) -> dict[str, int]:
+            return {
+                "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "input_tokens": input_tokens,
+                "output_tokens": 0,
+                "reasoning_output_tokens": 0,
+                "requests": requests,
+                "total_tokens": input_tokens,
+                "uncached_input_tokens": input_tokens,
+            }
+
+        expected = {
+            "arm_id": "cco-static",
+            "arm_mode": "cco_static",
+            "manifest_sha256": "sha256:" + "a" * 64,
+            "repetition": 1,
+            "run_id": "run-accounting",
+            "task_id": "owner__repo.task.lv1",
+        }
+        root_thread_id = "11111111-1111-4111-8111-111111111111"
+        result = {
+            **expected,
+            "protocol": "cco.benchmark-result.v1",
+            "root_thread_id": root_thread_id,
+            "verdict": "pass",
+            "wall_time_seconds": 1,
+            "usage": {
+                "families": {
+                    "sol": counter(input_tokens=10, requests=1),
+                    "terra": counter(input_tokens=0, requests=0),
+                    "luna": counter(input_tokens=0, requests=0),
+                },
+                "models": {
+                    "gpt-5.6-sol/max": counter(input_tokens=10, requests=1),
+                    "gpt-5.6-terra/max": counter(input_tokens=5, requests=1),
+                },
+                "protocol": "cco.benchmark-usage.v1",
+                "root_thread_id": root_thread_id,
+                "unexpected_models": [],
+            },
+        }
+
+        with self.assertRaisesRegex(BenchmarkError, "model/family usage"):
+            _validate_result(result, expected=expected)
 
     def test_summary_cli_fails_closed_when_a_planned_result_is_missing(self) -> None:
         manifest = self._manifest()

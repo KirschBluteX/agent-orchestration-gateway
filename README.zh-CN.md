@@ -2,11 +2,11 @@
 
 [English](README.md)
 
-> **预 1.0（pre-1.0）发布政策：**公开、安装程序和清单的发布标识均为无构建元数据的 `0.9.0`。在 1.0 之前，次版本可能包含破坏性变更。历史的 2.x 至 5.x 标签已压缩为 0.9 之前的开发历史；Git 历史保持不变。
+> **预 1.0（pre-1.0）发布政策：**公开、安装程序和清单的发布标识均为无构建元数据的 `0.9.1`。在 1.0 之前，次版本可能包含破坏性变更。历史的 2.x 至 5.x 标签已压缩为 0.9 之前的开发历史；Git 历史保持不变。
 
 Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的本地控制面。Primary 保留意图、
 集成和最终验收；CCO 负责已闭合、已定范围工作的派发与验收证据。当前预 1.0 版本为
-`0.9.0`。
+`0.9.1`。
 
 ## 派发契约
 
@@ -21,6 +21,10 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --ca
 只以返回的原始工具输入调用每个 action。复杂且尚未闭合的工作可先由一个普通的
 Terra/max 只读规划任务处理；其结果仅是无状态的 `cco.planner-proposal.v1` DAG 输入。
 CCO 不会创建规划路由，也不会运行第二个规划生命周期。
+
+原生 Hook 边界必须提供该工具输入的精确明文，或提供能够认证 prepared-input digest 的
+可信元数据。若宿主把 Agent 消息替换为无法绑定的 opaque 密文，CCO 会在 spawn、复用或
+continuation 之前拒绝操作；不要绕过该检查。宿主提供可绑定的 Hook 契约后即可恢复派发。
 
 只有显式权限、需要澄清、显式 direct 请求，或一个声明为少于 30 秒的工具时，工作才
 留在 Primary。派发后持续使用长 `wait_agent` 窗口，直到子任务完成或确实需要处理；
@@ -49,7 +53,7 @@ guarded plan 在所有非 reviewer 源节点之后有一个独立最终 reviewer
 ## 状态与升级
 
 当前协议为 `cco.wave.v3`、`cco.lifecycle.v2` 与 `cco.receipt.v2`。早期活动状态、wave、
-lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 0.9.0 前必须清理，再开始
+lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 0.9.1 前必须清理，再开始
 新任务。不存在迁移命令，也不存在活动状态兼容层。
 
 只读任务只扫描声明的范围。对于同一规范工作区，CCO 只允许一个普通 writer，并会对
@@ -85,11 +89,14 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
 ```
 
+Doctor 会拒绝缺失、重复或未知的 CCO Hook 定义。
+
 ## 离线 host-edge 修复
 
 Codex Desktop 拥有持久化 task-card edge。CCO 不会在 Hook 中修改该数据库。可选修复工具是
 离线兜底：离开活动任务，保持 `CODEX_THREAD_ID` 未设置，使用 `--offline-confirm`，并提供
-精确的 parent 和 child ID。修复前会创建仅 owner 可读写的回滚 journal。详见
+精确的 parent 和 child ID。修复前会持久化创建仅 owner 可读写的回滚 journal，并在数据库提交前
+重新校验精确 rollout 证明。详见
 [操作说明](docs/OPERATIONS.md#offline-host-edge-repair)。
 
 ## 开发

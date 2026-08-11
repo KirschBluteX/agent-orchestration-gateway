@@ -26,6 +26,7 @@ from control_plane import (  # noqa: E402
 )
 from delegation_compiler import compile_delegation_request  # noqa: E402
 import writer_isolation as isolation_module  # noqa: E402
+from operation_deadline import deadline_after  # noqa: E402
 
 
 def catalog() -> dict[str, object]:
@@ -176,7 +177,18 @@ class CooperativeWriterTests(unittest.TestCase):
         ]
         self.assertEqual(
             status_calls,
-            [("status", "--porcelain=v1", "-z", "--untracked-files=normal")],
+            [
+                (
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignored=matching",
+                    "--",
+                    ":(top,literal)a.txt",
+                    ":(top,literal)b.txt",
+                )
+            ],
         )
         self.assertEqual(len(actions), 2)
         for action in actions:
@@ -197,6 +209,48 @@ class CooperativeWriterTests(unittest.TestCase):
             notice = task["writer_isolation"]["notice"]
             self.assertIn("not a sandbox", notice)
             self.assertIn("Work only", notice)
+
+    def test_ignored_writer_content_selects_a_bounded_copy(self) -> None:
+        repo = self.make_workspace("clean")
+        (repo / ".gitignore").write_text("a.cache\n", encoding="utf-8")
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=CCO Tests",
+                "-c",
+                "user.email=cco-tests@example.invalid",
+                "commit",
+                "-qm",
+                "ignore cache",
+            ],
+            cwd=repo,
+            check=True,
+        )
+        (repo / "a.cache").write_text("required ignored input\n", encoding="utf-8")
+
+        records = isolation_module.prepare_isolates(
+            self.root / "ignored-state",
+            repo,
+            backend="git",
+            session_id="ignored-copy",
+            batch_id="sha256:" + "9" * 64,
+            members=[
+                {
+                    "id": "left",
+                    "scopes": [{"kind": "exact", "path": "a.cache"}],
+                }
+            ],
+        )
+
+        self.assertEqual(records[0]["mode"], isolation_module.COPY)
+        isolate = Path(records[0]["isolate_root"])
+        self.assertEqual(
+            (isolate / "a.cache").read_text(encoding="utf-8"),
+            "required ignored input\n",
+        )
+        self.assertEqual(isolation_module.cleanup_isolates(self.root / "ignored-state", records), 1)
 
     def test_guarded_cooperative_writers_run_before_the_final_reviewer(self) -> None:
         repo = self.make_workspace("clean")
@@ -1278,6 +1332,56 @@ class CooperativeWriterTests(unittest.TestCase):
         self.assertTrue(all(not root.exists() for root in roots))
         with control._coordinated_state() as state:
             self.assertNotIn("cooperative_preparing", state)
+
+    def test_git_isolation_clears_routing_overrides_and_bounds_active_deadlines(self) -> None:
+        canonical = self.make_workspace()
+        redirected = self.make_workspace("redirected")
+        with patch.dict(
+            os.environ,
+            {
+                "GIT_COMMON_DIR": str(redirected / ".git"),
+                "GIT_DIR": str(redirected / ".git"),
+                "GIT_INDEX_FILE": str(redirected / ".git" / "index"),
+                "GIT_WORK_TREE": str(redirected),
+            },
+        ):
+            result = isolation_module._git(canonical, "rev-parse", "--show-toplevel")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout.decode().strip()), canonical.resolve())
+
+        completed = subprocess.CompletedProcess(["git"], 0, stdout=b"", stderr=b"")
+        with (
+            deadline_after(5),
+            patch.object(isolation_module.subprocess, "run", return_value=completed) as run,
+        ):
+            isolation_module._git(canonical, "status")
+        kwargs = run.call_args.kwargs
+        self.assertGreater(kwargs["timeout"], 0)
+        self.assertLessEqual(kwargs["timeout"], 5)
+        self.assertNotIn("GIT_DIR", kwargs["env"])
+        self.assertNotIn("GIT_WORK_TREE", kwargs["env"])
+
+    def test_identity_and_empty_scope_apis_fail_before_isolate_materialization(self) -> None:
+        canonical = self.make_workspace("directory")
+        state_root = self.root / "empty-scope-state"
+        with self.assertRaisesRegex(isolation_module.WriterIsolationError, "member scopes"):
+            isolation_module.prepare_isolates(
+                state_root,
+                canonical,
+                backend="directory",
+                session_id="empty-scope",
+                batch_id="sha256:" + "e" * 64,
+                members=[{"id": "writer", "scopes": []}],
+            )
+        self.assertFalse(state_root.exists())
+        with self.assertRaisesRegex(isolation_module.WriterIsolationError, "ambiguous"):
+            isolation_module.scoped_content_identity(
+                canonical,
+                [
+                    {"kind": "exact", "path": "a.txt"},
+                    {"kind": "exact", "path": "a.txt"},
+                ],
+            )
 
 
 if __name__ == "__main__":

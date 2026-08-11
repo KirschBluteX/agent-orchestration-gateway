@@ -357,14 +357,23 @@ def evaluate(value: object) -> dict[str, Any]:
                         raise ControlPlaneError("spawn input is missing")
                     message = tool_input.get("message")
                     opaque_message = _host_opaque_message(message)
-                    if not opaque_message and _protected(message):
+                    if opaque_message:
+                        # The Hook contract exposes only the replacement
+                        # ciphertext, not an authenticated binding from that
+                        # ciphertext to the prepared tool input.  Treating a
+                        # Fernet-shaped string as authority would let a
+                        # substituted protected message claim the sole
+                        # matching dispatch.  Keep the plaintext CCO contract
+                        # visible until the host supplies such a binding.
+                        raise ControlPlaneError(
+                            "opaque CCO spawn has no trustworthy host binding"
+                        )
+                    if _protected(message):
                         raise ControlPlaneError(
                             "opaque collaboration content must remain in its protected host field"
                         )
-                    if not opaque_message and (
-                        not isinstance(message, str) or not message.startswith(
-                            TASK_HEADER + "\n"
-                        )
+                    if not isinstance(message, str) or not message.startswith(
+                        TASK_HEADER + "\n"
                     ):
                         raise ControlPlaneError(
                             "prepare every native child through the current cco.v9 plan"
@@ -379,20 +388,33 @@ def evaluate(value: object) -> dict[str, Any]:
                         raise ControlPlaneError("message input is missing")
                     message = tool_input.get("message")
                     opaque_message = _host_opaque_message(message)
-                    if not opaque_message and _protected(message):
+                    if opaque_message:
+                        # An opaque replacement cannot prove whether it is the
+                        # prepared reuse or continuation message.  In
+                        # particular, the ciphertext's shape is not a host
+                        # capability.  Every opaque followup fails closed,
+                        # even before a target can be recognized as managed.
+                        if tool in FOLLOWUP_TOOLS:
+                            raise ControlPlaneError(
+                                "opaque CCO follow-up has no trustworthy host binding"
+                            )
+                        # Do not let an opaque ordinary message replace a
+                        # managed owner either.
+                        target = tool_input.get("target")
+                        if isinstance(target, str) and _control(value).owner_is_managed(
+                            target
+                        ):
+                            raise ControlPlaneError(
+                                "opaque CCO follow-up has no trustworthy host binding"
+                            )
+                        return {}
+                    if _protected(message):
                         raise ControlPlaneError(
                             "opaque collaboration content must remain in its protected host field"
                         )
                     target = tool_input.get("target")
                     control = _control(value)
-                    if opaque_message:
-                        if isinstance(target, str) and control.owner_is_managed(target):
-                            if tool not in FOLLOWUP_TOOLS:
-                                raise ControlPlaneError(
-                                    "a managed CCO owner can only receive a prepared followup_task"
-                                )
-                            control.preflight_opaque_followup(value)
-                    elif isinstance(message, str) and message.startswith(
+                    if isinstance(message, str) and message.startswith(
                         TASK_HEADER + "\n"
                     ):
                         if tool not in FOLLOWUP_TOOLS:
@@ -433,17 +455,35 @@ def evaluate(value: object) -> dict[str, Any]:
                     else None
                 )
                 opaque_message = _host_opaque_message(message)
-                if opaque_message or (
-                    isinstance(message, str)
-                    and message.startswith(
-                        (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
-                    )
+                if opaque_message:
+                    tool = value.get("tool_name")
+                    if tool in SPAWN_TOOLS or tool in FOLLOWUP_TOOLS:
+                        # PreToolUse refuses opaque CCO calls, so an opaque
+                        # PostToolUse cannot be the settlement half of a
+                        # prepared dispatch either.  This closes
+                        # direct/replayed Hook delivery from turning ciphertext
+                        # shape into authority.
+                        raise ControlPlaneError(
+                            "opaque CCO postflight has no trustworthy host binding"
+                        )
+                    if tool in MESSAGE_TOOLS:
+                        target = tool_input.get("target") if isinstance(tool_input, Mapping) else None
+                        if isinstance(target, str) and _control(value).owner_is_managed(
+                            target
+                        ):
+                            raise ControlPlaneError(
+                                "opaque CCO postflight has no trustworthy host binding"
+                            )
+                    # An opaque ordinary message to an unmanaged target is not
+                    # a CCO lifecycle event.  It was never eligible for
+                    # settlement, so leave it unrelated rather than broadening
+                    # this Hook's authority over the host's other messages.
+                    return {}
+                if isinstance(message, str) and message.startswith(
+                    (TASK_HEADER + "\n", CONTINUE_HEADER + "\n")
                 ):
                     control = _control(value)
-                    if opaque_message:
-                        control.process_postflight_event(value, opaque_message=True)
-                    else:
-                        control.process_postflight_event(value)
+                    control.process_postflight_event(value)
                 return {}
         if event == "Stop":
             if value.get("stop_hook_active") is True:

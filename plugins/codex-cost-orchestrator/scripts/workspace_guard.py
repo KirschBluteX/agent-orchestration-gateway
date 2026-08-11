@@ -28,6 +28,7 @@ from workspace_state import (
     IGNORED_POLICY_SCOPED_READER_V1,
     StateError,
     StateUnavailable,
+    ScopeReparseBudget,
     ignored_scope_digest,
     normalize_allow,
     repository_control_roots,
@@ -55,6 +56,12 @@ class WorkspaceGuardUnavailable(WorkspaceGuardError):
 
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(path.expanduser()))
+
+
+def _root_key(path: Path) -> str:
+    """Compare recorded roots without resolving them a second time."""
+
+    return os.path.normcase(os.path.normpath(os.fspath(_absolute(path))))
 
 
 def _has_git_marker(path: Path) -> bool:
@@ -142,6 +149,7 @@ def _normalize_scope_groups(
             gitlinks = repository_gitlinks(workspace, active_index_records)
             tracked_spellings = repository_path_spelling_map(active_index_records)
             directory_spellings: dict[str, frozenset[str]] = {}
+            reparse_budget = ScopeReparseBudget()
             normalized_groups = [
                 [
                     normalize_allow(
@@ -151,6 +159,7 @@ def _normalize_scope_groups(
                         gitlinks=gitlinks,
                         tracked_spellings=tracked_spellings,
                         directory_spellings=directory_spellings,
+                        reparse_budget=reparse_budget,
                     )
                     for item in group
                 ]
@@ -270,7 +279,10 @@ def validate_baseline(value: object) -> dict[str, Any]:
         raise WorkspaceGuardError("wave baseline protocol is unsupported")
     if type(value.get("writable")) is not bool:
         raise WorkspaceGuardError("wave baseline writable flag is invalid")
-    root = Path(str(value.get("root")))
+    root_value = value.get("root")
+    if not isinstance(root_value, str):
+        raise WorkspaceGuardError("wave baseline root is not absolute")
+    root = Path(root_value)
     if not root.is_absolute():
         raise WorkspaceGuardError("wave baseline root is not absolute")
     scopes = _syntax_scopes(value.get("scopes"))
@@ -287,6 +299,17 @@ def validate_baseline(value: object) -> dict[str, Any]:
         raise WorkspaceGuardError(str(error)) from error
     if snapshot.get("state_id") != value.get("state_id"):
         raise WorkspaceGuardError("wave baseline identity is inconsistent")
+    snapshot_root = (
+        snapshot.get("repo_root")
+        if value["backend"] == "git"
+        else snapshot.get("root_path")
+    )
+    if not isinstance(snapshot_root, str) or _root_key(root) != _root_key(
+        Path(snapshot_root)
+    ):
+        raise WorkspaceGuardError(
+            "wave baseline snapshot root does not match its workspace root"
+        )
     if value["backend"] == "git":
         ignored_policy = snapshot_ignored_policy(snapshot)
         if ignored_policy == IGNORED_POLICY_SCOPED_READER_V1 and value["writable"]:
@@ -328,8 +351,8 @@ def verify_state(
     checkpoint()
     bound = validate_baseline(baseline)
     backend, workspace = discover_workspace(root)
-    if backend != bound["backend"] or os.path.normcase(str(workspace)) != os.path.normcase(
-        bound["root"]
+    if backend != bound["backend"] or _root_key(workspace) != _root_key(
+        Path(bound["root"])
     ):
         raise WorkspaceGuardError("workspace no longer matches the wave baseline")
     # These scopes were canonicalized once when the immutable plan and wave were

@@ -113,6 +113,30 @@ class WorkspaceGuardIgnoredPolicyTests(unittest.TestCase):
             self.assertIsNone(snapshot["ignored_scope_digest"])
             self.assertIn("generated/dependency.cache", snapshot["entries"])
 
+    def test_exact_ordinary_directory_and_rebound_root_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            with self.assertRaisesRegex(workspace_guard.WorkspaceGuardError, "invalid lease path"):
+                workspace_guard.capture(
+                    repo,
+                    scopes=[{"kind": "exact", "path": "reader"}],
+                    writable=False,
+                )
+
+            baseline = workspace_guard.capture(
+                repo,
+                scopes=[{"kind": "prefix", "path": "reader"}],
+                writable=False,
+            )
+            rebound = deepcopy(baseline)
+            rebound["root"] = str(root)
+            with self.assertRaisesRegex(
+                workspace_guard.WorkspaceGuardError,
+                "snapshot root does not match",
+            ):
+                workspace_guard.validate_baseline(rebound)
+
     def test_scoped_policy_is_bound_to_read_only_wave_scopes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = self.make_repo(Path(temp_dir))

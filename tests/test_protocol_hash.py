@@ -41,6 +41,8 @@ class CanonicalHelperTests(unittest.TestCase):
             "src/../a.py",
             ".git/config",
             "src/CON.txt",
+            "src/COM\u00b9.txt",
+            "src/lpt\u00b3.log",
             "src/trailing. ",
         ):
             with self.subTest(value=value), self.assertRaises(ProtocolHashError):

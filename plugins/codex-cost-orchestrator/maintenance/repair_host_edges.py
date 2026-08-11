@@ -502,6 +502,46 @@ def _ensure_owner_only(path: Path, *, mode: int, label: str) -> None:
         raise HostEdgeRepairError(f"{label} permissions are not owner-only")
 
 
+def _sync_directory(path: Path, *, label: str) -> None:
+    """Persist a POSIX namespace change before treating a journal as durable."""
+
+    # Python cannot open a directory for fsync on Windows.  Journal publication
+    # uses MoveFileExW write-through there instead.
+    if os.name == "nt":
+        return
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        os.fsync(descriptor)
+    except OSError as error:
+        raise HostEdgeRepairError(f"{label} cannot be synchronized") from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise HostEdgeRepairError(f"{label} cannot be closed") from error
+
+
+def _replace_journal(source: Path, target: Path) -> None:
+    """Publish one same-directory journal with host-appropriate durability."""
+
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move_file.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    move_file.restype = wintypes.BOOL
+    replace_existing = 0x00000001
+    write_through = 0x00000008
+    if not move_file(str(source), str(target), replace_existing | write_through):
+        code = ctypes.get_last_error()
+        raise OSError(code, "MoveFileExW rollback journal replacement failed", str(target))
+
+
 def _journal_root(codex_home: Path) -> Path:
     root = codex_home / "backups" / "cco-host-edge-repair"
     try:
@@ -593,9 +633,10 @@ def _write_rollback_journal(
             )
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, journal)
+        _replace_journal(temporary, journal)
         published = True
         _ensure_owner_only(journal, mode=0o600, label="host-edge rollback journal")
+        _sync_directory(root, label="host-edge rollback journal directory")
     except (HostEdgeRepairError, OSError) as error:
         if descriptor >= 0:
             os.close(descriptor)
@@ -615,28 +656,53 @@ def _write_rollback_journal(
 
 
 def _prune_rollback_journals(journal: Path) -> None:
-    candidates = sorted(
-        (
-            path
-            for path in journal.parent.iterdir()
-            if (
-                path.name.startswith(JOURNAL_PREFIX)
-                and path.name.endswith(JOURNAL_SUFFIX)
-                and path.is_file()
-                and not _is_reparse(path)
-            )
-        ),
-        key=lambda path: (path.stat().st_mtime_ns, path.name),
-        reverse=True,
-    )
-    for stale in candidates[ROLLBACK_RETENTION:]:
-        stale.unlink(missing_ok=True)
+    """Keep the just-committed journal even when wall-clock ordering is wrong."""
+
+    current = os.path.normcase(os.path.abspath(str(journal)))
+    candidates: list[tuple[int, str, Path, tuple[int, int], str]] = []
+    for path in journal.parent.iterdir():
+        if not path.name.startswith(JOURNAL_PREFIX) or not path.name.endswith(JOURNAL_SUFFIX):
+            continue
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            continue
+        if _is_reparse(path) or not stat.S_ISREG(before.st_mode):
+            continue
+        identity = (before.st_dev, before.st_ino)
+        canonical = os.path.normcase(os.path.abspath(str(path)))
+        candidates.append((before.st_mtime_ns, path.name, path, identity, canonical))
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    current_present = any(item[4] == current for item in candidates)
+    retained_others = 0
+    removed = False
+    for _mtime, _name, stale, identity, canonical in candidates:
+        if canonical == current:
+            continue
+        if retained_others < ROLLBACK_RETENTION - int(current_present):
+            retained_others += 1
+            continue
+        try:
+            observed = stale.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            _is_reparse(stale)
+            or not stat.S_ISREG(observed.st_mode)
+            or (observed.st_dev, observed.st_ino) != identity
+        ):
+            continue
+        stale.unlink()
+        removed = True
+    if removed:
+        _sync_directory(journal.parent, label="host-edge rollback journal directory")
 
 
 def _post_commit_warnings(journal: Path) -> list[str]:
     try:
         _prune_rollback_journals(journal)
-    except OSError:
+    except (HostEdgeRepairError, OSError):
         return ["repair committed, but old rollback journals could not be pruned"]
     return []
 
@@ -657,6 +723,34 @@ def _discard_uncommitted_journal(journal: Path | None) -> None:
         raise HostEdgeRepairError(
             "repair rolled back, but its uncommitted rollback journal could not be removed"
         ) from error
+
+
+def _verify_commit_proofs(
+    edges: Iterable[Mapping[str, Any]], *, sessions_root: Path
+) -> None:
+    """Bind each journalled rollout proof immediately before the DB commit."""
+
+    for edge in edges:
+        rollout_value = edge.get("rollout_path")
+        expected_digest = edge.get("proof_digest")
+        try:
+            if not isinstance(rollout_value, str) or not isinstance(expected_digest, str):
+                raise HostEdgeRepairError("journalled rollout proof is incomplete")
+            rollout = _resolved_plain_file(
+                Path(rollout_value),
+                root=sessions_root,
+                label="agent rollout",
+            )
+            if str(rollout) != rollout_value:
+                raise HostEdgeRepairError("journalled rollout path changed")
+            _first, observed_digest = _rollout_proof(rollout)
+            if observed_digest != expected_digest:
+                raise HostEdgeRepairError("journalled rollout proof changed")
+        except HostEdgeRepairError as error:
+            raise HostEdgeRepairError(
+                "requested child rollout proof changed before repair commit; "
+                "no repair was committed"
+            ) from error
 
 
 def repair_edges(
@@ -707,6 +801,7 @@ def repair_edges(
     sessions_root = _sessions_root(home)
     journal: Path | None = None
     repaired = 0
+    warnings: list[str] = []
     with closing(sqlite3.connect(database, timeout=5.0)) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -771,6 +866,10 @@ def repair_edges(
                 raise HostEdgeRepairError(
                     "requested child edges changed during repair; no repair was committed"
                 )
+            # Keep retention inside the immediate transaction.  A second offline
+            # repair cannot publish its current journal until this one commits.
+            warnings = _post_commit_warnings(journal)
+            _verify_commit_proofs(candidates.values(), sessions_root=sessions_root)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -780,7 +879,7 @@ def repair_edges(
         raise HostEdgeRepairError("host-edge rollback journal was not created")
     result["journal"] = str(journal)
     result["repaired"] = repaired
-    result["warnings"] = _post_commit_warnings(journal)
+    result["warnings"] = warnings
     return result
 
 

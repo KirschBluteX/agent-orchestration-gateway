@@ -178,6 +178,20 @@ class DirectoryStateTests(unittest.TestCase):
                     {"kind": "exact", "path": "same/same"},
                 )
 
+    def test_exact_scope_rejects_an_existing_ordinary_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "owned").mkdir()
+
+            with self.assertRaisesRegex(DirectoryStateError, "exact scope.*directory"):
+                normalize_directory_scope(
+                    root,
+                    {"kind": "exact", "path": "owned"},
+                )
+
+            with self.assertRaisesRegex(DirectoryStateError, "non-empty list"):
+                capture_directory_state(root, scopes=[], capture_mode="full")
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
     def test_reparse_entry_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -5,7 +5,7 @@
 Codex Cost Orchestrator (CCO) is a local control plane for Codex native Agents.
 Primary keeps intent, integration, and final acceptance; CCO dispatches closed,
 scoped work and returns exact acceptance evidence. CCO is pre-1.0: its public,
-installer, and manifest identity is `0.9.0` with no build metadata, and a
+installer, and manifest identity is `0.9.1` with no build metadata, and a
 pre-1.0 minor release may include breaking changes. Historical labels from 2.x
 through 5.x are compressed into pre-0.9 development history; Git history
 remains unchanged.
@@ -25,6 +25,12 @@ Invoke each returned action with only its supplied tool input. A complex unresol
 task may first use one ordinary read-only Terra/max planning task; its proposal is
 only a stateless `cco.planner-proposal.v1` DAG input. CCO does not create a planner
 route or a second planner lifecycle.
+
+The native Hook boundary must expose either that exact plaintext input or trusted
+metadata that authenticates its prepared-input digest. A host that replaces Agent
+messages with unbound opaque ciphertext is rejected before spawn, reuse, or
+continuation; do not bypass this check. CCO dispatch becomes available automatically
+when the host provides a bindable Hook contract.
 
 Primary stays in control only for explicit authority, clarification, an explicit
 direct request, or one declared tool bounded below 30 seconds. After dispatch,
@@ -61,7 +67,7 @@ still has a fresh dispatch and baseline.
 
 Current runtime records use `cco.wave.v3`, `cco.lifecycle.v2`, and
 `cco.receipt.v2`. Earlier active state, wave, lifecycle, receipt, and aggregation
-artifacts are not upgraded in place: clean them up before starting a 0.9.0 task.
+artifacts are not upgraded in place: clean them up before starting a 0.9.1 task.
 There is no migration command and no active-state compatibility layer.
 
 Readers scan only their declared scopes. CCO admits one normal writer at a time for
@@ -107,7 +113,8 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 Codex Desktop owns persisted task-card edges. CCO never changes that database from a
 Hook. The optional repair utility is an offline fallback: leave the active task, keep
 `CODEX_THREAD_ID` unset, use `--offline-confirm`, and name the exact parent and child
-IDs. It creates an owner-only rollback journal before a repair. See
+IDs. It durably creates an owner-only rollback journal and rechecks the exact rollout proof
+immediately before a repair commits. See
 [operations](docs/OPERATIONS.md#offline-host-edge-repair).
 
 ## Development

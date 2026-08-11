@@ -26,6 +26,7 @@ from control_plane import (  # noqa: E402
     parse_task_message,
 )
 import control_plane as control_plane_module  # noqa: E402
+from operation_deadline import OperationDeadlineExceeded  # noqa: E402
 from state_lock import StateLockBusy, acquire  # noqa: E402
 from workspace_guard import (  # noqa: E402
     WorkspaceGuardError,
@@ -162,7 +163,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         return dispatch_id, owner
 
-    def test_host_opaque_spawn_matches_and_settles_prepared_attempt(self) -> None:
+    def test_opaque_spawn_fails_closed_without_a_host_binding(self) -> None:
         control = self.control("opaque-native")
         control.create_plan(
             self.repo,
@@ -174,21 +175,24 @@ class V9ControlPlaneTests(unittest.TestCase):
         )["dispatches"][0]["tool_input"]
         opaque = {**native, "message": "gAAAA" + ("d" * 100)}
 
-        control.preflight_spawn(
-            {"tool_input": opaque, "tool_use_id": "opaque-call"},
-            opaque_message=True,
-        )
-        owner = "/root/" + str(native["task_name"])
-        control.process_postflight_event(
-            {
-                "tool_input": opaque,
-                "tool_response": {"task_name": owner},
-                "tool_use_id": "opaque-call",
-            },
-            opaque_message=True,
-        )
+        with self.assertRaisesRegex(ControlPlaneError, "trustworthy host binding"):
+            control.preflight_spawn(
+                {"tool_input": opaque, "tool_use_id": "opaque-call"},
+                opaque_message=True,
+            )
+        with self.assertRaisesRegex(ControlPlaneError, "trustworthy host binding"):
+            control.process_postflight_event(
+                {
+                    "tool_input": opaque,
+                    "tool_response": {"task_name": "/root/substituted"},
+                    "tool_use_id": "opaque-call",
+                },
+                opaque_message=True,
+            )
 
-        self.assertEqual(control.status()["counts"]["running"], 1)
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(state["dispatches"][dispatch_id]["receipt_id"])
 
     def ready_reuse_chain(
         self,
@@ -3128,7 +3132,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertNotIn("result", state["dispatches"][second_id])
         self.assertIsInstance(state["dispatches"][second_id]["receipt_id"], str)
 
-    def test_opaque_spawn_cannot_add_unprepared_fields(self) -> None:
+    def test_opaque_spawn_cannot_authorize_substituted_fields(self) -> None:
         control = self.control("opaque-spawn-no-scope-expansion")
         control.create_plan(
             self.repo,
@@ -3144,7 +3148,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             "unprepared_scope": "b.txt",
         }
 
-        with self.assertRaisesRegex(ControlPlaneError, "cannot add fields"):
+        with self.assertRaisesRegex(ControlPlaneError, "trustworthy host binding"):
             control.preflight_spawn(
                 {"tool_input": opaque, "tool_use_id": "opaque-extra-field"},
                 opaque_message=True,
@@ -3153,6 +3157,164 @@ class V9ControlPlaneTests(unittest.TestCase):
         state = json.loads(control.state_path.read_text(encoding="utf-8"))
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         self.assertIsNone(state["dispatches"][dispatch_id]["receipt_id"])
+
+    def test_opaque_reuse_and_continuation_cannot_select_a_prepared_owner(self) -> None:
+        control = self.control("opaque-followup-no-binding")
+
+        for kind in ("reuse", "continuation"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(
+                    ControlPlaneError, "trustworthy host binding"
+                ):
+                    control.preflight_opaque_followup(
+                        {
+                            "tool_input": {
+                                "message": "gAAAA" + ("q" * 100),
+                                "target": "/root/worker_n01",
+                            },
+                            "tool_use_id": f"opaque-{kind}",
+                        }
+                    )
+
+    def test_plain_spawn_requires_the_exact_prepared_tool_input(self) -> None:
+        control = self.control("exact-spawn-input")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+
+        with self.assertRaisesRegex(ControlPlaneError, "fields beyond"):
+            control.preflight_spawn(
+                {
+                    "tool_input": {**native, "unprepared": True},
+                    "tool_use_id": "extra-field",
+                }
+            )
+
+    def test_unlinked_durable_native_receipt_cannot_admit_postflight(self) -> None:
+        control = self.control("unlinked-native-receipt")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        tool_use_id = "unlinked-postflight"
+
+        # Simulate a receipt replacement that became visible immediately before
+        # its directory-sync acknowledgement failed.  The claim state was not
+        # published, so this receipt must not authorize a host result.
+        with control._coordinated_state() as state:
+            dispatch = control._find_dispatch(state, dispatch_id)
+            control._reserve_native_attempt_receipt(state, dispatch, tool_use_id)
+
+        owner = "/root/" + str(native["task_name"])
+        self.assertFalse(
+            control.process_postflight_event(
+                {
+                    "tool_input": native,
+                    "tool_response": {"task_name": owner},
+                    "tool_use_id": tool_use_id,
+                }
+            )
+        )
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        self.assertEqual(dispatch["state"], "starting")
+        self.assertIsNone(dispatch["tool_use_id"])
+        self.assertIsNone(dispatch["receipt_id"])
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_uncertain_postflight_state_publication_replays_its_receipt(self) -> None:
+        control = self.control("uncertain-postflight-publication")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        owner = "/root/" + str(native["task_name"])
+        tool_use_id = "uncertain-postflight"
+        control.preflight_spawn({"tool_input": native, "tool_use_id": tool_use_id})
+        original_write = control._write_state
+        raised = False
+
+        def publish_then_report_uncertain(state: dict[str, object]) -> None:
+            nonlocal raised
+            original_write(state)
+            if (
+                not raised
+                and any(
+                    isinstance(dispatch, dict) and dispatch.get("state") == "running"
+                    for dispatch in state.get("dispatches", {}).values()
+                )
+            ):
+                raised = True
+                raise control_plane_module._AtomicWriteUncertain(
+                    "simulated postflight directory sync failure"
+                )
+
+        payload = {
+            "tool_input": native,
+            "tool_response": {"task_name": owner},
+            "tool_use_id": tool_use_id,
+        }
+        with patch.object(control, "_write_state", side_effect=publish_then_report_uncertain):
+            with self.assertRaises(control_plane_module._AtomicWriteUncertain):
+                control.process_postflight_event(payload)
+
+        persisted = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["dispatches"][dispatch_id]["state"], "running")
+        receipt = next(self.state_root.glob(".cco-pending-*.event"))
+        self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["phase"], "native_observed")
+
+        self.assertTrue(control.process_postflight_event(payload))
+        control.process_result_event(
+            owner,
+            result_text(dispatch_id, evidence={"A01": "replayed"}),
+        )
+        self.assertEqual(control.status()["counts"]["retired"], 1)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_uncertain_bound_restart_receipt_is_not_replaced_by_an_unbound_one(self) -> None:
+        control = self.control("uncertain-restart-receipt")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("reader", "A01", "a.txt", role="explorer")]),
+        )
+        original_stage = control._stage_pending_event
+        raised = False
+
+        def stage_then_report_uncertain(event: dict[str, object]) -> Path:
+            nonlocal raised
+            path = original_stage(event)
+            if not raised:
+                raised = True
+                raise control_plane_module._AtomicWriteUncertain(
+                    "simulated restart receipt directory sync failure"
+                )
+            return path
+
+        with patch.object(control, "_stage_pending_event", side_effect=stage_then_report_uncertain):
+            with self.assertRaises(control_plane_module._AtomicWriteUncertain):
+                control.process_restart_event("clear")
+
+        receipts = list(self.state_root.glob(".cco-pending-*.event"))
+        self.assertEqual(len(receipts), 1)
+        self.assertIn("plan_id", json.loads(receipts[0].read_text(encoding="utf-8")))
+        self.assertGreaterEqual(control.process_restart_event("clear"), 0)
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
 
     def test_first_result_observation_is_immutable_across_duplicate_delivery(self) -> None:
         control = self.control("immutable-result-observation")
@@ -3187,6 +3349,168 @@ class V9ControlPlaneTests(unittest.TestCase):
         self.assertEqual(settled["state"], "retired")
         self.assertEqual(state["dispatches"][dispatch_id]["result"], parse_result(first))
         self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_apply_deadline_leaves_a_durable_journal_for_restart_recovery(self) -> None:
+        control, actions = self.cooperative_actions("apply-deadline-recovery")
+        tasks = [parse_task_message(action["tool_input"]["message"]) for action in actions]
+        owners = [self.start_dispatch(control, action["tool_input"])[1] for action in actions]
+
+        for task in tasks:
+            path = task["scopes"][0]["path"]
+            (Path(task["workspace_root"]) / path).write_text(
+                "changed\n", encoding="utf-8"
+            )
+
+        def result_for(index: int) -> str:
+            task = tasks[index]
+            acceptance_id = next(iter(task["acceptance"]))
+            path = task["scopes"][0]["path"]
+            return result_text(
+                task["dispatch_id"],
+                changed_paths=[path],
+                evidence={acceptance_id: "completed"},
+            )
+
+        control.record_result(owners[0], result_for(0))
+        with (
+            patch.object(
+                control_plane_module,
+                "apply_isolation_journal",
+                side_effect=OperationDeadlineExceeded("simulated apply deadline"),
+            ),
+            self.assertRaisesRegex(ControlPlaneUnavailable, "durable progress"),
+        ):
+            control.record_result(owners[1], result_for(1))
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["cooperative_journal"]["phase"], "applying")
+        self.assertTrue(
+            all(
+                item["state"] == "ready_to_apply"
+                for item in state["dispatches"].values()
+                if item.get("wave_id") == state["active_wave_id"]
+            )
+        )
+
+        self.assertGreaterEqual(control.restart(), 1)
+        self.assertEqual((self.repo / "a.txt").read_text(encoding="utf-8"), "a0\n")
+        self.assertEqual((self.repo / "b.txt").read_text(encoding="utf-8"), "b0\n")
+        self.assertEqual(control.status()["counts"]["fenced"], 2)
+
+    def test_atomic_write_syncs_the_parent_directory_after_replacement(self) -> None:
+        target = self.root / "atomic" / "state.json"
+
+        with patch.object(control_plane_module, "_sync_directory") as sync:
+            control_plane_module._atomic_write(target, {"state": "durable"})
+
+        self.assertEqual(
+            json.loads(target.read_text(encoding="utf-8")), {"state": "durable"}
+        )
+        sync.assert_called_once_with(target.parent)
+
+        uncertain = self.root / "atomic" / "uncertain.json"
+        with patch.object(
+            control_plane_module,
+            "_sync_directory",
+            side_effect=ControlPlaneUnavailable("injected directory sync failure"),
+        ):
+            with self.assertRaises(control_plane_module._AtomicWriteUncertain):
+                control_plane_module._atomic_write(uncertain, {"state": "replay"})
+        self.assertEqual(
+            json.loads(uncertain.read_text(encoding="utf-8")), {"state": "replay"}
+        )
+
+    def test_uncertain_cooperative_wave_publication_retains_isolates_for_replay(self) -> None:
+        control = self.control("uncertain-cooperative-wave")
+        plan = self.brief(
+            [
+                self.node("left", "A01", "a.txt"),
+                self.node("right", "A02", "b.txt"),
+            ]
+        )
+        plan["writer_isolation"] = "cooperative"
+        control.create_plan(self.repo, plan)
+        original_write = control._write_state
+        raised = False
+
+        def publish_then_report_uncertain(state: dict[str, object]) -> None:
+            nonlocal raised
+            original_write(state)
+            if state.get("active_wave_id") is not None and not raised:
+                raised = True
+                raise control_plane_module._AtomicWriteUncertain(
+                    "simulated post-replace directory sync failure"
+                )
+
+        with patch.object(control, "_write_state", side_effect=publish_then_report_uncertain):
+            with self.assertRaises(control_plane_module._AtomicWriteUncertain):
+                control.next_wave(
+                    capacity=2,
+                    native_catalog=catalog("gpt-5.6-terra"),
+                )
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        roots = [
+            Path(item["isolation"]["record"]["isolate_root"])
+            for item in state["dispatches"].values()
+        ]
+        self.assertEqual(len(roots), 2)
+        self.assertTrue(all(root.exists() for root in roots))
+
+        replay = control.next_wave(
+            capacity=2,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )
+        self.assertEqual(len(replay["dispatches"]), 2)
+
+    def test_uncertain_journal_publication_retains_the_replay_backup(self) -> None:
+        control, actions = self.cooperative_actions("uncertain-journal-publication")
+        tasks = [parse_task_message(action["tool_input"]["message"]) for action in actions]
+        owners = [self.start_dispatch(control, action["tool_input"])[1] for action in actions]
+        for task in tasks:
+            path = task["scopes"][0]["path"]
+            (Path(task["workspace_root"]) / path).write_text(
+                "changed\n", encoding="utf-8"
+            )
+
+        def result_for(index: int) -> str:
+            task = tasks[index]
+            return result_text(
+                task["dispatch_id"],
+                changed_paths=[task["scopes"][0]["path"]],
+                evidence={next(iter(task["acceptance"])): "completed"},
+            )
+
+        control.record_result(owners[0], result_for(0))
+        original_write = control._write_state
+        raised = False
+
+        def publish_then_report_uncertain(state: dict[str, object]) -> None:
+            nonlocal raised
+            original_write(state)
+            journal = state.get("cooperative_journal")
+            if (
+                isinstance(journal, dict)
+                and journal.get("phase") == "staged"
+                and not raised
+            ):
+                raised = True
+                raise control_plane_module._AtomicWriteUncertain(
+                    "simulated journal directory sync failure"
+                )
+
+        with patch.object(control, "_write_state", side_effect=publish_then_report_uncertain):
+            with self.assertRaises(control_plane_module._AtomicWriteUncertain):
+                control.record_result(owners[1], result_for(1))
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        backup = Path(state["cooperative_journal"]["backup_root"])
+        self.assertEqual(state["cooperative_journal"]["phase"], "staged")
+        self.assertTrue(backup.exists())
+
+        self.assertGreaterEqual(control.restart(), 1)
+        self.assertEqual((self.repo / "a.txt").read_text(encoding="utf-8"), "a0\n")
+        self.assertEqual((self.repo / "b.txt").read_text(encoding="utf-8"), "b0\n")
 
     def test_unresolved_interrupt_blocks_owner_reuse(self) -> None:
         control = self.control("interrupt-blocks-reuse")

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 from typing import Any, Callable, Mapping
 
@@ -389,7 +390,65 @@ def _load_toml(path: Path, label: str) -> dict[str, Any]:
 
 
 def _canonical_root(value: Path) -> str:
-    return os.path.normcase(str(value.expanduser().resolve()))
+    try:
+        return os.path.normcase(str(value.expanduser().resolve()))
+    except OSError as error:
+        raise RoutingCatalogError("trusted project root is unavailable") from error
+
+
+def _is_reparse(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _stable_project_root(value: Path) -> tuple[Path, tuple[int, int]]:
+    """Resolve a project exactly once and bind policy loading to that directory."""
+
+    try:
+        root = value.expanduser().resolve(strict=True)
+        metadata = root.lstat()
+    except OSError as error:
+        raise RoutingCatalogError("project CCO root is unavailable") from error
+    if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise RoutingCatalogError("project CCO root must be a real directory")
+    return root, (int(metadata.st_dev), int(metadata.st_ino))
+
+
+def _project_policy(root: Path, identity: tuple[int, int]) -> dict[str, Any]:
+    """Read a policy only while its trusted root remains the same directory."""
+
+    directory = root / ".codex"
+    try:
+        directory_metadata = directory.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise RoutingCatalogError("project CCO configuration is unavailable") from error
+    if _is_reparse(directory_metadata) or not stat.S_ISDIR(directory_metadata.st_mode):
+        raise RoutingCatalogError("project CCO configuration directory is unsafe")
+    path = directory / "cco.toml"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise RoutingCatalogError("project CCO configuration is unavailable") from error
+    if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise RoutingCatalogError("project CCO configuration is unsafe")
+    config = _load_toml(path, "project CCO configuration")
+    try:
+        current = root.lstat()
+    except OSError as error:
+        raise RoutingCatalogError("project CCO root is unavailable") from error
+    if (
+        _is_reparse(current)
+        or not stat.S_ISDIR(current.st_mode)
+        or (int(current.st_dev), int(current.st_ino)) != identity
+    ):
+        raise RoutingCatalogError("trusted project root changed while loading configuration")
+    return config
 
 
 def load_route_policy(repo: Path, *, codex_home: Path | None = None) -> dict[str, Any]:
@@ -401,12 +460,17 @@ def load_route_policy(repo: Path, *, codex_home: Path | None = None) -> dict[str
     trusted = global_config.get("trusted_project_roots", [])
     if not isinstance(trusted, list) or any(not isinstance(item, str) for item in trusted):
         raise RoutingCatalogError("trusted_project_roots must be a list of paths")
-    project_root = _canonical_root(Path(repo))
-    trusted_roots = {_canonical_root(Path(item)) for item in trusted}
-    project_path = Path(repo).resolve() / ".codex" / "cco.toml"
+    project, project_identity = _stable_project_root(Path(repo))
+    project_root = os.path.normcase(str(project))
+    trusted_roots: set[str] = set()
+    for item in trusted:
+        candidate = Path(item).expanduser()
+        if not candidate.is_absolute():
+            raise RoutingCatalogError("trusted_project_roots must contain absolute paths")
+        trusted_roots.add(_canonical_root(candidate))
     project_config: dict[str, Any] = {}
-    if project_root in trusted_roots and project_path.is_file():
-        project_config = _load_toml(project_path, "project CCO configuration")
+    if project_root in trusted_roots:
+        project_config = _project_policy(project, project_identity)
     global_policy = normalize_route_policy(global_config.get("routes"), "global CCO routes")
     project_policy = normalize_route_policy(project_config.get("routes"), "project CCO routes")
     merged = {**global_policy, **project_policy}

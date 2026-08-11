@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 import sys
 import unittest
@@ -10,6 +11,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from routing_catalog import (  # noqa: E402
     RoutingCatalogError,
+    load_route_policy,
     normalize_route_policy,
     resolve_route_plan,
 )
@@ -158,6 +160,28 @@ class RoutingCatalogTests(unittest.TestCase):
             route["candidates"],
             [{"effort": "ultra", "model": "gpt-5.6-sol"}],
         )
+
+    def test_trusted_project_policy_uses_a_stable_absolute_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            home = root / "home"
+            project = root / "project"
+            home.mkdir()
+            project.mkdir()
+            (home / "cco.toml").write_text(
+                f'trusted_project_roots = ["{project.as_posix()}"]\n',
+                encoding="utf-8",
+            )
+            (project / ".codex").mkdir()
+            (project / ".codex" / "cco.toml").write_text("# trusted\n", encoding="utf-8")
+
+            self.assertTrue(load_route_policy(project, codex_home=home)["project_trusted"])
+
+            (home / "cco.toml").write_text(
+                'trusted_project_roots = ["."]\n', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RoutingCatalogError, "absolute paths"):
+                load_route_policy(project, codex_home=home)
 
 if __name__ == "__main__":
     unittest.main()

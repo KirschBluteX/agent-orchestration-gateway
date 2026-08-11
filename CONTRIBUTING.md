@@ -8,10 +8,15 @@ private task content, or unredacted Codex logs.
 Use Python 3.11+ and install `requirements.txt`; `zstandard` is required on Python versions
 below 3.14. Codex CLI is needed only for live native-catalog and end-to-end checks.
 
+For installation changes, bootstrap the profiles, review and trust the five exact CCO Hook
+definitions in `/hooks`, start a new Codex task, and only then run `--doctor`. Doctor must fail
+for missing, duplicate, or unknown CCO Hook definitions; do not paper over that result by adding
+compatibility definitions.
+
 Run before opening a pull request:
 
 ```text
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt PyYAML==6.0.2 ruff==0.15.22
 python -X utf8 -B -m unittest discover -s tests -v
 python -m ruff check plugins tests benchmarks .github/scripts
 python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
@@ -28,6 +33,8 @@ git diff --check
   current wave/lifecycle/receipt protocols.
 - Treat cooperative writers as experimental copies/worktrees with bounded backup journals, never
   as a security sandbox.
+- Keep offline host-edge repair outside Hooks: it may close only exact proof-backed edges after a
+  durable owner-only journal and commit-time proof check.
 - Do not add compatibility adapters, a second planner lifecycle, host background work, or external
   accounting services without an explicit project decision.
 - Preserve user-owned files and unrelated worktree changes.

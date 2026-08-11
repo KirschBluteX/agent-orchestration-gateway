@@ -20,7 +20,8 @@ import stat
 import subprocess
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
-from operation_deadline import checkpoint
+from git_environment import clean_git_environment
+from operation_deadline import checkpoint, remaining_seconds
 from protocol_hash import ProtocolHashError, canonical_bytes, require_repository_path
 from workspace_guard import (
     WorkspaceGuardError,
@@ -691,25 +692,47 @@ def _copy_tree(
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    remaining = remaining_seconds()
+    timeout = 20.0 if remaining is None else min(20.0, remaining)
     try:
         return subprocess.run(
             ["git", "-c", "core.longpaths=true", "-C", str(root), *args],
             check=False,
+            env=clean_git_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=20,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired as error:
+        checkpoint()
         raise WriterIsolationUnavailable("Git cooperative isolation timed out") from error
     except OSError as error:
         raise WriterIsolationUnavailable("Git cooperative isolation is unavailable") from error
 
 
-def _clean_git_workspace(root: Path) -> bool:
-    # `normal` reports an untracked directory once instead of recursively
-    # enumerating every child. Any record is enough to select the bounded-copy
-    # path, so `all` would add work without improving the decision.
-    status = _git(root, "status", "--porcelain=v1", "-z", "--untracked-files=normal")
+def _clean_git_workspace(
+    root: Path,
+    scopes: Iterable[Mapping[str, str]],
+) -> bool:
+    # A detached worktree cannot materialize ignored content. Check only the
+    # declared writer union, and select the bounded-copy path when any tracked,
+    # untracked, or ignored content there differs from HEAD. `normal` and
+    # `matching` collapse untracked/ignored directories instead of recursively
+    # enumerating every child; any record is enough for this decision.
+    pathspecs = [
+        f":(top,literal){scope['path']}"
+        for scope in sorted(scopes, key=lambda item: (item["path"], item["kind"]))
+    ]
+    status = _git(
+        root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=normal",
+        "--ignored=matching",
+        "--",
+        *pathspecs,
+    )
     if status.returncode:
         raise WriterIsolationUnavailable("Git workspace cleanliness is unavailable")
     head = _git(root, "rev-parse", "--verify", "HEAD")
@@ -1147,6 +1170,32 @@ def _new_record(
     }
 
 
+def _normalize_isolation_scopes(value: object, label: str) -> list[dict[str, str]]:
+    """Reject empty or ambiguous typed scopes before isolate materialization."""
+
+    if not isinstance(value, list) or not value:
+        raise WriterIsolationError(f"{label} scopes are invalid")
+    seen: set[tuple[str, str]] = set()
+    normalized: list[dict[str, str]] = []
+    for raw_scope in value:
+        if not isinstance(raw_scope, Mapping) or set(raw_scope) != {"kind", "path"}:
+            raise WriterIsolationError(f"{label} scope is invalid")
+        kind = raw_scope.get("kind")
+        if kind not in {"exact", "prefix"}:
+            raise WriterIsolationError(f"{label} scope is invalid")
+        try:
+            path = require_repository_path(raw_scope.get("path"), f"{label} scope")
+        except ProtocolHashError as error:
+            raise WriterIsolationError(str(error)) from error
+        identity = (str(kind), path)
+        if identity in seen:
+            raise WriterIsolationError(f"{label} scope is ambiguous")
+        seen.add(identity)
+        normalized.append({"kind": str(kind), "path": path})
+    normalized.sort(key=lambda item: (item["kind"], item["path"]))
+    return normalized
+
+
 def prepare_isolates(
     state_root: Path,
     canonical_root: Path,
@@ -1164,10 +1213,34 @@ def prepare_isolates(
         raise WriterIsolationError("cooperative session identity is invalid")
     if not 1 <= len(members) <= MAX_GROUP_SIZE or len(members) > MAX_ISOLATE_ROOTS:
         raise WriterIsolationError("cooperative writer group size is invalid")
+    prepared_members: list[dict[str, Any]] = []
+    for member in members:
+        if not isinstance(member, Mapping):
+            raise WriterIsolationError("cooperative member identity is invalid")
+        member_id = member.get("id")
+        if not isinstance(member_id, str) or not member_id:
+            raise WriterIsolationError("cooperative member identity is invalid")
+        prepared_members.append(
+            {
+                "id": member_id,
+                "scopes": _normalize_isolation_scopes(
+                    member.get("scopes"), "cooperative member"
+                ),
+            }
+        )
     canonical = _absolute(canonical_root)
     _assert_state_root_separate(state_root, canonical)
     _lstat_directory(canonical, "canonical workspace root")
-    mode = WORKTREE if backend == "git" and _clean_git_workspace(canonical) else COPY
+    writer_scopes = [
+        scope
+        for member in prepared_members
+        for scope in member["scopes"]
+    ]
+    mode = (
+        WORKTREE
+        if backend == "git" and _clean_git_workspace(canonical, writer_scopes)
+        else COPY
+    )
     if mode == COPY:
         _walk_visible(canonical, exclude_git=True)
     namespace = _namespace_base(state_root, "isolates", canonical_root=canonical)
@@ -1186,7 +1259,7 @@ def prepare_isolates(
     records: list[dict[str, Any]] = []
     current_isolate: Path | None = None
     try:
-        for index, member in enumerate(members):
+        for index, member in enumerate(prepared_members):
             member_id = member.get("id")
             scopes = member.get("scopes")
             if not isinstance(member_id, str) or not isinstance(scopes, list):
@@ -1240,27 +1313,9 @@ def validate_record(
         raise WriterIsolationError("cooperative isolate record is malformed")
     if record.get("mode") not in {WORKTREE, COPY}:
         raise WriterIsolationError("cooperative isolate mode is invalid")
-    scopes = record.get("scopes")
-    if not isinstance(scopes, list) or not scopes:
-        raise WriterIsolationError("cooperative isolate scopes are invalid")
-    seen: set[tuple[str, str]] = set()
-    normalized_scopes: list[dict[str, str]] = []
-    for raw_scope in scopes:
-        if not isinstance(raw_scope, Mapping) or set(raw_scope) != {"kind", "path"}:
-            raise WriterIsolationError("cooperative isolate scope is invalid")
-        kind = raw_scope.get("kind")
-        if kind not in {"exact", "prefix"}:
-            raise WriterIsolationError("cooperative isolate scope is invalid")
-        try:
-            path = require_repository_path(raw_scope.get("path"), "cooperative isolate scope")
-        except ProtocolHashError as error:
-            raise WriterIsolationError(str(error)) from error
-        identity = (str(kind), path)
-        if identity in seen:
-            raise WriterIsolationError("cooperative isolate scope is ambiguous")
-        seen.add(identity)
-        normalized_scopes.append({"kind": str(kind), "path": path})
-    normalized_scopes.sort(key=lambda item: (item["kind"], item["path"]))
+    normalized_scopes = _normalize_isolation_scopes(
+        record.get("scopes"), "cooperative isolate"
+    )
     isolate, _canonical = _record_layout(record, state_root, terminal_recovery=terminal_recovery)
     metadata = _lstat(isolate, "cooperative isolate root", missing=True)
     if metadata is None:
@@ -1320,24 +1375,12 @@ def verify_isolate(
 def scoped_content_identity(root: Path, scopes: object) -> str:
     workspace = _absolute(root)
     _lstat_directory(workspace, "cooperative comparison root")
-    if not isinstance(scopes, list) or not scopes:
-        raise WriterIsolationError("cooperative comparison scopes are invalid")
+    normalized_scopes = _normalize_isolation_scopes(
+        scopes, "cooperative comparison"
+    )
     entries: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for raw_scope in scopes:
-        if not isinstance(raw_scope, Mapping) or set(raw_scope) != {"kind", "path"}:
-            raise WriterIsolationError("cooperative comparison scope is invalid")
-        kind = raw_scope.get("kind")
-        if kind not in {"exact", "prefix"}:
-            raise WriterIsolationError("cooperative comparison scope is invalid")
-        try:
-            relative = require_repository_path(raw_scope.get("path"), "cooperative scope")
-        except ProtocolHashError as error:
-            raise WriterIsolationError(str(error)) from error
-        identity = (str(kind), relative)
-        if identity in seen:
-            continue
-        seen.add(identity)
+    for scope in normalized_scopes:
+        relative = scope["path"]
         description = _describe(
             _require_child(workspace, relative, "cooperative comparison path"),
             limit=MAX_BYTES,
@@ -1345,7 +1388,7 @@ def scoped_content_identity(root: Path, scopes: object) -> str:
         entries.append(
             {
                 "content_id": str(description["content_id"]),
-                "kind": str(kind),
+                "kind": scope["kind"],
                 "path": relative,
             }
         )

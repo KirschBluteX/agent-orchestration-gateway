@@ -61,7 +61,9 @@ python -m benchmarks.cco_benchmark usage \
 
 The report separates `sol`, `terra`, and `luna` and records input, uncached input,
 cached input reads, cache writes, output, reasoning output, total tokens, and request
-count. It is a benchmark artifact, not a runtime accounting ledger.
+count. Every model/effort route must add exactly to its model-family counter; a route outside
+those three families is recorded as unexpected and makes the result fail closed. It is a benchmark
+artifact, not a runtime accounting ledger.
 
 Bind the usage and evaluator verdict to the planned run, then summarize only complete
 pairs:

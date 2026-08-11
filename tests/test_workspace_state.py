@@ -101,6 +101,31 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             ):
                 workspace_state_module.directory_digest(scanned)
 
+    def test_prefix_scope_reparse_checks_share_one_bounded_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = self.make_repo(Path(temp_dir))
+            (repo / "other").mkdir()
+            (repo / "other" / "entry.txt").write_text("entry\n", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    workspace_state_module,
+                    "MAX_SCOPE_REPARSE_ENTRIES",
+                    1,
+                ),
+                self.assertRaisesRegex(StateUnavailable, "reparse entry limit"),
+            ):
+                budget = workspace_state_module.ScopeReparseBudget()
+                workspace_state_module.normalize_allow(
+                    repo,
+                    "prefix:src",
+                    reparse_budget=budget,
+                )
+                workspace_state_module.normalize_allow(
+                    repo,
+                    "prefix:other",
+                    reparse_budget=budget,
+                )
+
     def test_complete_git_control_inspection_uses_one_shared_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = self.make_repo(Path(temp_dir))
@@ -175,6 +200,50 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(self.git(repo, "init").returncode, 0)
 
             self.assertIsNone(workspace_state_module.head_oid(repo))
+
+    def test_git_environment_cannot_redirect_an_explicit_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = self.make_repo(root)
+            redirected_root = root / "redirected-root"
+            redirected_root.mkdir()
+            redirected = self.make_repo(redirected_root)
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "GIT_COMMON_DIR": str(redirected / ".git"),
+                    "GIT_DIR": str(redirected / ".git"),
+                    "GIT_INDEX_FILE": str(redirected / ".git" / "index"),
+                    "GIT_WORK_TREE": str(redirected),
+                },
+            ):
+                self.assertEqual(
+                    workspace_state_module.repository_root(repo), repo.resolve()
+                )
+
+    def test_empty_snapshot_scopes_and_malformed_identities_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = self.make_repo(Path(temp_dir))
+            with self.assertRaisesRegex(workspace_state_module.StateError, "non-empty"):
+                workspace_state_module.state_payload(repo, scopes=[])
+            with self.assertRaisesRegex(workspace_state_module.StateError, "non-empty"):
+                workspace_state_module.ignored_entries(
+                    repo,
+                    max_files=1,
+                    max_bytes=1,
+                    scopes=[],
+                )
+
+            snapshot = workspace_state_module.state_payload(repo)
+            snapshot["repo_identity"] = {"device": True, "inode": 1}
+            unsigned = {key: value for key, value in snapshot.items() if key != "state_id"}
+            snapshot["state_id"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(workspace_state_module.StateError, "identity"):
+                workspace_state_module.validate_snapshot(snapshot)
 
     def git(self, repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -553,11 +622,8 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
                 check=False,
             )
 
-            self.assertEqual(exact.returncode, 1, exact.stderr)
-            self.assertEqual(
-                json.loads(exact.stdout)["violations"],
-                ["outside_lease:src/owned.txt"],
-            )
+            self.assertEqual(exact.returncode, 2, exact.stderr)
+            self.assertIn("invalid lease path: src", exact.stderr)
             self.assertEqual(prefix.returncode, 0, prefix.stderr)
             self.assertEqual(json.loads(prefix.stdout)["violations"], [])
 

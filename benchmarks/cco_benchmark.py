@@ -271,6 +271,32 @@ def _result_counter(value: Any, *, label: str) -> dict[str, int]:
     return result
 
 
+def _model_family_usage(
+    value: Any, *, label: str
+) -> tuple[dict[str, dict[str, int]], list[str], dict[str, dict[str, int]]]:
+    """Validate per-model counters and derive the only permitted family totals."""
+
+    if not isinstance(value, Mapping):
+        raise BenchmarkError(f"{label} must be an object")
+    models: dict[str, dict[str, int]] = {}
+    families = {family: _empty_usage() for family in ("sol", "terra", "luna")}
+    unexpected_models: set[str] = set()
+    for route, counter in value.items():
+        if not isinstance(route, str):
+            raise BenchmarkError(f"{label} has an invalid model route")
+        model, separator, effort = route.rpartition("/")
+        if not separator or not model or not effort:
+            raise BenchmarkError(f"{label} has an invalid model route")
+        checked = _result_counter(counter, label=f"{label} {route}")
+        models[route] = checked
+        family = _model_family(model)
+        if family == "other":
+            unexpected_models.add(model)
+        else:
+            _merge_counter(families[family], checked)
+    return models, sorted(unexpected_models), families
+
+
 def _validate_result(
     value: Mapping[str, Any], *, expected: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -309,10 +335,23 @@ def _validate_result(
         raise BenchmarkError(
             f"result {expected.get('run_id')} has no unique root thread binding"
         )
-    if usage.get("unexpected_models") != []:
+    models, observed_unexpected, calculated_families = _model_family_usage(
+        usage.get("models"), label=f"result {expected.get('run_id')} model usage"
+    )
+    declared_unexpected = usage.get("unexpected_models")
+    if (
+        not isinstance(declared_unexpected, list)
+        or any(not isinstance(model, str) for model in declared_unexpected)
+        or declared_unexpected != sorted(set(declared_unexpected))
+        or declared_unexpected != observed_unexpected
+    ):
+        raise BenchmarkError(
+            f"result {expected.get('run_id')} has inconsistent unexpected model accounting"
+        )
+    if declared_unexpected:
         raise BenchmarkError(f"result {expected.get('run_id')} used an unexpected model")
-    models = usage.get("models")
-    if not isinstance(models, Mapping) or "gpt-5.6-sol/max" not in models:
+    primary_usage = models.get("gpt-5.6-sol/max")
+    if primary_usage is None or primary_usage["requests"] < 1:
         raise BenchmarkError(f"result {expected.get('run_id')} lacks Sol/max Primary usage")
     families = usage.get("families")
     if not isinstance(families, Mapping) or set(families) != {"sol", "terra", "luna"}:
@@ -321,6 +360,10 @@ def _validate_result(
         family: _result_counter(families[family], label=f"usage family {family}")
         for family in ("sol", "terra", "luna")
     }
+    if checked_families != calculated_families:
+        raise BenchmarkError(
+            f"result {expected.get('run_id')} has inconsistent model/family usage"
+        )
     if checked_families["sol"]["requests"] < 1:
         raise BenchmarkError(f"result {expected.get('run_id')} has no Primary request")
     if expected.get("arm_mode") == "primary_only":

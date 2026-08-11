@@ -190,6 +190,15 @@ class ControlPlaneUnavailable(ControlPlaneError):
     """CCO state infrastructure is temporarily unavailable; do not fence work."""
 
 
+class _AtomicWriteUncertain(ControlPlaneUnavailable):
+    """A replacement was published, but its directory sync was not confirmed.
+
+    Callers must retain the in-memory revision and let receipt/state replay
+    resolve the outcome.  Reverting local bookkeeping after ``os.replace``
+    would be unsafe because the replacement may already be visible.
+    """
+
+
 def _text(value: object, label: str, *, limit: int = 8_192) -> str:
     if not isinstance(value, str):
         raise ControlPlaneError(f"{label} must be text")
@@ -267,8 +276,62 @@ def _isolation_lock_timeout(limit: float) -> float:
     return _bounded_lock_timeout(min(limit, ISOLATION_NAMESPACE_WAIT_SECONDS))
 
 
+def _sync_directory(path: Path) -> None:
+    """Persist a completed POSIX namespace transition before reporting success.
+
+    Python cannot open a directory for ``fsync`` on Windows; the Windows path
+    instead uses ``MoveFileExW(MOVEFILE_WRITE_THROUGH)`` in
+    :func:`_replace_atomically`.  POSIX hosts need the parent sync in addition
+    to the staged-file sync for crash-durable publication.
+    """
+
+    if os.name == "nt":
+        return
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ControlPlaneUnavailable(
+            "lifecycle state directory cannot be synchronized"
+        ) from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                raise ControlPlaneUnavailable(
+                    "lifecycle state directory cannot be closed"
+                ) from error
+
+
+def _replace_atomically(source: Path, target: Path) -> None:
+    """Replace one same-directory staged file with host-appropriate durability."""
+
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    # ``os.replace`` maps to an atomic rename but does not request Windows'
+    # write-through completion.  The staging file is deliberately in the same
+    # directory, so ``MoveFileExW`` retains the replacement semantics while
+    # making the namespace transition durable before it returns.
+    import ctypes
+    from ctypes import wintypes
+
+    move_file = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move_file.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
+    move_file.restype = wintypes.BOOL
+    replace_existing = 0x00000001
+    write_through = 0x00000008
+    if not move_file(str(source), str(target), replace_existing | write_through):
+        code = ctypes.get_last_error()
+        raise OSError(code, "MoveFileExW lifecycle replacement failed", str(target))
+
+
 def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     # Workspace adapters legitimately contain platform inode/device integers above
     # JavaScript's safe range.  Artifact identities bind their state_id, while the
     # persisted snapshot itself uses deterministic ordinary JSON without re-hashing
@@ -283,7 +346,9 @@ def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
         + b"\n"
     )
     staged: Path | None = None
+    replaced = False
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="wb",
             dir=path.parent,
@@ -294,15 +359,38 @@ def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
             staged = Path(handle.name)
-        os.replace(staged, path)
+        _replace_atomically(staged, path)
         staged = None
+        replaced = True
+        try:
+            _sync_directory(path.parent)
+        except ControlPlaneUnavailable as error:
+            # The file data is fsync'd and the replacement completed, but a
+            # caller cannot safely assume either rollback or durable success
+            # until a later replay observes the namespace.
+            raise _AtomicWriteUncertain(
+                "lifecycle replacement directory sync is uncertain"
+            ) from error
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+    except _AtomicWriteUncertain:
+        raise
+    except OSError as error:
+        if replaced:
+            raise _AtomicWriteUncertain(
+                "lifecycle replacement durability is uncertain"
+            ) from error
+        raise ControlPlaneUnavailable("lifecycle atomic write is unavailable") from error
     finally:
         if staged is not None:
-            staged.unlink(missing_ok=True)
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                # This is only an unlinked staging file: never hide the
+                # authoritative publication outcome behind cleanup failure.
+                pass
 
 
 def _write_immutable(path: Path, value: Mapping[str, Any]) -> None:
@@ -1154,8 +1242,13 @@ class ControlPlane:
                 handle.write(STATE_ROOT_SENTINEL_BYTES)
                 handle.flush()
                 os.fsync(handle.fileno())
+            _sync_directory(self.root)
         except Exception:
-            self._state_root_sentinel.unlink(missing_ok=True)
+            try:
+                self._state_root_sentinel.unlink(missing_ok=True)
+                _sync_directory(self.root)
+            except (ControlPlaneUnavailable, OSError):
+                pass
             raise
 
     @staticmethod
@@ -1819,6 +1912,7 @@ class ControlPlane:
             current = self._read_pending_event(path)
             if current == normalized:
                 path.unlink(missing_ok=True)
+                _sync_directory(path.parent)
 
     def _interrupt_attempt_receipt(
         self,
@@ -1997,6 +2091,7 @@ class ControlPlane:
         ):
             if path.exists() and self._read_pending_event(path) == normalized:
                 path.unlink(missing_ok=True)
+                _sync_directory(path.parent)
 
     @staticmethod
     def _validate_native_attempt_observation(
@@ -2064,23 +2159,8 @@ class ControlPlane:
             raise ControlPlaneError("native tool result has no input identity")
         message = tool_input.get("message")
         if opaque_message:
-            with self._coordinated_state() as state:
-                matches = [
-                    dispatch
-                    for dispatch in state["dispatches"].values()
-                    if dispatch.get("tool_use_id") == tool_use_id
-                    and dispatch.get("tool_kind") in {"spawn", "reuse", "continuation"}
-                ]
-                if len(matches) != 1:
-                    raise ControlPlaneError(
-                        "opaque native result has no unique prepared attempt"
-                    )
-                dispatch_id = matches[0]["dispatch_id"]
-                input_sha256 = _digest(
-                    b"cco.native-input.v1\0",
-                    dict(matches[0]["native"]),
-                )
-        elif isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
+            raise ControlPlaneError("opaque postflight has no trustworthy host binding")
+        if isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
             dispatch_id = parse_task_message(message)["dispatch_id"]
             input_sha256 = _digest(b"cco.native-input.v1\0", dict(tool_input))
         elif isinstance(message, str) and message.startswith(CONTINUE_HEADER + "\n"):
@@ -2166,10 +2246,11 @@ class ControlPlane:
             raise ControlPlaneError("native receipt observation is invalid")
         settlement_event = dict(normalized)
         settlement_event["owners"] = list(recorded_observation["owners"])
-        settled = self._settle_native_success_event(settlement_event)
+        settled = self._settle_native_success_event(settlement_event, receipt=observed)
         if not settled:
-            # The receipt is from an earlier plan.  Its identity proof prevents
-            # it from being replayed against a replacement plan.
+            # An earlier plan or an unlinked reservation cannot authorize this
+            # postflight.  Its identity proof prevents it from mutating a
+            # replacement plan or a dispatch whose state claim never landed.
             self._finalize_native_attempt_receipt(observed)
             return False
 
@@ -2321,6 +2402,8 @@ class ControlPlane:
                 raise ControlPlaneUnavailable(
                     "pending lifecycle event finalization failed"
                 ) from error
+            else:
+                _sync_directory(path.parent)
 
     def _pending_restart_receipt(self) -> dict[str, Any] | None:
         """Return the oldest restart transaction awaiting this session's recovery."""
@@ -2357,6 +2440,11 @@ class ControlPlane:
                     # before this restart can make a lifecycle decision.
                     self._stage_pending_event(event)
                     return event
+        except _AtomicWriteUncertain:
+            # A bound restart receipt can already be visible.  Let the next
+            # replay discover that exact transaction rather than fabricating a
+            # second, unbound restart decision.
+            raise
         except ControlPlaneUnavailable:
             # A host restart can arrive before a current lifecycle is readable.
             # Keep its bounded receipt unbound until normal recovery can either
@@ -3153,6 +3241,7 @@ class ControlPlane:
                     raise ControlPlaneUnavailable(
                         "orphaned lifecycle receipt cleanup failed"
                     ) from error
+                _sync_directory(path.parent)
                 removed += 1
         return removed
 
@@ -3505,6 +3594,12 @@ class ControlPlane:
         state["revision"] = int(previous_revision) + 1
         try:
             _atomic_write(target, state)
+        except _AtomicWriteUncertain:
+            # ``os.replace`` completed, so this process must not mutate its
+            # in-memory state back to the old revision.  A duplicate Hook or
+            # restart will read the authoritative file/receipt and settle it.
+            self._state_path = target
+            raise
         except Exception:
             state["revision"] = previous_revision
             raise
@@ -4599,7 +4694,16 @@ class ControlPlane:
                 state["active_wave_id"] = wave_id
                 if cooperative:
                     state.pop("cooperative_preparing", None)
-                self._write_state(state)
+                try:
+                    self._write_state(state)
+                except _AtomicWriteUncertain:
+                    # The final state can already reference these isolate
+                    # roots even though its parent-directory durability is
+                    # uncertain.  Preserve the physical roots for replay;
+                    # deleting them here would turn a replayable publication
+                    # into an invalid live wave.
+                    isolate_committed = cooperative
+                    raise
                 isolate_committed = cooperative
                 result = self._public_batch(state, created)
                 if blocked:
@@ -4808,6 +4912,11 @@ class ControlPlane:
             try:
                 self._begin_native_claim(state, dispatch, tool_use_id)
                 self._write_state(state)
+            except _AtomicWriteUncertain:
+                # The claim and its receipt may already be published.  Leave
+                # both for the durable receipt/state replay instead of
+                # manufacturing an unlinked rollback.
+                raise
             except Exception:
                 dispatch["receipt_id"] = None
                 self._discard_reserved_native_attempt_receipt(receipt)
@@ -4889,6 +4998,11 @@ class ControlPlane:
                 )
                 checkpoint()
                 self._write_state(state)
+        except _AtomicWriteUncertain:
+            # A post-verification renewal may already be live.  Its receipt
+            # remains the replay anchor, so never clear it from a stale local
+            # copy after a directory-sync uncertainty.
+            raise
         except Exception:
             self._rollback_native_claim(dispatch_id, tool_use_id)
             raise
@@ -4903,38 +5017,13 @@ class ControlPlane:
         if not isinstance(tool_input, Mapping):
             raise ControlPlaneError("spawn input is missing")
         if opaque_message:
-            comparable_keys = (
-                "agent_type",
-                "fork_turns",
-                "model",
-                "reasoning_effort",
-                "task_name",
-            )
-            with self._coordinated_state() as state:
-                matches = [
-                    dispatch
-                    for dispatch in state["dispatches"].values()
-                    if dispatch.get("state") == "starting"
-                    and dispatch.get("tool_kind") == "spawn"
-                    and isinstance(dispatch.get("native"), Mapping)
-                    and all(
-                        tool_input.get(key) == dispatch["native"].get(key)
-                        for key in comparable_keys
-                    )
-                ]
-            if len(matches) != 1:
-                raise ControlPlaneError(
-                    "opaque spawn has no unique prepared dispatch"
-                )
-            expected_input = matches[0]["native"]
-            if set(tool_input) != set(expected_input):
-                raise ControlPlaneError(
-                    "opaque spawn cannot add fields beyond its prepared attempt"
-                )
-            dispatch_id = matches[0]["dispatch_id"]
-        else:
-            task = parse_task_message(tool_input.get("message"))
-            dispatch_id = task["dispatch_id"]
+            # The Hook surface currently provides no authenticated host
+            # metadata that binds an encrypted replacement to the prepared
+            # dispatch and exact plaintext message.  Matching its shape (or
+            # its neighboring fields) is not authorization.
+            raise ControlPlaneError("opaque spawn has no trustworthy host binding")
+        task = parse_task_message(tool_input.get("message"))
+        dispatch_id = task["dispatch_id"]
         tool_use_id = payload.get("tool_use_id")
         if not isinstance(tool_use_id, str) or not tool_use_id:
             raise ControlPlaneError("spawn has no native tool-use identity")
@@ -4944,6 +5033,8 @@ class ControlPlane:
             if dispatch["state"] != "starting" or dispatch["tool_kind"] != "spawn":
                 raise ControlPlaneError("dispatch is not ready to spawn")
             expected = dispatch["native"]
+            if set(tool_input) != set(expected):
+                raise ControlPlaneError("spawn contains fields beyond its prepared wave")
             keys = [
                 "agent_type",
                 "fork_turns",
@@ -4951,8 +5042,7 @@ class ControlPlane:
                 "reasoning_effort",
                 "task_name",
             ]
-            if not opaque_message:
-                keys.append("message")
+            keys.append("message")
             for key in keys:
                 if tool_input.get(key) != expected[key]:
                     raise ControlPlaneError(
@@ -4998,6 +5088,8 @@ class ControlPlane:
             dispatch = self._find_dispatch(state, dispatch_id)
             if dispatch["state"] != "starting" or dispatch["tool_kind"] != "reuse":
                 raise ControlPlaneError("dispatch is not ready to reuse an owner")
+            if set(tool_input) != set(dispatch["native"]):
+                raise ControlPlaneError("reuse contains fields beyond its prepared input")
             if (
                 tool_input.get("target") != dispatch.get("owner")
                 or tool_input.get("message") != dispatch["native"].get("message")
@@ -5062,40 +5154,10 @@ class ControlPlane:
         )
 
     def preflight_opaque_followup(self, payload: Mapping[str, Any]) -> None:
-        """Bind one host-protected follow-up to its unique prepared attempt."""
+        """Fail closed until the host exposes a signed follow-up binding."""
 
-        tool_input = payload.get("tool_input")
-        if not isinstance(tool_input, Mapping):
-            raise ControlPlaneError("follow-up input is missing")
-        target = tool_input.get("target")
-        if not isinstance(target, str):
-            raise ControlPlaneError("follow-up target is missing")
-        if set(tool_input) != {"message", "target"}:
-            raise ControlPlaneError(
-                "opaque follow-up cannot add fields beyond its prepared attempt"
-            )
-        with self._coordinated_state() as state:
-            matches = [
-                dispatch
-                for dispatch in state["dispatches"].values()
-                if dispatch.get("owner") == target
-                and dispatch.get("tool_kind") in {"reuse", "continuation"}
-                and dispatch.get("state") in {"starting", "paused"}
-                and isinstance(dispatch.get("native"), Mapping)
-                and dispatch["native"].get("target") == target
-            ]
-        if len(matches) != 1:
-            raise ControlPlaneError(
-                "opaque follow-up has no unique prepared continuation or reuse"
-            )
-        prepared_payload = dict(payload)
-        prepared_input = dict(tool_input)
-        prepared_input["message"] = matches[0]["native"]["message"]
-        prepared_payload["tool_input"] = prepared_input
-        if matches[0]["tool_kind"] == "reuse":
-            self.preflight_reuse(prepared_payload)
-        else:
-            self.preflight_continuation(prepared_payload)
+        del payload
+        raise ControlPlaneError("opaque follow-up has no trustworthy host binding")
 
     def preflight_continuation(self, payload: Mapping[str, Any]) -> None:
         tool_input = payload.get("tool_input")
@@ -5125,6 +5187,8 @@ class ControlPlane:
                     "continuation owner has an unresolved interrupt attempt"
                 )
             if (
+                set(tool_input) != set(dispatch["native"])
+                or
                 tool_input.get("target") != dispatch["owner"]
                 or tool_input.get("message") != dispatch["native"].get("message")
             ):
@@ -5377,7 +5441,12 @@ class ControlPlane:
             raise ControlPlaneError("native tool result is not a spawn or follow-up")
         self._observe_native_attempt(event)
 
-    def _settle_native_success_event(self, event: Mapping[str, Any]) -> bool:
+    def _settle_native_success_event(
+        self,
+        event: Mapping[str, Any],
+        *,
+        receipt: Mapping[str, Any],
+    ) -> bool:
         dispatch_id = str(event["dispatch_id"])
         tool_use_id = str(event["tool_use_id"])
         if not self.state_path.exists():
@@ -5389,11 +5458,27 @@ class ControlPlane:
                 # A receipt from an explicitly cleaned-up plan cannot authorize
                 # work in a replacement plan.
                 return False
+            # Receipt publication is intentionally before the state claim.  An
+            # atomic replacement can become visible just before its directory
+            # durability report fails, leaving a durable-but-unlinked
+            # reservation.  It never admitted a host call, so it cannot turn a
+            # later PostToolUse into a running dispatch merely by sharing the
+            # prepared ciphertext/message shape.
+            if not self._native_receipt_is_current(state, dispatch, receipt):
+                return False
             if dispatch["state"] in {"fenced", "rejected", "retired", "ready_to_apply"} or (
                 dispatch["state"] == "paused"
                 and isinstance(dispatch.get("result"), Mapping)
             ):
                 return True
+            # A successful state transition may have been published just
+            # before the Hook lost its directory-sync acknowledgement.  The
+            # current receipt proves this is its exact replay; advance only its
+            # receipt state below, rather than requiring a second host call.
+            if dispatch["state"] == "running":
+                return True
+            if dispatch["state"] != "starting":
+                return False
             expected = dispatch.get("native")
             if (
                 not isinstance(expected, Mapping)
@@ -5401,9 +5486,7 @@ class ControlPlane:
                 != event.get("tool_input_sha256")
             ):
                 raise ControlPlaneError("native tool result input is stale")
-            if isinstance(dispatch.get("tool_use_id"), str) and dispatch[
-                "tool_use_id"
-            ] != tool_use_id:
+            if dispatch.get("tool_use_id") != tool_use_id:
                 raise ControlPlaneError("native tool result call identity is stale")
             self._assert_cross_task_compatible(
                 dispatch["workspace_root"],
@@ -5556,6 +5639,10 @@ class ControlPlane:
                     _now_milliseconds() + NATIVE_CLAIM_TTL_MILLISECONDS
                 )
                 self._write_state(state)
+            except _AtomicWriteUncertain:
+                # A durable interrupt reservation may already exist.  Do not
+                # clear the local pointer or delete its replay receipt.
+                raise
             except Exception:
                 dispatch["interrupt_receipt_id"] = None
                 dispatch["interrupt_tool_use_id"] = None
@@ -5893,6 +5980,27 @@ class ControlPlane:
                 for item in dispatches
             ):
                 raise ControlPlaneError("cooperative wave does not have every required result")
+            previous_journal = state.get("cooperative_journal")
+            if previous_journal is not None:
+                try:
+                    bound_journal = validate_isolation_journal(previous_journal, self.root)
+                except WriterIsolationError as error:
+                    raise ControlPlaneError(
+                        "cooperative journal is invalid: " + str(error)
+                    ) from error
+                if bound_journal["phase"] not in {"applied", "rolled_back"}:
+                    # A prior Hook can time out after persisting an ``applying``
+                    # entry but before returning from the filesystem mutation.
+                    # Recover that exact durable journal before any new apply;
+                    # do not create a second backup or treat the tail as a new
+                    # successful result.
+                    self._recover_cooperative_journal_locked(state)
+                    raise ControlPlaneError(
+                        "cooperative apply recovery fenced the interrupted wave"
+                    )
+                raise ControlPlaneError(
+                    "cooperative journal conflicts with a ready-to-apply wave"
+                )
             changes: dict[str, dict[str, Any]] = {}
             try:
                 for dispatch in sorted(dispatches, key=lambda item: str(item["unit_id"])):
@@ -6052,7 +6160,14 @@ class ControlPlane:
                     # orphan scan can now see either no journal or its durable
                     # liveness record, never an unreferenced live backup.
                     state["cooperative_journal"] = journal
-                    self._write_state(state)
+                    try:
+                        self._write_state(state)
+                    except _AtomicWriteUncertain:
+                        # The authoritative state may already reference this
+                        # backup tree.  Retain it for replay rather than
+                        # deleting a journal whose publication was uncertain.
+                        journal_published = True
+                        raise
                     journal_published = True
                 finally:
                     if journal is not None and not journal_published:
@@ -6077,6 +6192,26 @@ class ControlPlane:
                         progress=persist_apply_progress,
                         ready_isolates=ready_isolates,
                     )
+                except OperationDeadlineExceeded as error:
+                    # ``applying`` and each entry's pre-mutation phase are
+                    # written before that entry can change the canonical tree.
+                    # Once the Hook budget is exhausted, attempting rollback
+                    # under the same expired deadline would make a partial
+                    # mutation less recoverable.  Leave the journal as the
+                    # sole durable recovery authority and ask the host to
+                    # replay/restart it with a fresh bounded operation.
+                    raise ControlPlaneUnavailable(
+                        "cooperative apply reached its deadline after durable progress; "
+                        "retry lifecycle recovery"
+                    ) from error
+                except _AtomicWriteUncertain:
+                    # A progress checkpoint may have been replaced before its
+                    # directory sync failed.  Its durable receipt/state is the
+                    # recovery authority; never start a second rollback from a
+                    # stale in-memory journal.
+                    raise
+                except ControlPlaneUnavailable:
+                    raise
                 except (
                     WriterIsolationError,
                     WriterIsolationUnavailable,
@@ -6087,6 +6222,11 @@ class ControlPlane:
                     self._write_state(state)
                     try:
                         rollback_isolation_journal(journal, self.root)
+                    except OperationDeadlineExceeded as rollback_error:
+                        raise ControlPlaneUnavailable(
+                            "cooperative apply rollback reached its deadline; "
+                            "retry lifecycle recovery"
+                        ) from rollback_error
                     except (WriterIsolationError, WriterIsolationUnavailable) as rollback_error:
                         journal["phase"] = "recovery_required"
                         state["cooperative_journal"] = journal
@@ -6598,6 +6738,13 @@ class ControlPlane:
         self._write_state(state)
         try:
             rollback_isolation_journal(bound, self.root)
+        except OperationDeadlineExceeded as error:
+            # ``rolling_back`` was persisted before the first rollback
+            # mutation.  Do not fence or overwrite that recovery marker after
+            # the Hook deadline; a fresh replay can continue the exact journal.
+            raise ControlPlaneUnavailable(
+                "cooperative apply recovery reached its deadline; retry lifecycle recovery"
+            ) from error
         except (WriterIsolationError, WriterIsolationUnavailable) as error:
             bound["phase"] = "recovery_required"
             state["cooperative_journal"] = bound
@@ -7071,6 +7218,7 @@ class ControlPlane:
                             "recovery before cleanup."
                         )
                     self.state_path.unlink()
+                    _sync_directory(self.state_path.parent)
                 removed = 1 + cooperative_removed + remove_artifacts()
         else:
             with acquire(self.root, self.session_id, timeout=self.lock_timeout):

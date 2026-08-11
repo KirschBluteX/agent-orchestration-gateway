@@ -4,12 +4,32 @@ CCO follows semantic versioning while it remains pre-1.0. A pre-1.0 minor releas
 breaking changes. Public, installer, and manifest identities use a plain release version without
 build metadata.
 
+## 0.9.1 - 2026-08-10
+
+### Changed
+
+- `0.9.1` is the current public, installer, and manifest identity. It remains deliberately
+  pre-1.0 with no build metadata.
+- Offline host-edge repair now durably publishes the exact owner-only rollback journal, pins that
+  current journal through retention even when host clocks are out of order, and rechecks its
+  rollout proof immediately before the edge-close commit.
+- Benchmark results now require every model-route counter to add exactly to its `sol`, `terra`, or
+  `luna` family counter. Doctor rejects missing, duplicate, and unknown CCO Hook definitions from
+  the authoritative host inventory.
+- Unbound opaque Agent messages now fail closed; exact plaintext or trusted prepared-input digest
+  metadata is required before spawn, reuse, continuation, or postflight settlement. Git subprocesses
+  also clear repository-routing environment overrides before inspecting or mutating a workspace.
+- Cooperative writers use bounded copies when declared scopes contain ignored content, apply
+  deadlines retain a replayable journal, and prefix-scope reparse inspection has one shared entry
+  budget. Partial rollout tails are retryable rather than permanently fencing a valid result.
+- The dependency marker, Hook-trust instructions, operational security boundary, and release
+  documents are aligned with the current maintenance release.
+
 ## 0.9.0 - 2026-08-10
 
 ### Release policy
 
-- `0.9.0` is the current public release identity. It is deliberately pre-1.0 and has no build
-  metadata.
+- `0.9.0` introduced the pre-1.0 public release identity without build metadata.
 - Historical labels from 2.x through 5.x are compressed into the pre-0.9 development history
   below. Git history remains unchanged; this release does not rewrite commits, tags, or branches.
 

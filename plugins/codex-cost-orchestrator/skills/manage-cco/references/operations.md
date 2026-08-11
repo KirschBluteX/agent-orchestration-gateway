@@ -4,12 +4,17 @@
 
 ```text
 python -B scripts/install_agents.py --workspace <repo> --bootstrap
-python -B scripts/install_agents.py --workspace <repo> --doctor
 python -B scripts/install_agents.py --workspace <repo> --uninstall
 ```
 
 Use `--replace` only when explicitly replacing the two CCO-owned profile files. Review and trust
-the five CCO Hook definitions in `/hooks`, then begin a new Codex task.
+the five exact CCO Hook definitions in `/hooks`, then begin a new Codex task before running doctor:
+
+```text
+python -B scripts/install_agents.py --workspace <repo> --doctor
+```
+
+Doctor rejects missing, duplicate, and unknown CCO Hook definitions reported by the host.
 
 ## Lifecycle
 
@@ -27,7 +32,7 @@ python -B scripts/control_plane.py cleanup
 not a native failure. `retry` makes a guarded newer generation. `cleanup` is current-task-only
 and refuses active or paused work.
 
-CCO is pre-1.0. Its current public, installer, and manifest identity is `0.9.0` with no build
+CCO is pre-1.0. Its current public, installer, and manifest identity is `0.9.1` with no build
 metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
 through 5.x are pre-0.9 development history; Git history remains unchanged. Predecessor active
 state, wave, lifecycle, and receipt artifacts are rejected before use. Remove those old artifacts
@@ -38,7 +43,9 @@ command exists.
 
 Run the repair utility only outside an active Codex task with `CODEX_THREAD_ID` unset. `--check`
 is read-only. `--repair` requires `--offline-confirm`, one exact parent UUID, and every exact
-child UUID it may close. It creates an owner-only rollback journal before changing an edge.
+child UUID it may close. It durably creates an owner-only rollback journal before changing an edge,
+retains that current journal despite clock anomalies, and rechecks the bound rollout proof just
+before the database commit.
 
 ```text
 python -B <PLUGIN_ROOT>/maintenance/repair_host_edges.py --check

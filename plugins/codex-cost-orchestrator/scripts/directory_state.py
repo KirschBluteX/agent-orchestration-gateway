@@ -192,6 +192,10 @@ def normalize_directory_scope(
         if _is_reparse_metadata(metadata):
             raise DirectoryStateError("directory scope cannot traverse a reparse point")
         if stat.S_ISDIR(metadata.st_mode):
+            if scope["kind"] == "exact" and index == len(segments) - 1:
+                raise DirectoryStateError(
+                    "directory exact scope cannot identify an ordinary directory"
+                )
             current = candidate
         elif index < len(segments) - 1:
             raise DirectoryStateError("directory scope traverses a non-directory")
@@ -425,8 +429,8 @@ def capture_directory_state(
     workspace = directory_root(root)
     if capture_mode not in CAPTURE_MODES or workspace_mode not in {"light", "strict"}:
         raise DirectoryStateError("directory snapshot mode is invalid")
-    if not isinstance(scopes, list):
-        raise DirectoryStateError("directory snapshot scopes must be a list")
+    if not isinstance(scopes, list) or not scopes:
+        raise DirectoryStateError("directory snapshot scopes must be a non-empty list")
     limits = _limits(max_entries, max_bytes)
     normalized = [
         normalize_directory_scope(
@@ -503,7 +507,10 @@ def validate_directory_snapshot(value: object) -> dict[str, Any]:
         or not Path(root_path).is_absolute()
         or not isinstance(root_identity, Mapping)
         or set(root_identity) != {"device", "inode"}
-        or any(not isinstance(item, str) or not item.isdigit() for item in root_identity.values())
+        or any(
+            not isinstance(item, str) or not item.isascii() or not item.isdecimal()
+            for item in root_identity.values()
+        )
     ):
         raise DirectoryStateError("directory snapshot root is invalid")
     limits = value.get("limits")
@@ -515,7 +522,11 @@ def validate_directory_snapshot(value: object) -> dict[str, Any]:
         scopes = [require_repository_scope(item, "directory snapshot scope") for item in scopes_value]
     except (ProtocolHashError, TypeError) as error:
         raise DirectoryStateError("directory snapshot scopes are malformed") from error
-    if scopes != sorted(scopes, key=lambda item: (item["kind"], item["path"])):
+    if (
+        not scopes
+        or len({(item["kind"], _case_key(item["path"])) for item in scopes}) != len(scopes)
+        or scopes != sorted(scopes, key=lambda item: (item["kind"], item["path"]))
+    ):
         raise DirectoryStateError("directory snapshot scopes are not canonical")
     entries_value = value.get("entries")
     if not isinstance(entries_value, list):

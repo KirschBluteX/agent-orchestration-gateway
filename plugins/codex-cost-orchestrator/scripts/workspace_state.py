@@ -9,12 +9,14 @@ import json
 import ntpath
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
 import tempfile
 from typing import Any, Iterator
 
+from git_environment import clean_git_environment
 from operation_deadline import (
     OperationDeadlineExceeded,
     checkpoint,
@@ -39,6 +41,9 @@ DEFAULT_IGNORED_MAX_BYTES = 256 * 1024 * 1024
 MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 MAX_GIT_RECORDS = 200_000
 MAX_GIT_CONTROL_ENTRIES = 100_000
+MAX_SCOPE_REPARSE_ENTRIES = 100_000
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_OID_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 GIT_ADMIN_PATHS = (
     "AUTO_MERGE",
     "BISECT_EXPECTED_REV",
@@ -101,12 +106,13 @@ class StateUnavailable(StateError):
 
 
 def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
-    environment = os.environ.copy()
+    environment = clean_git_environment()
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     command = ["git", *args]
     process: subprocess.Popen[bytes] | None = None
     try:
         with tempfile.TemporaryFile(mode="w+b") as output:
+            checkpoint()
             process = subprocess.Popen(
                 command,
                 cwd=repo,
@@ -302,6 +308,33 @@ def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _validate_digest(value: object, label: str, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise StateError(f"baseline {label} is invalid")
+    return value
+
+
+def _validate_filesystem_identity(value: object, label: str) -> dict[str, int]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"device", "inode"}
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 0
+            for item in value.values()
+        )
+    ):
+        raise StateError(f"baseline {label} is invalid")
+    return {"device": value["device"], "inode": value["inode"]}
+
+
+def _validate_absolute_root(value: object, label: str) -> str:
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        raise StateError(f"baseline {label} is invalid")
+    return value
+
+
 def normalized_snapshot_scopes(
     scopes: object,
     *,
@@ -313,8 +346,8 @@ def normalized_snapshot_scopes(
         if require_nonempty:
             raise StateError("scoped ignored policy requires reader scopes")
         return None
-    if not isinstance(scopes, list):
-        raise StateError("workspace scopes must be a list")
+    if not isinstance(scopes, list) or not scopes:
+        raise StateError("workspace scopes must be a non-empty list")
     try:
         normalized = [
             require_repository_scope(scope, f"workspace scope[{index}]")
@@ -326,8 +359,6 @@ def normalized_snapshot_scopes(
     if len(identities) != len(normalized):
         raise StateError("workspace scopes contain duplicates")
     canonical = [identities[key] for key in sorted(identities)]
-    if require_nonempty and not canonical:
-        raise StateError("scoped ignored policy requires reader scopes")
     return canonical
 
 
@@ -389,12 +420,28 @@ class _ControlEntryBudget:
         self.remaining -= 1
 
 
+class ScopeReparseBudget:
+    """One shared traversal budget for every prefix scope in one request."""
+
+    def __init__(self) -> None:
+        self.remaining = MAX_SCOPE_REPARSE_ENTRIES
+
+    def consume(self) -> None:
+        checkpoint()
+        if self.remaining <= 0:
+            raise StateUnavailable(
+                "workspace scope inspection exceeds the "
+                f"{MAX_SCOPE_REPARSE_ENTRIES} reparse entry limit"
+            )
+        self.remaining -= 1
+
+
 def reparse_resolved_record(
     path: Path,
     *,
     _budget: _ControlEntryBudget | None = None,
 ) -> dict[str, Any]:
-    budget = _budget or _ControlEntryBudget()
+    budget = _ControlEntryBudget() if _budget is None else _budget
     try:
         if path.is_dir():
             return {
@@ -422,7 +469,7 @@ def directory_digest(
 ) -> str:
     if not path.exists():
         return sha256_bytes(b'{"kind":"missing"}')
-    budget = _budget or _ControlEntryBudget()
+    budget = _ControlEntryBudget() if _budget is None else _budget
     records: list[dict[str, Any]] = []
     stack: list[tuple[Path, str]] = [(path, "")]
     while stack:
@@ -492,7 +539,7 @@ def control_entry_record(
     *,
     _budget: _ControlEntryBudget | None = None,
 ) -> dict[str, Any]:
-    budget = _budget or _ControlEntryBudget()
+    budget = _ControlEntryBudget() if _budget is None else _budget
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -543,7 +590,7 @@ def git_admin_digest(
     _budget: _ControlEntryBudget | None = None,
 ) -> str:
     paths = repository_git_paths(root, GIT_ADMIN_PATHS)
-    budget = _budget or _ControlEntryBudget()
+    budget = _ControlEntryBudget() if _budget is None else _budget
     records = [
         {"name": name, **control_entry_record(paths[name], _budget=budget)}
         for name in GIT_ADMIN_PATHS
@@ -663,8 +710,10 @@ def ignored_entries(
 
     if max_files < 0 or max_bytes < 0:
         raise StateError("ignored scan limits must be non-negative")
-    if scopes == []:
-        return {}
+    if scopes is not None:
+        normalized_scopes = normalized_snapshot_scopes(scopes)
+        assert normalized_scopes is not None
+        scopes = normalized_scopes
     pathspecs: list[str] | None = None
     if scopes is not None:
         pathspecs = []
@@ -813,6 +862,10 @@ def tracked_entries(
     ignored_max_bytes: int = DEFAULT_IGNORED_MAX_BYTES,
     scopes: list[dict[str, str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    if scopes is not None:
+        normalized_scopes = normalized_snapshot_scopes(scopes)
+        assert normalized_scopes is not None
+        scopes = normalized_scopes
     index_records = (
         repository_index_records(root) if index_records is None else index_records
     )
@@ -869,6 +922,36 @@ def tracked_entries(
     return entries
 
 
+def _reject_exact_ordinary_directories(
+    root: Path,
+    scopes: list[dict[str, str]] | None,
+    *,
+    gitlinks: frozenset[str],
+) -> None:
+    """Keep an ``exact`` scope atomic unless it names a Gitlink.
+
+    Ordinary directories need a ``prefix`` scope so their children, including
+    ignored content, remain observable.  A Gitlink is the sole directory-shaped
+    atomic object: its nested repository receives its own full snapshot.
+    """
+
+    if scopes is None:
+        return
+    for scope in scopes:
+        if scope["kind"] != "exact" or scope["path"] in gitlinks:
+            continue
+        try:
+            metadata = (root / Path(scope["path"])).lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise StateUnavailable("workspace scope inspection is unavailable") from error
+        if stat.S_ISDIR(metadata.st_mode):
+            raise StateError(
+                f"invalid lease path: {scope['path']} (exact scope names an ordinary directory)"
+            )
+
+
 def workspace_entries(
     root: Path,
     index_records: dict[str, list[dict[str, str]]] | None = None,
@@ -885,10 +968,18 @@ def workspace_entries(
         scopes,
         require_nonempty=(ignored_policy == IGNORED_POLICY_SCOPED_READER_V1),
     )
+    active_index_records = (
+        repository_index_records(root) if index_records is None else index_records
+    )
+    _reject_exact_ordinary_directories(
+        root,
+        normalized_scopes,
+        gitlinks=repository_gitlinks(root, active_index_records),
+    )
     status = status_entries(root)
     tracked = tracked_entries(
         root,
-        index_records,
+        active_index_records,
         ignored_mode=ignored_mode,
         ignored_max_files=ignored_max_files,
         ignored_max_bytes=ignored_max_bytes,
@@ -1082,6 +1173,41 @@ def validate_snapshot(value: Any) -> dict[str, Any]:
         raise StateError("baseline state identifier does not match its content")
     if not isinstance(value.get("entries"), dict):
         raise StateError("baseline entries are invalid")
+    _validate_absolute_root(value.get("repo_root"), "repository root")
+    _validate_filesystem_identity(value.get("repo_identity"), "repository identity")
+    control_identities = value.get("git_control_identities")
+    if not isinstance(control_identities, list) or not 1 <= len(control_identities) <= 2:
+        raise StateError("baseline Git control identities are invalid")
+    control_paths: list[str] = []
+    for item in control_identities:
+        if not isinstance(item, dict) or set(item) != {"identity", "path"}:
+            raise StateError("baseline Git control identities are invalid")
+        path = _validate_absolute_root(item.get("path"), "Git control path")
+        _validate_filesystem_identity(item.get("identity"), "Git control identity")
+        control_paths.append(path)
+    if len(set(control_paths)) != len(control_paths) or control_paths != sorted(control_paths):
+        raise StateError("baseline Git control identities are not canonical")
+    for field in (
+        "git_admin_sha256",
+        "git_config_sha256",
+        "git_info_sha256",
+        "hooks_sha256",
+        "refs_sha256",
+    ):
+        _validate_digest(value.get(field), field)
+    _validate_digest(value.get("index_sha256"), "index identity", nullable=True)
+    head = value.get("head")
+    if head is not None and (
+        not isinstance(head, str) or _OID_RE.fullmatch(head) is None
+    ):
+        raise StateError("baseline HEAD identity is invalid")
+    symbolic = value.get("symbolic_head")
+    if symbolic is not None and (
+        not isinstance(symbolic, str)
+        or not symbolic.startswith("refs/")
+        or any(ord(character) < 32 or ord(character) == 127 for character in symbolic)
+    ):
+        raise StateError("baseline symbolic HEAD is invalid")
     if value.get("ignored_mode") not in WORKSPACE_MODES:
         raise StateError("baseline workspace mode is invalid")
     ignored_policy = value.get("ignored_policy")
@@ -1117,6 +1243,7 @@ def validate_repository_lease_path(
     gitlinks: frozenset[str] | None = None,
     tracked_spellings: dict[str, str] | None = None,
     directory_spellings: dict[str, frozenset[str]] | None = None,
+    reparse_budget: ScopeReparseBudget | None = None,
 ) -> None:
     index_records: dict[str, list[dict[str, str]]] | None = None
     if gitlinks is None or tracked_spellings is None:
@@ -1199,12 +1326,33 @@ def validate_repository_lease_path(
             except FileNotFoundError:
                 continue
     if scope_kind == "prefix":
-        _reject_reparse_descendants(root / Path(value), value)
+        _reject_reparse_descendants(
+            root / Path(value),
+            value,
+            ScopeReparseBudget() if reparse_budget is None else reparse_budget,
+        )
+    elif scope_kind == "exact" and value not in active_gitlinks:
+        try:
+            metadata = (root / Path(value)).lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise StateUnavailable("workspace scope inspection is unavailable") from error
+        if stat.S_ISDIR(metadata.st_mode):
+            raise StateError(f"invalid lease path: {value}")
 
 
-def _reject_reparse_descendants(path: Path, value: str) -> None:
-    if not path.exists():
+def _reject_reparse_descendants(
+    path: Path,
+    value: str,
+    budget: ScopeReparseBudget,
+) -> None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
         return
+    except OSError as error:
+        raise StateUnavailable("workspace scope inspection is unavailable") from error
     stack = [path]
     while stack:
         current = stack.pop()
@@ -1212,9 +1360,17 @@ def _reject_reparse_descendants(path: Path, value: str) -> None:
             children = os.scandir(current)
         except (FileNotFoundError, NotADirectoryError):
             continue
+        except OSError as error:
+            raise StateUnavailable("workspace scope inspection is unavailable") from error
         with children:
             for child in children:
-                metadata = child.stat(follow_symlinks=False)
+                budget.consume()
+                try:
+                    metadata = child.stat(follow_symlinks=False)
+                except OSError as error:
+                    raise StateUnavailable(
+                        "workspace scope inspection is unavailable"
+                    ) from error
                 attributes = getattr(metadata, "st_file_attributes", 0)
                 if child.is_symlink() or (
                     attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -1232,6 +1388,7 @@ def normalize_allow(
     gitlinks: frozenset[str] | None = None,
     tracked_spellings: dict[str, str] | None = None,
     directory_spellings: dict[str, frozenset[str]] | None = None,
+    reparse_budget: ScopeReparseBudget | None = None,
 ) -> dict[str, str]:
     try:
         scope = parse_repository_scope_text(value, "lease scope")
@@ -1246,6 +1403,7 @@ def normalize_allow(
         gitlinks=active_gitlinks,
         tracked_spellings=tracked_spellings,
         directory_spellings=directory_spellings,
+        reparse_budget=reparse_budget,
     )
     return scope
 
@@ -1478,6 +1636,7 @@ def main() -> int:
             gitlinks = repository_gitlinks(root, index_records)
             tracked_spellings = repository_path_spelling_map(index_records)
             directory_spellings: dict[str, frozenset[str]] = {}
+            reparse_budget = ScopeReparseBudget()
             scopes = [
                 normalize_allow(
                     root,
@@ -1486,6 +1645,7 @@ def main() -> int:
                     gitlinks=gitlinks,
                     tracked_spellings=tracked_spellings,
                     directory_spellings=directory_spellings,
+                    reparse_budget=reparse_budget,
                 )
                 for item in args.allow
             ]

@@ -138,6 +138,57 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(calls, [("/root/worker_n01", result)])
         self.assertEqual(outcome, {"continue": False})
 
+    def test_partial_protected_result_tail_requests_a_retry(self) -> None:
+        agent_id = "00000000-0000-4000-8000-000000000010"
+        with tempfile.TemporaryDirectory() as directory:
+            sessions = Path(directory) / "sessions"
+            sessions.mkdir()
+            rollout = sessions / f"rollout-test-{agent_id}.jsonl"
+            metadata = {
+                "type": "session_meta",
+                "payload": {
+                    "agent_path": "/root/worker_n01",
+                    "id": agent_id,
+                    "parent_thread_id": "parent-task",
+                },
+            }
+            partial_final = {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "phase": "final_answer",
+                    "message": "CCO_RESULT cco.v9\n{\"status\":\"complete\"}",
+                },
+            }
+            rollout.write_text(
+                json.dumps(metadata) + "\n" + json.dumps(partial_final),
+                encoding="utf-8",
+            )
+            processed: list[tuple[str, object]] = []
+
+            class Control:
+                @staticmethod
+                def process_result_event(owner: str, raw_result: object) -> None:
+                    processed.append((owner, raw_result))
+
+            with (
+                patch.object(cco_hook, "_sessions_root", return_value=sessions.resolve()),
+                patch.object(cco_hook, "_control", return_value=Control()),
+            ):
+                outcome = cco_hook.evaluate(
+                    {
+                        "agent_id": agent_id,
+                        "agent_transcript_path": str(rollout),
+                        "hook_event_name": "SubagentStop",
+                        "last_assistant_message": "gAAAA" + ("a" * 100),
+                        "session_id": "parent-task",
+                    }
+                )
+
+        self.assertEqual(processed, [])
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("exact same result", outcome["reason"])
+
     def test_protected_subagent_stop_uses_latest_rollout_result_for_reused_owner(self) -> None:
         agent_id = "00000000-0000-4000-8000-000000000005"
         historical = "CCO_RESULT cco.v9\n{\"status\":\"historical\"}"
@@ -376,7 +427,7 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(calls, [(agent_id, result)])
         self.assertEqual(outcome, {"continue": False})
 
-    def test_protected_managed_followup_uses_prepared_preflight(self) -> None:
+    def test_opaque_managed_reuse_or_continuation_fails_closed(self) -> None:
         calls: list[object] = []
 
         class Control:
@@ -399,8 +450,27 @@ class V9HookTests(unittest.TestCase):
             "tool_use_id": "opaque-followup-call",
         }
         with patch.object(cco_hook, "_control", return_value=Control()):
-            self.assertEqual(cco_hook.evaluate(payload), {})
-        self.assertEqual(calls, [payload])
+            outcome = cco_hook.evaluate(payload)
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("trustworthy host binding", outcome["reason"])
+        self.assertEqual(calls, [])
+
+    def test_opaque_followup_fails_closed_before_owner_lookup(self) -> None:
+        outcome = cco_hook.evaluate(
+            {
+                "hook_event_name": "PreToolUse",
+                "session_id": "opaque-unmanaged-followup",
+                "tool_input": {
+                    "message": "gAAAA" + ("a" * 100),
+                    "target": "/root/not_prepared",
+                },
+                "tool_name": "followup_task",
+                "tool_use_id": "opaque-unmanaged-followup-call",
+            }
+        )
+
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("trustworthy host binding", outcome["reason"])
 
     def test_unmappable_owner_closes_unresolved_leases(self) -> None:
         calls: list[str] = []
@@ -450,7 +520,7 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(outcome["decision"], "block")
         self.assertIn("opaque collaboration", outcome["reason"])
 
-    def test_host_opaque_spawn_uses_prepared_preflight(self) -> None:
+    def test_opaque_spawn_fails_closed_without_host_binding(self) -> None:
         calls: list[tuple[object, bool]] = []
 
         class Control:
@@ -476,8 +546,48 @@ class V9HookTests(unittest.TestCase):
         with patch.object(cco_hook, "_control", return_value=Control()):
             outcome = cco_hook.evaluate(payload)
 
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("trustworthy host binding", outcome["reason"])
+        self.assertEqual(calls, [])
+
+    def test_opaque_postflight_cannot_settle_a_prepared_dispatch(self) -> None:
+        calls: list[object] = []
+
+        class Control:
+            @staticmethod
+            def process_postflight_event(payload: object, **_kwargs: object) -> None:
+                calls.append(payload)
+
+        payload = {
+            "hook_event_name": "PostToolUse",
+            "session_id": "opaque-postflight",
+            "tool_input": {"message": "gAAAA" + ("d" * 100)},
+            "tool_name": "spawn_agent",
+            "tool_use_id": "opaque-postflight-call",
+        }
+
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            outcome = cco_hook.evaluate(payload)
+
+        self.assertEqual(outcome["decision"], "block")
+        self.assertIn("trustworthy host binding", outcome["reason"])
+        self.assertEqual(calls, [])
+
+    def test_opaque_unmanaged_message_postflight_stays_unrelated(self) -> None:
+        outcome = cco_hook.evaluate(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "opaque-unmanaged-postflight",
+                "tool_input": {
+                    "message": "gAAAA" + ("d" * 100),
+                    "target": "/root/unmanaged",
+                },
+                "tool_name": "send_message",
+                "tool_use_id": "opaque-unmanaged-postflight-call",
+            }
+        )
+
         self.assertEqual(outcome, {})
-        self.assertEqual(calls, [(payload, True)])
 
     def test_native_bypass_cannot_forward_embedded_protected_content(self) -> None:
         outcome = cco_hook.evaluate(
