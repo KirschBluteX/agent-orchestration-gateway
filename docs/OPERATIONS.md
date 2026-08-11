@@ -22,7 +22,7 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 Doctor rejects missing, duplicate, or unknown CCO Hook definitions from the authoritative host
 inventory.
 
-CCO is pre-1.0. Version `0.9.1` is the plain public, installer, and manifest identity: it has no
+CCO is pre-1.0. Version `0.9.2` is the plain public, installer, and manifest identity: it has no
 build metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
 through 5.x are compressed into pre-0.9 development history; Git history remains unchanged.
 Current records are `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. If predecessor state,
@@ -43,10 +43,13 @@ settled plan. After dispatch, repeat long `wait_agent` windows until completion 
 attention. A `timed_out` result means another long wait, not a retry, progress report, or duplicate
 execution.
 
-CCO fails closed if a collaboration Hook receives an opaque Agent message without trusted metadata
-binding it to the prepared input digest. This host incompatibility cannot be repaired by trusting
-the Hook or copying the ciphertext. Use a Codex build that exposes plaintext or an authenticated
-binding; never weaken the check locally.
+The default `trusted_host` policy supports the opaque whole-message input emitted by current Codex
+Desktop builds. Preflight requires one uniquely matching prepared visible envelope and durably
+binds the actual ciphertext digest plus `tool_use_id`; postflight must present the same pair. This
+is a host-trust compatibility mode, not proof of the hidden plaintext. To fail closed on every
+opaque Agent input, set `CCO_OPAQUE_MESSAGE_POLICY=strict` in the environment inherited by Codex
+and start a new Codex task. Already admitted calls remain settlement-compatible so a policy change
+cannot strand their leases.
 
 ```text
 python -B <PLUGIN_ROOT>/scripts/control_plane.py status

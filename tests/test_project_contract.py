@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
 ORCHESTRATE = PLUGIN / "skills" / "orchestrate"
 MANAGE = PLUGIN / "skills" / "manage-cco"
-RELEASE = "0.9.1"
+RELEASE = "0.9.2"
 RELEASE_DOCUMENTS = (
     "CHANGELOG.md",
     "README.md",
@@ -42,7 +42,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertEqual(manifest["version"], RELEASE)
-        self.assertIn('PLUGIN_VERSION = "0.9.1"', installer)
+        self.assertIn('PLUGIN_VERSION = "0.9.2"', installer)
         self.assertIn("PLUGIN_RELEASE = PLUGIN_VERSION", installer)
         self.assertNotIn("PLUGIN_BUILD_METADATA", installer)
         for document in release_documents:
@@ -50,7 +50,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertNotRegex(release_surface, r"\b0\.9\.0\+[A-Za-z0-9.-]+\b")
         self.assertNotRegex(release_surface, r"\bcodex\.\d{14}\b")
         self.assertNotRegex(release_surface, r"\b[1-9]\d*\.\d+\.\d+(?:\+[A-Za-z0-9.-]+)?\b")
-        self.assertRegex(changelog, r"(?m)^## 0\.9\.1 - 2026-08-10$")
+        self.assertRegex(changelog, r"(?m)^## 0\.9\.2 - 2026-08-11$")
         self.assertIn("pre-1.0", changelog)
         self.assertIn("2.x through 5.x", changelog)
         self.assertIn("pre-0.9 development history", changelog)

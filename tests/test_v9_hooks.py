@@ -427,7 +427,7 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(calls, [(agent_id, result)])
         self.assertEqual(outcome, {"continue": False})
 
-    def test_opaque_managed_reuse_or_continuation_fails_closed(self) -> None:
+    def test_opaque_followup_is_delegated_to_the_control_plane(self) -> None:
         calls: list[object] = []
 
         class Control:
@@ -451,26 +451,31 @@ class V9HookTests(unittest.TestCase):
         }
         with patch.object(cco_hook, "_control", return_value=Control()):
             outcome = cco_hook.evaluate(payload)
-        self.assertEqual(outcome["decision"], "block")
-        self.assertIn("trustworthy host binding", outcome["reason"])
-        self.assertEqual(calls, [])
+        self.assertEqual(outcome, {})
+        self.assertEqual(calls, [payload])
 
-    def test_opaque_followup_fails_closed_before_owner_lookup(self) -> None:
-        outcome = cco_hook.evaluate(
-            {
-                "hook_event_name": "PreToolUse",
-                "session_id": "opaque-unmanaged-followup",
-                "tool_input": {
-                    "message": "gAAAA" + ("a" * 100),
-                    "target": "/root/not_prepared",
-                },
-                "tool_name": "followup_task",
-                "tool_use_id": "opaque-unmanaged-followup-call",
-            }
-        )
+    def test_opaque_followup_control_plane_rejection_blocks(self) -> None:
+        class Control:
+            @staticmethod
+            def preflight_opaque_followup(_payload: object) -> None:
+                raise cco_hook.ControlPlaneError("no prepared opaque follow-up")
+
+        with patch.object(cco_hook, "_control", return_value=Control()):
+            outcome = cco_hook.evaluate(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "opaque-unmanaged-followup",
+                    "tool_input": {
+                        "message": "gAAAA" + ("a" * 100),
+                        "target": "/root/not_prepared",
+                    },
+                    "tool_name": "followup_task",
+                    "tool_use_id": "opaque-unmanaged-followup-call",
+                }
+            )
 
         self.assertEqual(outcome["decision"], "block")
-        self.assertIn("trustworthy host binding", outcome["reason"])
+        self.assertIn("no prepared", outcome["reason"])
 
     def test_unmappable_owner_closes_unresolved_leases(self) -> None:
         calls: list[str] = []
@@ -520,7 +525,7 @@ class V9HookTests(unittest.TestCase):
         self.assertEqual(outcome["decision"], "block")
         self.assertIn("opaque collaboration", outcome["reason"])
 
-    def test_opaque_spawn_fails_closed_without_host_binding(self) -> None:
+    def test_opaque_spawn_is_delegated_to_the_control_plane(self) -> None:
         calls: list[tuple[object, bool]] = []
 
         class Control:
@@ -546,17 +551,16 @@ class V9HookTests(unittest.TestCase):
         with patch.object(cco_hook, "_control", return_value=Control()):
             outcome = cco_hook.evaluate(payload)
 
-        self.assertEqual(outcome["decision"], "block")
-        self.assertIn("trustworthy host binding", outcome["reason"])
-        self.assertEqual(calls, [])
+        self.assertEqual(outcome, {})
+        self.assertEqual(calls, [(payload, True)])
 
-    def test_opaque_postflight_cannot_settle_a_prepared_dispatch(self) -> None:
-        calls: list[object] = []
+    def test_opaque_postflight_is_delegated_to_the_control_plane(self) -> None:
+        calls: list[tuple[object, object]] = []
 
         class Control:
             @staticmethod
-            def process_postflight_event(payload: object, **_kwargs: object) -> None:
-                calls.append(payload)
+            def process_postflight_event(payload: object, **kwargs: object) -> None:
+                calls.append((payload, kwargs))
 
         payload = {
             "hook_event_name": "PostToolUse",
@@ -569,9 +573,8 @@ class V9HookTests(unittest.TestCase):
         with patch.object(cco_hook, "_control", return_value=Control()):
             outcome = cco_hook.evaluate(payload)
 
-        self.assertEqual(outcome["decision"], "block")
-        self.assertIn("trustworthy host binding", outcome["reason"])
-        self.assertEqual(calls, [])
+        self.assertEqual(outcome, {})
+        self.assertEqual(calls, [(payload, {"opaque_message": True})])
 
     def test_opaque_unmanaged_message_postflight_stays_unrelated(self) -> None:
         outcome = cco_hook.evaluate(

@@ -163,7 +163,7 @@ class V9ControlPlaneTests(unittest.TestCase):
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         return dispatch_id, owner
 
-    def test_opaque_spawn_fails_closed_without_a_host_binding(self) -> None:
+    def test_trusted_host_opaque_spawn_binds_the_observed_ciphertext(self) -> None:
         control = self.control("opaque-native")
         control.create_plan(
             self.repo,
@@ -175,21 +175,152 @@ class V9ControlPlaneTests(unittest.TestCase):
         )["dispatches"][0]["tool_input"]
         opaque = {**native, "message": "gAAAA" + ("d" * 100)}
 
-        with self.assertRaisesRegex(ControlPlaneError, "trustworthy host binding"):
+        control.preflight_spawn(
+            {"tool_input": opaque, "tool_use_id": "opaque-call"},
+            opaque_message=True,
+        )
+
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        receipt = control._native_attempt_for_dispatch(dispatch)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(
+            receipt["tool_input_sha256"],
+            control_plane_module._digest(b"cco.native-input.v1\0", opaque),
+        )
+        self.assertNotEqual(
+            receipt["tool_input_sha256"],
+            control_plane_module._digest(b"cco.native-input.v1\0", native),
+        )
+        owner = "/root/" + str(native["task_name"])
+        substituted = {**opaque, "message": "gAAAA" + ("x" * 100)}
+        with self.assertRaisesRegex(ControlPlaneError, "input changed"):
             control.preflight_spawn(
-                {"tool_input": opaque, "tool_use_id": "opaque-call"},
+                {"tool_input": substituted, "tool_use_id": "opaque-call"},
                 opaque_message=True,
             )
-        with self.assertRaisesRegex(ControlPlaneError, "trustworthy host binding"):
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["dispatches"][dispatch_id]["receipt_id"], receipt["event_id"])
+        with self.assertRaisesRegex(ControlPlaneError, "no matching preflight"):
             control.process_postflight_event(
                 {
-                    "tool_input": opaque,
-                    "tool_response": {"task_name": "/root/substituted"},
+                    "tool_input": substituted,
+                    "tool_response": {"task_name": owner},
                     "tool_use_id": "opaque-call",
                 },
                 opaque_message=True,
             )
+        with patch.dict(os.environ, {"CCO_OPAQUE_MESSAGE_POLICY": "strict"}):
+            control.process_postflight_event(
+                {
+                    "tool_input": opaque,
+                    "tool_response": {"task_name": owner},
+                    "tool_use_id": "opaque-call",
+                },
+                opaque_message=True,
+            )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["dispatches"][dispatch_id]["state"], "running")
+        self.assertEqual(state["dispatches"][dispatch_id]["owner"], owner)
 
+    def test_trusted_host_opaque_reuse_binds_one_prepared_owner(self) -> None:
+        control, _first_id, owner = self.ready_reuse_chain("opaque-reuse")
+        action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        self.assertEqual(action["action"], "reuse_owner")
+        native = action["tool_input"]
+        opaque = {**native, "message": "gAAAA" + ("r" * 100)}
+        control.preflight_opaque_followup(
+            {"tool_input": opaque, "tool_use_id": "opaque-reuse-call"}
+        )
+        changed = {**opaque, "message": "gAAAA" + ("s" * 100)}
+        with self.assertRaisesRegex(ControlPlaneError, "input changed"):
+            control.preflight_opaque_followup(
+                {"tool_input": changed, "tool_use_id": "opaque-reuse-call"}
+            )
+        control.process_postflight_event(
+            {
+                "tool_input": opaque,
+                "tool_response": {},
+                "tool_use_id": "opaque-reuse-call",
+            },
+            opaque_message=True,
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        running = [
+            item
+            for item in state["dispatches"].values()
+            if item.get("owner") == owner and item.get("state") == "running"
+        ]
+        self.assertEqual(len(running), 1)
+
+    def test_trusted_host_opaque_continuation_advances_the_cursor(self) -> None:
+        control = self.control("opaque-continuation")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("paused", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        control.record_result(
+            owner,
+            result_text(
+                dispatch_id,
+                status="blocked",
+                outcome="pause",
+                blockers=["need one fact"],
+                failure_signature="missing_fact",
+            ),
+        )
+        prepared = control.prepare_continuation(dispatch_id, {"fact": "known"})
+        continuation = prepared["tool_input"]
+        opaque = {**continuation, "message": "gAAAA" + ("c" * 100)}
+        control.preflight_opaque_followup(
+            {"tool_input": opaque, "tool_use_id": "opaque-continue-call"}
+        )
+        changed = {**opaque, "message": "gAAAA" + ("t" * 100)}
+        with self.assertRaisesRegex(ControlPlaneError, "input changed"):
+            control.preflight_opaque_followup(
+                {"tool_input": changed, "tool_use_id": "opaque-continue-call"}
+            )
+        control.process_postflight_event(
+            {
+                "tool_input": opaque,
+                "tool_response": {},
+                "tool_use_id": "opaque-continue-call",
+            },
+            opaque_message=True,
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        self.assertEqual(dispatch["state"], "running")
+        self.assertEqual(dispatch["cursor"], 1)
+
+    def test_strict_policy_rejects_opaque_spawn_before_receipt(self) -> None:
+        control = self.control("opaque-native-strict")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("opaque", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        opaque = {**native, "message": "gAAAA" + ("s" * 100)}
+        with (
+            patch.dict(os.environ, {"CCO_OPAQUE_MESSAGE_POLICY": "strict"}),
+            self.assertRaisesRegex(ControlPlaneError, "strict policy"),
+        ):
+            control.preflight_spawn(
+                {"tool_input": opaque, "tool_use_id": "opaque-call"},
+                opaque_message=True,
+            )
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         state = json.loads(control.state_path.read_text(encoding="utf-8"))
         self.assertIsNone(state["dispatches"][dispatch_id]["receipt_id"])
@@ -3148,7 +3279,7 @@ class V9ControlPlaneTests(unittest.TestCase):
             "unprepared_scope": "b.txt",
         }
 
-        with self.assertRaisesRegex(ControlPlaneError, "trustworthy host binding"):
+        with self.assertRaisesRegex(ControlPlaneError, "does not match one"):
             control.preflight_spawn(
                 {"tool_input": opaque, "tool_use_id": "opaque-extra-field"},
                 opaque_message=True,
@@ -3158,13 +3289,17 @@ class V9ControlPlaneTests(unittest.TestCase):
         dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         self.assertIsNone(state["dispatches"][dispatch_id]["receipt_id"])
 
-    def test_opaque_reuse_and_continuation_cannot_select_a_prepared_owner(self) -> None:
+    def test_strict_policy_rejects_opaque_reuse_and_continuation(self) -> None:
         control = self.control("opaque-followup-no-binding")
 
         for kind in ("reuse", "continuation"):
             with self.subTest(kind=kind):
-                with self.assertRaisesRegex(
-                    ControlPlaneError, "trustworthy host binding"
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"CCO_OPAQUE_MESSAGE_POLICY": "strict"},
+                    ),
+                    self.assertRaisesRegex(ControlPlaneError, "strict policy"),
                 ):
                     control.preflight_opaque_followup(
                         {

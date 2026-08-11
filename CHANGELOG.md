@@ -4,6 +4,21 @@ CCO follows semantic versioning while it remains pre-1.0. A pre-1.0 minor releas
 breaking changes. Public, installer, and manifest identities use a plain release version without
 build metadata.
 
+## 0.9.2 - 2026-08-11
+
+### Changed
+
+- Current Codex Desktop opaque V2 Agent inputs are usable again under the default
+  `trusted_host` policy. Preflight uniquely matches the visible prepared envelope and durably
+  binds the exact observed ciphertext digest plus `tool_use_id`; postflight must present the same
+  pair. Duplicate preflight for one native call is idempotent only when that observed digest is
+  identical; a changed ciphertext cannot replace its live receipt.
+- `CCO_OPAQUE_MESSAGE_POLICY=strict` retains fail-closed opaque admission for environments that do
+  not accept the documented host-trust boundary. Plaintext native calls remain exact-input bound,
+  and policy changes never prevent settlement of an already reserved attempt.
+- The public, installer, and manifest identity is `0.9.2`; lifecycle and receipt protocols remain
+  unchanged, with no additional runtime, ledger, background service, or compatibility layer.
+
 ## 0.9.1 - 2026-08-10
 
 ### Changed

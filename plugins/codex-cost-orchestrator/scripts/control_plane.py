@@ -120,6 +120,7 @@ ACTIVE_STATES = frozenset({"running", "ready_to_apply", "paused"})
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 TASK_PATH_RE = re.compile(r"^/root(?:/[a-z0-9][a-z0-9_]*)+$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+HOST_OPAQUE_MESSAGE_RE = re.compile(r"gAAAA[A-Za-z0-9_-]{80,}={0,2}")
 FAILURE_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_TOMBSTONES = 256
@@ -180,6 +181,8 @@ BREAKING_UPGRADE_MESSAGE = (
     "unsupported predecessor CCO artifact; clean up the old CCO state and "
     "artifacts, then start a new task (breaking upgrade)"
 )
+OPAQUE_MESSAGE_POLICY_ENV = "CCO_OPAQUE_MESSAGE_POLICY"
+OPAQUE_MESSAGE_POLICIES = frozenset({"strict", "trusted_host"})
 
 
 class ControlPlaneError(RuntimeError):
@@ -210,6 +213,24 @@ def _text(value: object, label: str, *, limit: int = 8_192) -> str:
 
 def _digest(domain: bytes, value: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(domain + canonical_bytes(dict(value))).hexdigest()
+
+
+def host_opaque_message(value: object) -> bool:
+    """Recognize the whole-message ciphertext emitted by the current host."""
+
+    return (
+        isinstance(value, str)
+        and HOST_OPAQUE_MESSAGE_RE.fullmatch(value.strip()) is not None
+    )
+
+
+def _opaque_message_policy() -> str:
+    policy = os.environ.get(OPAQUE_MESSAGE_POLICY_ENV, "trusted_host").strip()
+    if policy not in OPAQUE_MESSAGE_POLICIES:
+        raise ControlPlaneError(
+            f"{OPAQUE_MESSAGE_POLICY_ENV} must be strict or trusted_host"
+        )
+    return policy
 
 
 def _state_root() -> Path:
@@ -1601,10 +1622,12 @@ class ControlPlane:
         state: Mapping[str, Any],
         dispatch: Mapping[str, Any],
         tool_use_id: str,
+        tool_input: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         native = dispatch.get("native")
         if not isinstance(native, Mapping):
             raise ControlPlaneError("native attempt has no prepared input")
+        observed_input = native if tool_input is None else tool_input
         identity = {
             "cursor": dispatch.get("pending_cursor")
             if dispatch.get("tool_kind") == "continuation"
@@ -1616,7 +1639,13 @@ class ControlPlane:
             "plan_id": state.get("plan_id"),
             "protocol": PENDING_EVENT_PROTOCOL,
             "session_id": self.session_id,
-            "tool_input_sha256": _digest(b"cco.native-input.v1\0", dict(native)),
+            # This is the exact input observed by PreToolUse.  In plaintext
+            # mode it equals ``native``; in trusted-host opaque mode its
+            # message is ciphertext while the prepared input remains in the
+            # lifecycle state for visible-envelope validation.
+            "tool_input_sha256": _digest(
+                b"cco.native-input.v1\0", dict(observed_input)
+            ),
             "tool_kind": dispatch.get("tool_kind"),
             "tool_use_id": tool_use_id,
             "workspace_root": state.get("workspace_root"),
@@ -1636,10 +1665,31 @@ class ControlPlane:
         state: dict[str, Any],
         dispatch: dict[str, Any],
         tool_use_id: str,
+        tool_input: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Reserve the native and result slot before the host makes a call."""
 
-        receipt = self._native_attempt_receipt(state, dispatch, tool_use_id)
+        receipt = self._native_attempt_receipt(
+            state,
+            dispatch,
+            tool_use_id,
+            tool_input,
+        )
+        # A host can retry PreToolUse for the same native call.  Treat only
+        # an identical observed input as idempotent; never replace a live
+        # receipt with a different ciphertext for the same tool_use_id.
+        linked_receipt_id = dispatch.get("receipt_id")
+        if isinstance(linked_receipt_id, str):
+            linked = self._native_attempt_for_dispatch(dispatch)
+            if linked is None:
+                raise ControlPlaneUnavailable(
+                    "native attempt receipt is linked but unavailable"
+                )
+            if linked != receipt:
+                raise ControlPlaneError(
+                    "native admission input changed for the existing tool call"
+                )
+            return linked
         path = _pending_event_path(self.root, self.session_id, receipt["event_id"])
         with acquire(
             self.root,
@@ -2159,8 +2209,19 @@ class ControlPlane:
             raise ControlPlaneError("native tool result has no input identity")
         message = tool_input.get("message")
         if opaque_message:
-            raise ControlPlaneError("opaque postflight has no trustworthy host binding")
-        if isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
+            if not host_opaque_message(message):
+                raise ControlPlaneError("opaque postflight message is invalid")
+            input_sha256 = _digest(b"cco.native-input.v1\0", dict(tool_input))
+            receipt = self._find_native_attempt_receipt(
+                tool_use_id=tool_use_id,
+                tool_input_sha256=input_sha256,
+            )
+            if receipt is None:
+                raise ControlPlaneError(
+                    "opaque native result has no matching preflight receipt"
+                )
+            dispatch_id = str(receipt["dispatch_id"])
+        elif isinstance(message, str) and message.startswith(TASK_HEADER + "\n"):
             dispatch_id = parse_task_message(message)["dispatch_id"]
             input_sha256 = _digest(b"cco.native-input.v1\0", dict(tool_input))
         elif isinstance(message, str) and message.startswith(CONTINUE_HEADER + "\n"):
@@ -4861,6 +4922,7 @@ class ControlPlane:
         ],
         *,
         recapture_stale_native: bool,
+        observed_tool_input: Mapping[str, Any] | None = None,
     ) -> None:
         """Run the shared two-phase admission around lock-free workspace verification."""
 
@@ -4908,6 +4970,7 @@ class ControlPlane:
                 state,
                 dispatch,
                 tool_use_id,
+                observed_tool_input,
             )
             try:
                 self._begin_native_claim(state, dispatch, tool_use_id)
@@ -5007,21 +5070,120 @@ class ControlPlane:
             self._rollback_native_claim(dispatch_id, tool_use_id)
             raise
 
+    def _resolve_opaque_native_input(
+        self,
+        tool_input: Mapping[str, Any],
+        *,
+        allowed_kinds: set[str],
+    ) -> tuple[dict[str, Any], str, str]:
+        """Resolve one ciphertext envelope without treating its shape as identity.
+
+        The current host hides the prepared message but leaves the remaining
+        native input visible.  Trusted-host mode therefore requires one and
+        only one live reservation whose complete visible envelope matches.
+        The exact ciphertext is separately bound to the preflight receipt.
+        """
+
+        if not allowed_kinds or not allowed_kinds <= {
+            "continuation",
+            "reuse",
+            "spawn",
+        }:
+            raise ControlPlaneError("opaque native kind selection is invalid")
+        if not host_opaque_message(tool_input.get("message")):
+            raise ControlPlaneError("opaque native message is invalid")
+        with self._coordinated_state() as state:
+            matches = self._opaque_dispatch_candidates(
+                state,
+                tool_input,
+                allowed_kinds,
+            )
+            if len(matches) != 1:
+                raise ControlPlaneError(
+                    "opaque native input does not match one prepared dispatch"
+                )
+            dispatch_id, expected, kind = matches[0]
+            return dispatch_id, expected, kind
+
+    @staticmethod
+    def _opaque_dispatch_candidates(
+        state: Mapping[str, Any],
+        tool_input: Mapping[str, Any],
+        allowed_kinds: set[str],
+    ) -> list[tuple[str, dict[str, Any], str]]:
+        matches: list[tuple[str, dict[str, Any], str]] = []
+        for dispatch in state.get("dispatches", {}).values():
+            kind = dispatch.get("tool_kind")
+            lifecycle = dispatch.get("state")
+            if kind not in allowed_kinds or (
+                lifecycle != "starting"
+                and not (kind == "continuation" and lifecycle == "paused")
+            ):
+                continue
+            expected = dispatch.get("native")
+            dispatch_id = dispatch.get("dispatch_id")
+            if (
+                not isinstance(dispatch_id, str)
+                or not isinstance(expected, Mapping)
+                or set(tool_input) != set(expected)
+            ):
+                continue
+            if any(
+                key != "message" and tool_input.get(key) != expected.get(key)
+                for key in expected
+            ):
+                continue
+            matches.append((dispatch_id, dict(expected), str(kind)))
+        return matches
+
+    def _assert_opaque_dispatch_claim(
+        self,
+        state: Mapping[str, Any],
+        observed_tool_input: Mapping[str, Any] | None,
+        *,
+        dispatch_id: str,
+        allowed_kinds: set[str],
+    ) -> None:
+        if observed_tool_input is None:
+            return
+        matches = self._opaque_dispatch_candidates(
+            state,
+            observed_tool_input,
+            allowed_kinds,
+        )
+        if len(matches) != 1 or matches[0][0] != dispatch_id:
+            raise ControlPlaneError(
+                "opaque native dispatch changed before admission commit"
+            )
+
     def preflight_spawn(
         self,
         payload: Mapping[str, Any],
         *,
         opaque_message: bool = False,
+        _observed_tool_input: Mapping[str, Any] | None = None,
+        _opaque_dispatch_id: str | None = None,
     ) -> None:
         tool_input = payload.get("tool_input")
         if not isinstance(tool_input, Mapping):
             raise ControlPlaneError("spawn input is missing")
         if opaque_message:
-            # The Hook surface currently provides no authenticated host
-            # metadata that binds an encrypted replacement to the prepared
-            # dispatch and exact plaintext message.  Matching its shape (or
-            # its neighboring fields) is not authorization.
-            raise ControlPlaneError("opaque spawn has no trustworthy host binding")
+            if _opaque_message_policy() == "strict":
+                raise ControlPlaneError("strict policy rejects opaque spawn input")
+            dispatch_id, expected, kind = self._resolve_opaque_native_input(
+                tool_input,
+                allowed_kinds={"spawn"},
+            )
+            if kind != "spawn":
+                raise ControlPlaneError("opaque input is not a prepared spawn")
+            substituted = dict(payload)
+            substituted["tool_input"] = expected
+            self.preflight_spawn(
+                substituted,
+                _observed_tool_input=tool_input,
+                _opaque_dispatch_id=dispatch_id,
+            )
+            return
         task = parse_task_message(tool_input.get("message"))
         dispatch_id = task["dispatch_id"]
         tool_use_id = payload.get("tool_use_id")
@@ -5030,6 +5192,14 @@ class ControlPlane:
 
         def claim(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
             dispatch = self._find_dispatch(state, dispatch_id)
+            if _opaque_dispatch_id is not None and dispatch_id != _opaque_dispatch_id:
+                raise ControlPlaneError("opaque spawn dispatch identity changed")
+            self._assert_opaque_dispatch_claim(
+                state,
+                _observed_tool_input,
+                dispatch_id=dispatch_id,
+                allowed_kinds={"spawn"},
+            )
             if dispatch["state"] != "starting" or dispatch["tool_kind"] != "spawn":
                 raise ControlPlaneError("dispatch is not ready to spawn")
             expected = dispatch["native"]
@@ -5072,9 +5242,20 @@ class ControlPlane:
             tool_use_id,
             claim,
             recapture_stale_native=True,
+            observed_tool_input=(
+                tool_input
+                if _observed_tool_input is None
+                else _observed_tool_input
+            ),
         )
 
-    def preflight_reuse(self, payload: Mapping[str, Any]) -> None:
+    def preflight_reuse(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        _observed_tool_input: Mapping[str, Any] | None = None,
+        _opaque_dispatch_id: str | None = None,
+    ) -> None:
         tool_input = payload.get("tool_input")
         if not isinstance(tool_input, Mapping):
             raise ControlPlaneError("reuse input is missing")
@@ -5086,6 +5267,14 @@ class ControlPlane:
 
         def claim(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
             dispatch = self._find_dispatch(state, dispatch_id)
+            if _opaque_dispatch_id is not None and dispatch_id != _opaque_dispatch_id:
+                raise ControlPlaneError("opaque reuse dispatch identity changed")
+            self._assert_opaque_dispatch_claim(
+                state,
+                _observed_tool_input,
+                dispatch_id=dispatch_id,
+                allowed_kinds={"reuse"},
+            )
             if dispatch["state"] != "starting" or dispatch["tool_kind"] != "reuse":
                 raise ControlPlaneError("dispatch is not ready to reuse an owner")
             if set(tool_input) != set(dispatch["native"]):
@@ -5151,15 +5340,47 @@ class ControlPlane:
             tool_use_id,
             claim,
             recapture_stale_native=True,
+            observed_tool_input=(
+                tool_input
+                if _observed_tool_input is None
+                else _observed_tool_input
+            ),
         )
 
     def preflight_opaque_followup(self, payload: Mapping[str, Any]) -> None:
-        """Fail closed until the host exposes a signed follow-up binding."""
+        """Bind one host-opaque follow-up to its unique prepared envelope."""
 
-        del payload
-        raise ControlPlaneError("opaque follow-up has no trustworthy host binding")
+        if _opaque_message_policy() == "strict":
+            raise ControlPlaneError("strict policy rejects opaque follow-up input")
+        tool_input = payload.get("tool_input")
+        if not isinstance(tool_input, Mapping):
+            raise ControlPlaneError("opaque follow-up input is missing")
+        dispatch_id, expected, kind = self._resolve_opaque_native_input(
+            tool_input,
+            allowed_kinds={"continuation", "reuse"},
+        )
+        substituted = dict(payload)
+        substituted["tool_input"] = expected
+        if kind == "reuse":
+            self.preflight_reuse(
+                substituted,
+                _observed_tool_input=tool_input,
+                _opaque_dispatch_id=dispatch_id,
+            )
+        else:
+            self.preflight_continuation(
+                substituted,
+                _observed_tool_input=tool_input,
+                _opaque_dispatch_id=dispatch_id,
+            )
 
-    def preflight_continuation(self, payload: Mapping[str, Any]) -> None:
+    def preflight_continuation(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        _observed_tool_input: Mapping[str, Any] | None = None,
+        _opaque_dispatch_id: str | None = None,
+    ) -> None:
         tool_input = payload.get("tool_input")
         if not isinstance(tool_input, Mapping):
             raise ControlPlaneError("continuation input is missing")
@@ -5170,6 +5391,14 @@ class ControlPlane:
 
         def claim(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, str]]]:
             dispatch = self._find_dispatch(state, body["dispatch_id"])
+            if _opaque_dispatch_id is not None and body["dispatch_id"] != _opaque_dispatch_id:
+                raise ControlPlaneError("opaque continuation dispatch identity changed")
+            self._assert_opaque_dispatch_claim(
+                state,
+                _observed_tool_input,
+                dispatch_id=body["dispatch_id"],
+                allowed_kinds={"continuation"},
+            )
             if _is_cooperative_dispatch(dispatch):
                 raise ControlPlaneError(
                     "cooperative writer isolation does not permit continuation"
@@ -5220,6 +5449,11 @@ class ControlPlane:
             tool_use_id,
             claim,
             recapture_stale_native=False,
+            observed_tool_input=(
+                tool_input
+                if _observed_tool_input is None
+                else _observed_tool_input
+            ),
         )
 
     def _append_tombstone(self, state: dict[str, Any], dispatch: Mapping[str, Any], reason: str) -> None:
@@ -5479,12 +5713,7 @@ class ControlPlane:
                 return True
             if dispatch["state"] != "starting":
                 return False
-            expected = dispatch.get("native")
-            if (
-                not isinstance(expected, Mapping)
-                or _digest(b"cco.native-input.v1\0", dict(expected))
-                != event.get("tool_input_sha256")
-            ):
+            if receipt.get("tool_input_sha256") != event.get("tool_input_sha256"):
                 raise ControlPlaneError("native tool result input is stale")
             if dispatch.get("tool_use_id") != tool_use_id:
                 raise ControlPlaneError("native tool result call identity is stale")

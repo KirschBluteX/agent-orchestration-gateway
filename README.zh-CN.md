@@ -2,11 +2,11 @@
 
 [English](README.md)
 
-> **预 1.0（pre-1.0）发布政策：**公开、安装程序和清单的发布标识均为无构建元数据的 `0.9.1`。在 1.0 之前，次版本可能包含破坏性变更。历史的 2.x 至 5.x 标签已压缩为 0.9 之前的开发历史；Git 历史保持不变。
+> **预 1.0（pre-1.0）发布政策：**公开、安装程序和清单的发布标识均为无构建元数据的 `0.9.2`。在 1.0 之前，次版本可能包含破坏性变更。历史的 2.x 至 5.x 标签已压缩为 0.9 之前的开发历史；Git 历史保持不变。
 
 Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的本地控制面。Primary 保留意图、
 集成和最终验收；CCO 负责已闭合、已定范围工作的派发与验收证据。当前预 1.0 版本为
-`0.9.1`。
+`0.9.2`。
 
 ## 派发契约
 
@@ -22,9 +22,12 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --ca
 Terra/max 只读规划任务处理；其结果仅是无状态的 `cco.planner-proposal.v1` DAG 输入。
 CCO 不会创建规划路由，也不会运行第二个规划生命周期。
 
-原生 Hook 边界必须提供该工具输入的精确明文，或提供能够认证 prepared-input digest 的
-可信元数据。若宿主把 Agent 消息替换为无法绑定的 opaque 密文，CCO 会在 spawn、复用或
-continuation 之前拒绝操作；不要绕过该检查。宿主提供可绑定的 Hook 契约后即可恢复派发。
+当前 Codex Desktop 可能在 Hook 边界把准备好的 Agent 消息替换为 opaque 密文。默认
+`trusted_host` 策略只在全部可见字段唯一匹配一个已准备 dispatch 时准入，并把实际密文
+摘要与 `tool_use_id` 写入现有持久收据；PostToolUse 必须再次匹配同一对值。这样无需第二
+运行时或第二账本即可恢复原生 V2 spawn、复用与 continuation。该模式信任宿主，但不能
+证明隐藏明文等于准备消息。若要在宿主提供认证明文摘要前拒绝所有 opaque Agent 输入，
+请在启动 Codex 前设置 `CCO_OPAQUE_MESSAGE_POLICY=strict`。
 
 只有显式权限、需要澄清、显式 direct 请求，或一个声明为少于 30 秒的工具时，工作才
 留在 Primary。派发后持续使用长 `wait_agent` 窗口，直到子任务完成或确实需要处理；
@@ -53,7 +56,7 @@ guarded plan 在所有非 reviewer 源节点之后有一个独立最终 reviewer
 ## 状态与升级
 
 当前协议为 `cco.wave.v3`、`cco.lifecycle.v2` 与 `cco.receipt.v2`。早期活动状态、wave、
-lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 0.9.1 前必须清理，再开始
+lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 0.9.2 前必须清理，再开始
 新任务。不存在迁移命令，也不存在活动状态兼容层。
 
 只读任务只扫描声明的范围。对于同一规范工作区，CCO 只允许一个普通 writer，并会对

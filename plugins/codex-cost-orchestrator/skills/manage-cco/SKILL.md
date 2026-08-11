@@ -15,7 +15,7 @@ Except for offline host-edge repair, lifecycle commands use the current `CODEX_T
 substitute another task ID. Current commands are `status`, `continue`, `native-failure`, `abandon`,
 `retry`, `restart`, and `cleanup`. Invoke returned native actions only with their exact input.
 
-CCO is pre-1.0. Its current public, installer, and manifest identity is `0.9.1` with no build
+CCO is pre-1.0. Its current public, installer, and manifest identity is `0.9.2` with no build
 metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
 through 5.x are pre-0.9 development history; Git history remains unchanged. CCO rejects
 predecessor active state, wave, lifecycle, and receipt artifacts. Clean them up before starting a

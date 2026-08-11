@@ -29,9 +29,16 @@ evidence; protect the local state directory accordingly.
 CCO ships five exact Hook definitions. It has no global all-tool matcher. Hooks bind native calls
 and results to an exact dispatch, scope, baseline, owner, and receipt. A host Hook crash or timeout
 can remain fail-open at the host boundary; retain Hook trust and inspect failures.
-Collaboration messages must be visible as exact plaintext or carry trusted metadata authenticating
-the prepared-input digest. A Fernet-shaped or otherwise opaque string is not proof of that binding;
-CCO rejects unbound opaque spawn, reuse, continuation, and postflight events.
+
+The default `trusted_host` policy supports current hosts that expose a whole-message opaque
+ciphertext instead of plaintext. CCO requires an exact, unique match of every visible field to a
+prepared dispatch, reserves the actual ciphertext digest with the native `tool_use_id`, and accepts
+postflight only for that same pair. This prevents cross-attempt replay and a different postflight
+input after admission; it cannot detect a different opaque message first presented at preflight,
+because the ciphertext shape is not authentication of its hidden plaintext. Primary, the local
+user, and the host are already inside this project's trust boundary. Set
+`CCO_OPAQUE_MESSAGE_POLICY=strict` before starting Codex when that host trust is unacceptable;
+strict mode rejects opaque spawn, reuse, and continuation at preflight.
 Review and trust those five definitions before opening a new task. Doctor reads the host inventory
 and rejects missing, duplicate, or unknown CCO definitions; it never repairs or trusts a Hook on
 the user's behalf.

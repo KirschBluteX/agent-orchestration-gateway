@@ -1,11 +1,11 @@
 # Roadmap
 
-## 0.9.1 release readiness
+## 0.9.2 release readiness
 
-- CCO remains pre-1.0: its plain `0.9.1` identity has no build metadata, and a minor release may
+- CCO remains pre-1.0: its plain `0.9.2` identity has no build metadata, and a minor release may
   make breaking changes. The historical 2.x through 5.x labels are pre-0.9 development history;
   Git history remains unchanged.
-- Validate clean 0.9.1 installation, Hook trust, and the breaking-state cleanup path on current
+- Validate clean 0.9.2 installation, Hook trust, and the breaking-state cleanup path on current
   Windows and Linux Codex builds.
 - Exercise exact/prefix reader scans, serial writers, experimental cooperative copies/worktrees,
   final review, restart fencing, commit-bound offline host-edge repair, and clock-safe journal
