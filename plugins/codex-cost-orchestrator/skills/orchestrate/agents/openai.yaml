@@ -1,7 +1,7 @@
 interface:
   display_name: "Codex Cost Orchestrator"
   short_description: "Route closed native Agent work with static local policy"
-  default_prompt: "Use $codex-cost-orchestrator:orchestrate to route closed native Agent work once, wait for authoritative events, and verify the exact resulting state."
+  default_prompt: "Use $codex-cost-orchestrator:orchestrate to compile one closed delegation, invoke only its returned Agent actions, wait on their events, and perform final acceptance without duplicating delegated work."
 
 policy:
   allow_implicit_invocation: true

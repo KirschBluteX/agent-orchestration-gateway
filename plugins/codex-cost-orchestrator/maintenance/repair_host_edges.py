@@ -10,7 +10,7 @@ child's own trusted rollout proves that its host lifecycle reached
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import hashlib
 from itertools import chain
@@ -23,7 +23,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -36,6 +36,7 @@ from rollout_io import (  # noqa: E402
     is_rollout_path,
     iter_records,
 )
+from state_lock import StateLockBusy, acquire as acquire_state_lock  # noqa: E402
 
 
 PROTOCOL = "cco.host-edge-repair.v2"
@@ -52,6 +53,7 @@ ROLLBACK_PROTOCOL = "cco.host-edge-rollback.v2"
 ROLLBACK_RETENTION = 3
 JOURNAL_PREFIX = "cco-host-edge-"
 JOURNAL_SUFFIX = ".rollback.json"
+JOURNAL_LOCK_IDENTITY = "host-edge-rollback-journals"
 
 # Codex has used more than one spelling while reporting a native turn's start
 # and interruption.  Starts after completion and any interruption make the
@@ -82,6 +84,16 @@ INTERRUPTION_EVENTS = frozenset(
 
 class HostEdgeRepairError(RuntimeError):
     """Raised when host state cannot be audited or repaired safely."""
+
+
+def _note_secondary_failure(
+    primary: BaseException, *, operation: str, secondary: BaseException
+) -> None:
+    """Retain a cleanup failure without replacing the operation that failed first."""
+
+    add_note = getattr(primary, "add_note", None)
+    if callable(add_note):
+        add_note(f"{operation} also failed: {secondary}")
 
 
 def _is_reparse(path: Path) -> bool:
@@ -493,6 +505,13 @@ def audit_edges(
 def _ensure_owner_only(path: Path, *, mode: int, label: str) -> None:
     try:
         os.chmod(path, mode)
+    except OSError as error:
+        raise HostEdgeRepairError(f"{label} permissions could not be secured") from error
+    _verify_owner_only(path, label=label)
+
+
+def _verify_owner_only(path: Path, *, label: str) -> None:
+    try:
         current_mode = stat.S_IMODE(path.stat().st_mode)
     except OSError as error:
         raise HostEdgeRepairError(f"{label} permissions could not be secured") from error
@@ -503,28 +522,34 @@ def _ensure_owner_only(path: Path, *, mode: int, label: str) -> None:
 
 
 def _sync_directory(path: Path, *, label: str) -> None:
-    """Persist a POSIX namespace change before treating a journal as durable."""
+    """Persist a journal namespace change on POSIX hosts."""
 
-    # Python cannot open a directory for fsync on Windows.  Journal publication
-    # uses MoveFileExW write-through there instead.
     if os.name == "nt":
+        # Windows lacks a directory fsync equivalent.  Each Windows caller
+        # reaches this boundary through MoveFileExW(MOVEFILE_WRITE_THROUGH)
+        # instead; see _replace_journal and _remove_journal_durably.
         return
+
     descriptor: int | None = None
+    sync_error: OSError | None = None
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         os.fsync(descriptor)
     except OSError as error:
-        raise HostEdgeRepairError(f"{label} cannot be synchronized") from error
+        sync_error = error
     finally:
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except OSError as error:
-                raise HostEdgeRepairError(f"{label} cannot be closed") from error
+                if sync_error is None:
+                    sync_error = error
+    if sync_error is not None:
+        raise HostEdgeRepairError(f"{label} cannot be synchronized") from sync_error
 
 
 def _replace_journal(source: Path, target: Path) -> None:
-    """Publish one same-directory journal with host-appropriate durability."""
+    """Durably rename one same-directory journal or journal directory."""
 
     if os.name != "nt":
         os.replace(source, target)
@@ -542,12 +567,103 @@ def _replace_journal(source: Path, target: Path) -> None:
         raise OSError(code, "MoveFileExW rollback journal replacement failed", str(target))
 
 
+def _remove_journal_durably(journal: Path) -> None:
+    """Make an uncommitted journal unreachable across a host crash.
+
+    POSIX persists an unlink through its containing directory.  Windows has no
+    portable directory fsync, so a write-through rename first makes the record
+    non-journal data; a later crash can leave only a harmless private tombstone.
+    """
+
+    if os.name != "nt":
+        journal.unlink(missing_ok=True)
+        _sync_directory(
+            journal.parent,
+            label="host-edge rollback journal directory",
+        )
+        return
+    if not journal.exists():
+        return
+    tombstone = journal.parent / (
+        f".{journal.name}.{secrets.token_hex(8)}.discarded"
+    )
+    _replace_journal(journal, tombstone)
+    try:
+        tombstone.unlink(missing_ok=True)
+    except OSError:
+        # The durable rename has already made recovery ignore this aborted
+        # journal.  Surface the cleanup error to the caller, which preserves
+        # any primary repair failure and records this secondary failure.
+        raise
+
+
+def _make_journal_directory(
+    path: Path,
+    *,
+    label: str,
+    owner_only: bool = True,
+) -> bool:
+    """Create one directory and publish its first use crash-durably."""
+
+    if any(_is_reparse(candidate) for candidate in (path, *path.parents)):
+        raise HostEdgeRepairError(f"{label} cannot use a reparse ancestor")
+    if path.exists():
+        if not path.is_dir():
+            raise HostEdgeRepairError(f"{label} failed")
+        if owner_only:
+            _ensure_owner_only(path, mode=0o700, label=label)
+        # A prior interrupted POSIX setup may have created this directory
+        # before its caller could synchronize it; complete that first-use
+        # publication before placing a journal inside it.
+        _sync_directory(path, label=label)
+        _sync_directory(path.parent, label=f"{label} parent directory")
+        return False
+
+    temporary: Path | None = None
+    published = False
+    try:
+        temporary = Path(
+            tempfile.mkdtemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+        )
+        if owner_only:
+            _ensure_owner_only(temporary, mode=0o700, label=label)
+        _sync_directory(temporary, label=label)
+        try:
+            _replace_journal(temporary, path)
+            published = True
+        except FileExistsError:
+            # A concurrent offline invocation may have published this exact
+            # first-use directory after our initial existence check.  Its
+            # durable directory is safe to reuse after the same checks.
+            if not path.is_dir():
+                raise
+            if owner_only:
+                _ensure_owner_only(path, mode=0o700, label=label)
+        _sync_directory(path, label=label)
+        _sync_directory(path.parent, label=f"{label} parent directory")
+        return published
+    except OSError as error:
+        raise HostEdgeRepairError(f"{label} failed") from error
+    finally:
+        if temporary is not None and not published:
+            try:
+                temporary.rmdir()
+            except OSError:
+                pass
+
+
 def _journal_root(codex_home: Path) -> Path:
     root = codex_home / "backups" / "cco-host-edge-repair"
-    try:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError as error:
-        raise HostEdgeRepairError("host-edge rollback journal directory failed") from error
+    _make_journal_directory(
+        root.parent,
+        label="host-edge rollback journal parent directory",
+        owner_only=False,
+    )
+    _make_journal_directory(root, label="host-edge rollback journal directory")
     if any(_is_reparse(candidate) for candidate in (root, *root.parents)):
         raise HostEdgeRepairError("host-edge rollback journal directory cannot use a reparse ancestor")
     _ensure_owner_only(root, mode=0o700, label="host-edge rollback journal directory")
@@ -555,6 +671,19 @@ def _journal_root(codex_home: Path) -> Path:
         return root.resolve(strict=True)
     except OSError as error:
         raise HostEdgeRepairError("host-edge rollback journal directory failed") from error
+
+
+@contextmanager
+def _journal_directory_lock(root: Path) -> Iterator[None]:
+    """Serialize journal publication with post-commit retention."""
+
+    try:
+        with acquire_state_lock(root, JOURNAL_LOCK_IDENTITY):
+            yield
+    except StateLockBusy as error:
+        raise HostEdgeRepairError(
+            "host-edge rollback journal directory is busy"
+        ) from error
 
 
 def _journal_edge(edge: Mapping[str, Any]) -> dict[str, str]:
@@ -578,10 +707,13 @@ def _write_rollback_journal(
     edges: list[Mapping[str, Any]],
     parent_thread_id: str | None = None,
     all_native: bool = False,
+    journal_root: Path | None = None,
 ) -> Path:
-    """Atomically persist the minimum undo record before any DB update."""
+    """Persist one journal while the caller holds its directory lock."""
 
-    root = _journal_root(codex_home)
+    # A caller holding the directory lock passes its already-resolved root so
+    # publication and retention cannot silently resolve different namespaces.
+    root = journal_root if journal_root is not None else _journal_root(codex_home)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     operation_id = "sha256:" + hashlib.sha256(
         f"{timestamp}:{secrets.token_hex(16)}".encode("utf-8")
@@ -635,20 +767,45 @@ def _write_rollback_journal(
             os.fsync(stream.fileno())
         _replace_journal(temporary, journal)
         published = True
-        _ensure_owner_only(journal, mode=0o600, label="host-edge rollback journal")
+        # Permissions were fixed while this was the private temporary file.
+        # Verify only after its write-through publication so no metadata change
+        # can outrun the journal namespace durability boundary.
+        _verify_owner_only(journal, label="host-edge rollback journal")
         _sync_directory(root, label="host-edge rollback journal directory")
     except (HostEdgeRepairError, OSError) as error:
         if descriptor >= 0:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as cleanup_error:
+                _note_secondary_failure(
+                    error,
+                    operation="host-edge rollback journal descriptor cleanup",
+                    secondary=cleanup_error,
+                )
         try:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-            if published:
-                journal.unlink(missing_ok=True)
         except OSError as cleanup_error:
-            raise HostEdgeRepairError(
-                "host-edge rollback journal could not be cleaned up; no repair was committed"
-            ) from cleanup_error
+            _note_secondary_failure(
+                error,
+                operation="host-edge rollback journal temporary cleanup",
+                secondary=cleanup_error,
+            )
+        if published:
+            try:
+                _remove_journal_durably(journal)
+            except OSError as cleanup_error:
+                _note_secondary_failure(
+                    error,
+                    operation="host-edge rollback journal cleanup",
+                    secondary=cleanup_error,
+                )
+            except HostEdgeRepairError as cleanup_error:
+                _note_secondary_failure(
+                    error,
+                    operation="host-edge rollback journal deletion synchronization",
+                    secondary=cleanup_error,
+                )
         if isinstance(error, HostEdgeRepairError):
             raise
         raise HostEdgeRepairError("host-edge rollback journal failed") from error
@@ -676,7 +833,6 @@ def _prune_rollback_journals(journal: Path) -> None:
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     current_present = any(item[4] == current for item in candidates)
     retained_others = 0
-    removed = False
     for _mtime, _name, stale, identity, canonical in candidates:
         if canonical == current:
             continue
@@ -693,15 +849,20 @@ def _prune_rollback_journals(journal: Path) -> None:
             or (observed.st_dev, observed.st_ino) != identity
         ):
             continue
-        stale.unlink()
-        removed = True
-    if removed:
-        _sync_directory(journal.parent, label="host-edge rollback journal directory")
+        _remove_journal_durably(stale)
 
 
-def _post_commit_warnings(journal: Path) -> list[str]:
+def _post_commit_warnings(
+    journal: Path,
+    *,
+    directory_locked: bool = False,
+) -> list[str]:
     try:
-        _prune_rollback_journals(journal)
+        if directory_locked:
+            _prune_rollback_journals(journal)
+        else:
+            with _journal_directory_lock(journal.parent):
+                _prune_rollback_journals(journal)
     except (HostEdgeRepairError, OSError):
         return ["repair committed, but old rollback journals could not be pruned"]
     return []
@@ -718,11 +879,121 @@ def _discard_uncommitted_journal(journal: Path | None) -> None:
     if journal is None:
         return
     try:
-        journal.unlink(missing_ok=True)
-    except OSError as error:
+        _remove_journal_durably(journal)
+    except (HostEdgeRepairError, OSError) as error:
         raise HostEdgeRepairError(
             "repair rolled back, but its uncommitted rollback journal could not be removed"
         ) from error
+
+
+def _commit_transaction(connection: sqlite3.Connection) -> None:
+    """One testable commit boundary for proof finalization and compensation."""
+
+    connection.commit()
+
+
+def _rollback_transaction(connection: sqlite3.Connection) -> None:
+    """One testable rollback boundary that never replaces a primary failure."""
+
+    connection.rollback()
+
+
+def _rollback_uncommitted_repair(
+    connection: sqlite3.Connection,
+    journal: Path | None,
+    *,
+    primary: BaseException,
+) -> None:
+    """Attempt both rollback steps while preserving the failure that started them."""
+
+    try:
+        _rollback_transaction(connection)
+    except BaseException as rollback_error:
+        _note_secondary_failure(
+            primary,
+            operation="host-edge database rollback",
+            secondary=rollback_error,
+        )
+    try:
+        _discard_uncommitted_journal(journal)
+    except BaseException as cleanup_error:
+        _note_secondary_failure(
+            primary,
+            operation="host-edge rollback journal cleanup",
+            secondary=cleanup_error,
+        )
+
+
+def _rollback_committed_repair(
+    connection: sqlite3.Connection,
+    *,
+    parent_thread_id: str,
+    candidates: Mapping[str, Mapping[str, Any]],
+    primary: BaseException,
+) -> bool:
+    """Compensate a commit whose immediately-following proof check changed.
+
+    The journal remains until this transaction commits.  Returning ``False``
+    leaves that durable undo record in place and adds all recovery failures to
+    the original finalization failure.
+    """
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        restored = 0
+        for child in sorted(candidates):
+            edge = candidates[child]
+            raw_rollout_path = edge.get("_rollout_db_path")
+            if not isinstance(raw_rollout_path, str):
+                raise HostEdgeRepairError(
+                    "committed repair cannot restore an unbound rollout path"
+                )
+            changed = connection.execute(
+                """
+                UPDATE thread_spawn_edges
+                SET status = 'open'
+                WHERE parent_thread_id = ?
+                  AND child_thread_id = ?
+                  AND status = 'closed'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM threads
+                      WHERE threads.id = thread_spawn_edges.child_thread_id
+                        AND threads.agent_path = ?
+                        AND threads.agent_role = ?
+                        AND threads.rollout_path = ?
+                  )
+                """,
+                (
+                    parent_thread_id,
+                    child,
+                    edge["agent_path"],
+                    edge["agent_role"],
+                    raw_rollout_path,
+                ),
+            ).rowcount
+            restored += max(0, changed)
+        if restored != len(candidates):
+            raise HostEdgeRepairError(
+                "committed repair could not be rolled back safely"
+            )
+        _commit_transaction(connection)
+    except BaseException as rollback_error:
+        _note_secondary_failure(
+            primary,
+            operation="host-edge committed repair rollback",
+            secondary=rollback_error,
+        )
+        try:
+            _rollback_transaction(connection)
+        except BaseException as cleanup_error:
+            _note_secondary_failure(
+                primary,
+                operation="host-edge committed repair rollback cleanup",
+                secondary=cleanup_error,
+            )
+        return False
+    return True
 
 
 def _verify_commit_proofs(
@@ -751,6 +1022,21 @@ def _verify_commit_proofs(
                 "requested child rollout proof changed before repair commit; "
                 "no repair was committed"
             ) from error
+
+
+def _verify_finalized_proofs(
+    edges: Iterable[Mapping[str, Any]], *, sessions_root: Path
+) -> None:
+    """Detect a proof mutation that raced the final database commit.
+
+    This second digest has a distinct purpose from the pre-commit check: a
+    change observed here is compensated in a new durable transaction before
+    the repair reports failure.  The documented offline boundary makes a
+    mutation after this finalization check out of scope; it must have no live
+    host writer while this utility runs.
+    """
+
+    _verify_commit_proofs(edges, sessions_root=sessions_root)
 
 
 def repair_edges(
@@ -802,78 +1088,136 @@ def repair_edges(
     journal: Path | None = None
     repaired = 0
     warnings: list[str] = []
+    candidates: dict[str, dict[str, Any]] = {}
+    state_committed = False
+    uncommitted_cleanup_attempted = False
     with closing(sqlite3.connect(database, timeout=5.0)) as connection:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 5000")
+        # The journal has already reached durable storage before this
+        # connection commits.  Force the matching SQLite durability boundary
+        # for both the repair and any proof-race compensation below.
+        connection.execute("PRAGMA synchronous = FULL")
         connection.execute("BEGIN IMMEDIATE")
         try:
             _require_schema(connection)
+            fresh_rows = _edge_rows(
+                connection,
+                parent_thread_id=parent_thread_id,
+                child_thread_ids=requested_children,
+                all_native=all_native,
+            )
             fresh_edges = [
                 _validate_terminal_edge(
                     row,
                     sessions_root=sessions_root,
                     all_native=all_native,
                 )
-                for row in _edge_rows(
-                    connection,
-                    parent_thread_id=parent_thread_id,
-                    child_thread_ids=requested_children,
-                    all_native=all_native,
-                )
+                for row in fresh_rows
             ]
             candidates = {
                 edge["child_thread_id"]: edge
                 for edge in fresh_edges
                 if edge["verdict"] == "repairable"
             }
+            # Keep the exact DB spelling separately from the canonical path
+            # recorded in the journal.  Hosts may expose equivalent short/long
+            # or case-normalized path spellings, while SQLite must bind the
+            # original persisted identity exactly.
+            for row, edge in zip(fresh_rows, fresh_edges):
+                if edge["verdict"] == "repairable":
+                    raw_rollout_path = row["rollout_path"]
+                    if not isinstance(raw_rollout_path, str):
+                        raise HostEdgeRepairError(
+                            "requested child rollout path is not persisted"
+                        )
+                    edge["_rollout_db_path"] = raw_rollout_path
             if set(candidates) != requested:
                 raise HostEdgeRepairError(
                     "requested child edges changed before repair; no repair was committed"
                 )
-            journal = _write_rollback_journal(
-                database,
-                codex_home=home,
-                edges=list(candidates.values()),
-                parent_thread_id=parent_thread_id,
-                all_native=all_native,
-            )
-            for child in sorted(candidates):
-                edge = candidates[child]
-                changed = connection.execute(
-                    """
-                    UPDATE thread_spawn_edges
-                    SET status = 'closed'
-                    WHERE parent_thread_id = ?
-                      AND child_thread_id = ?
-                      AND status = 'open'
-                      AND EXISTS (
-                          SELECT 1
-                          FROM threads
-                          WHERE threads.id = thread_spawn_edges.child_thread_id
-                            AND threads.agent_path = ?
-                            AND threads.agent_role = ?
-                      )
-                    """,
-                    (
-                        parent_thread_id,
-                        child,
-                        edge["agent_path"],
-                        edge["agent_role"],
-                    ),
-                ).rowcount
-                repaired += max(0, changed)
-            if repaired != len(requested):
-                raise HostEdgeRepairError(
-                    "requested child edges changed during repair; no repair was committed"
+            journal_root = _journal_root(home)
+            # SQLite serializes the state update; this lock also keeps a later
+            # committed repair from pruning this repair's published-but-
+            # uncommitted journal.
+            with _journal_directory_lock(journal_root):
+                journal = _write_rollback_journal(
+                    database,
+                    codex_home=home,
+                    edges=list(candidates.values()),
+                    parent_thread_id=parent_thread_id,
+                    all_native=all_native,
+                    journal_root=journal_root,
                 )
-            # Keep retention inside the immediate transaction.  A second offline
-            # repair cannot publish its current journal until this one commits.
-            warnings = _post_commit_warnings(journal)
-            _verify_commit_proofs(candidates.values(), sessions_root=sessions_root)
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            _discard_uncommitted_journal(journal)
+                try:
+                    for child in sorted(candidates):
+                        edge = candidates[child]
+                        changed = connection.execute(
+                            """
+                            UPDATE thread_spawn_edges
+                            SET status = 'closed'
+                            WHERE parent_thread_id = ?
+                              AND child_thread_id = ?
+                              AND status = 'open'
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM threads
+                                  WHERE threads.id = thread_spawn_edges.child_thread_id
+                                    AND threads.agent_path = ?
+                                    AND threads.agent_role = ?
+                                    AND threads.rollout_path = ?
+                              )
+                            """,
+                            (
+                                parent_thread_id,
+                                child,
+                                edge["agent_path"],
+                                edge["agent_role"],
+                                edge["_rollout_db_path"],
+                            ),
+                        ).rowcount
+                        repaired += max(0, changed)
+                    if repaired != len(requested):
+                        raise HostEdgeRepairError(
+                            "requested child edges changed during repair; no repair was committed"
+                        )
+                    # This check binds the exact proof to the pending state write.
+                    # A distinct post-commit check below detects the only remaining
+                    # pre-commit/commit race and compensates it durably.
+                    _verify_commit_proofs(candidates.values(), sessions_root=sessions_root)
+                    _commit_transaction(connection)
+                    state_committed = True
+                    try:
+                        _verify_finalized_proofs(
+                            candidates.values(), sessions_root=sessions_root
+                        )
+                    except BaseException as error:
+                        if _rollback_committed_repair(
+                            connection,
+                            parent_thread_id=parent_thread_id,
+                            candidates=candidates,
+                            primary=error,
+                        ):
+                            try:
+                                _discard_uncommitted_journal(journal)
+                            except BaseException as cleanup_error:
+                                _note_secondary_failure(
+                                    error,
+                                    operation="host-edge compensated rollback journal cleanup",
+                                    secondary=cleanup_error,
+                                )
+                        raise
+
+                    if journal is not None:
+                        warnings = _post_commit_warnings(journal, directory_locked=True)
+                except BaseException as error:
+                    if not state_committed:
+                        uncommitted_cleanup_attempted = True
+                        _rollback_uncommitted_repair(connection, journal, primary=error)
+                    raise
+        except BaseException as error:
+            if not state_committed and not uncommitted_cleanup_attempted:
+                _rollback_uncommitted_repair(connection, journal, primary=error)
             raise
     if journal is None:
         raise HostEdgeRepairError("host-edge rollback journal was not created")

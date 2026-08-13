@@ -4,6 +4,27 @@ CCO follows semantic versioning while it remains pre-1.0. A pre-1.0 minor releas
 breaking changes. Public, installer, and manifest identities use a plain release version without
 build metadata.
 
+## 0.9.3 - 2026-08-12
+
+### Changed
+
+- Native spawn and interrupt attempts now reserve durable replay capacity before invocation,
+  settle by the exact dispatch and tool call even when a reused owner is addressed by task name,
+  and retain unresolved evidence across restart instead of silently releasing a lease.
+- Cooperative writer apply cleans up partial copies on deadlines and other process-level
+  interruptions while preserving its replayable rollback journal. Cooperative waves now fill the
+  requested capacity with up to four pairwise-disjoint writers under one aggregate resource budget.
+  Offline host-edge repair binds the final rollout proof to the exact persisted path and durably
+  retains or removes journals.
+- Doctor validates the fixed five-event Hook contract, exact handler schema when the host exposes
+  it, and the anchored CCO-only SubagentStop matcher instead of trusting a mutable local surface.
+- The orchestration skill now states exact Primary exceptions, disjoint ownership, quiet
+  event-driven waiting, per-revision validation ownership, and the prohibition on unprepared
+  planner or child spawns. Its concise contract limit is 480 words, and closed plans are bounded
+  to 128 nodes before graph normalization.
+- The public, installer, and manifest identity is `0.9.3`; durable protocol versions are unchanged,
+  and no coordinator, compatibility runtime, background service, or second ledger was added.
+
 ## 0.9.2 - 2026-08-11
 
 ### Changed

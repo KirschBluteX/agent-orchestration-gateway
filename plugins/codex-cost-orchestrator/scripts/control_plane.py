@@ -123,7 +123,11 @@ SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 HOST_OPAQUE_MESSAGE_RE = re.compile(r"gAAAA[A-Za-z0-9_-]{80,}={0,2}")
 FAILURE_RE = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 MAX_INPUT_BYTES = 1024 * 1024
-MAX_TOMBSTONES = 256
+MAX_TOOL_USE_ID_BYTES = 4_096
+# A plan admits at most 128 nodes plus one compiler-injected reviewer.  Native
+# retries and bounded continuations can consume several attempt identities per
+# dispatch, so retain a fixed plan-lifetime replay margin beyond that graph.
+MAX_TOMBSTONES = 1_024
 MAX_TRANSIENT_RETRIES = 3
 NATIVE_CLAIM_TTL_MILLISECONDS = 120_000
 PREFLIGHT_VERIFICATION_SECONDS = 14.0
@@ -991,6 +995,65 @@ def _owner_matches_task(owner: object, task_name: object) -> bool:
     )
 
 
+def _interrupt_target_valid(target: object) -> bool:
+    if not isinstance(target, str) or not target:
+        return False
+    try:
+        return len(target.encode("utf-8")) <= 4_096
+    except UnicodeEncodeError:
+        return False
+
+
+def _tool_use_id_valid(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= MAX_TOOL_USE_ID_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+def _interrupt_target_matches_dispatch(
+    target: object,
+    dispatch: Mapping[str, Any],
+) -> bool:
+    """Accept only immutable, exact aliases for one interruptable dispatch.
+
+    A task name is intentionally retained as the ownerless-spawn alias.  Once
+    a native spawn reports its canonical owner, that exact path is also safe.
+    Do not infer an alias from a path suffix: an unrelated canonical path can
+    share a task-name basename and must never acquire this dispatch's lease.
+    """
+
+    if not _interrupt_target_valid(target):
+        return False
+    return target in (dispatch.get("owner"), dispatch.get("task_name"))
+
+
+def _cooperative_group_size_valid(size: object) -> bool:
+    """Keep one explicit, writer-isolation-owned bound for cooperative waves."""
+
+    return (
+        isinstance(size, int)
+        and not isinstance(size, bool)
+        and 2 <= size <= MAX_COOPERATIVE_WRITERS
+    )
+
+
+def _cooperative_units_disjoint(units: Iterable[Mapping[str, Any]]) -> bool:
+    """A cooperative batch can apply only pairwise-disjoint writer deltas."""
+
+    collected = list(units)
+    return all(
+        not _scopes_overlap(
+            list(left.get("scopes", [])),
+            list(right.get("scopes", [])),
+        )
+        for index, left in enumerate(collected)
+        for right in collected[index + 1 :]
+    )
+
+
 def _sibling_writer_scopes(
     state: Mapping[str, Any],
     dispatch: Mapping[str, Any],
@@ -1095,7 +1158,7 @@ def _validate_cooperative_preparing(
     if value.get("plan_id") != plan_id:
         raise ControlPlaneError("cooperative preparing reservation plan is invalid")
     members = value.get("members")
-    if not isinstance(members, list) or len(members) != MAX_COOPERATIVE_WRITERS:
+    if not isinstance(members, list) or not _cooperative_group_size_valid(len(members)):
         raise ControlPlaneError("cooperative preparing reservation members are invalid")
     normalized: list[dict[str, Any]] = []
     ids: set[str] = set()
@@ -1134,9 +1197,12 @@ def _validate_cooperative_preparing(
                 "scopes": sorted(normalized_scopes, key=lambda item: (item["kind"], item["path"])),
             }
         )
+    normalized = sorted(normalized, key=lambda item: item["id"])
+    if not _cooperative_units_disjoint(normalized):
+        raise ControlPlaneError("cooperative preparing reservation scopes overlap")
     return {
         "batch_id": batch_id,
-        "members": sorted(normalized, key=lambda item: item["id"]),
+        "members": normalized,
         "plan_id": plan_id,
     }
 
@@ -1485,8 +1551,7 @@ class ControlPlane:
                 or isinstance(event.get("generation"), bool)
                 or not isinstance(event.get("generation"), int)
                 or event["generation"] < 1
-                or not isinstance(event.get("owner"), str)
-                or TASK_PATH_RE.fullmatch(event["owner"]) is None
+                or not _interrupt_target_valid(event.get("owner"))
                 or not isinstance(event.get("tool_use_id"), str)
                 or not event["tool_use_id"]
                 or not isinstance(event.get("workspace_root"), str)
@@ -1675,6 +1740,15 @@ class ControlPlane:
             tool_use_id,
             tool_input,
         )
+        for tombstone in state.get("tombstones", []):
+            if (
+                tombstone.get("tool_use_id") == receipt["tool_use_id"]
+                or tombstone.get("tool_input_sha256")
+                == receipt["tool_input_sha256"]
+            ):
+                raise ControlPlaneError(
+                    "native admission reuses a completed tool call or input"
+                )
         # A host can retry PreToolUse for the same native call.  Treat only
         # an identical observed input as idempotent; never replace a live
         # receipt with a different ciphertext for the same tool_use_id.
@@ -1690,6 +1764,22 @@ class ControlPlane:
                     "native admission input changed for the existing tool call"
                 )
             return linked
+        anchored = sum(
+            1
+            for item in state.get("tombstones", [])
+            if item.get("tool_use_id") is not None
+            or item.get("tool_input_sha256") is not None
+        )
+        reserved = sum(
+            1
+            for item in state.get("dispatches", {}).values()
+            if isinstance(item, Mapping)
+            and isinstance(item.get("receipt_id"), str)
+        )
+        if anchored + reserved >= MAX_TOMBSTONES:
+            raise ControlPlaneUnavailable(
+                "lifecycle replay-anchor capacity is exhausted before native admission"
+            )
         path = _pending_event_path(self.root, self.session_id, receipt["event_id"])
         with acquire(
             self.root,
@@ -1783,7 +1873,24 @@ class ControlPlane:
             return True
         return (
             receipt.get("kind") == "interrupt_attempt"
-            and receipt.get("owner") == dispatch.get("owner")
+            and _interrupt_target_matches_dispatch(receipt.get("owner"), dispatch)
+        )
+
+    @staticmethod
+    def _interrupt_receipt_is_current(
+        state: Mapping[str, Any],
+        dispatch: Mapping[str, Any],
+        receipt: Mapping[str, Any],
+    ) -> bool:
+        return (
+            receipt.get("kind") == "interrupt_attempt"
+            and receipt.get("plan_id") == state.get("plan_id")
+            and receipt.get("workspace_root") == state.get("workspace_root")
+            and receipt.get("generation") == dispatch.get("generation")
+            and receipt.get("dispatch_id") == dispatch.get("dispatch_id")
+            and receipt.get("event_id") == dispatch.get("interrupt_receipt_id")
+            and receipt.get("tool_use_id") == dispatch.get("interrupt_tool_use_id")
+            and _interrupt_target_matches_dispatch(receipt.get("owner"), dispatch)
         )
 
     def _find_native_attempt_receipt(
@@ -2183,10 +2290,9 @@ class ControlPlane:
         event = dict(value)
         if (
             set(event)
-            != {"kind", "owner", "previous_status", "tool_use_id"}
+            != {"kind", "previous_status", "target", "tool_use_id"}
             or event.get("kind") != "interrupt_attempt_observation"
-            or not isinstance(event.get("owner"), str)
-            or TASK_PATH_RE.fullmatch(event["owner"]) is None
+            or not _interrupt_target_valid(event.get("target"))
             or not isinstance(event.get("previous_status"), str)
             or not event["previous_status"]
             or not isinstance(event.get("tool_use_id"), str)
@@ -2228,22 +2334,22 @@ class ControlPlane:
             dispatch_id = parse_continue_message(message)["dispatch_id"]
             input_sha256 = _digest(b"cco.native-input.v1\0", dict(tool_input))
         else:
-            owner = tool_input.get("target")
+            target = tool_input.get("target")
             response = payload.get("tool_response")
             previous_status = (
                 response.get("previous_status")
                 if isinstance(response, Mapping)
                 else None
             )
-            if not isinstance(owner, str):
+            if not isinstance(target, str):
                 raise ControlPlaneError("native tool result is not CCO-owned")
             if not isinstance(previous_status, str) or not previous_status:
                 previous_status = "unknown"
             return self._validate_interrupt_attempt_observation(
                 {
                     "kind": "interrupt_attempt_observation",
-                    "owner": owner,
                     "previous_status": previous_status,
+                    "target": target,
                     "tool_use_id": tool_use_id,
                 }
             )
@@ -2725,7 +2831,7 @@ class ControlPlane:
         return settled
 
     def _release_settled_result_receipt(self, receipt: Mapping[str, Any]) -> None:
-        """Drop the current pointer before deleting an acknowledged receipt."""
+        """Persist the replay anchor before deleting an acknowledged receipt."""
 
         dispatch_id = str(receipt["dispatch_id"])
         interrupt_receipt: dict[str, Any] | None = None
@@ -2741,6 +2847,12 @@ class ControlPlane:
                 }:
                     changed = False
                     if dispatch.get("receipt_id") == receipt.get("event_id"):
+                        self._append_tombstone(
+                            state,
+                            dispatch,
+                            "native_attempt_consumed",
+                            receipt=receipt,
+                        )
                         dispatch["receipt_id"] = None
                         changed = True
                     if dispatch.get("state") in {"retired", "fenced", "rejected"} and (
@@ -2901,7 +3013,7 @@ class ControlPlane:
         return self._observe_interrupt_attempt(
             {
                 "kind": "interrupt_attempt_observation",
-                "owner": receipt["owner"],
+                "target": receipt["owner"],
                 "previous_status": receipt["previous_status"],
                 "tool_use_id": receipt["tool_use_id"],
             }
@@ -3147,6 +3259,56 @@ class ControlPlane:
             raise ControlPlaneError("lifecycle logical state is invalid")
         if "settled_events" in normalized:
             raise ControlPlaneError(BREAKING_UPGRADE_MESSAGE)
+        tombstones = normalized.get("tombstones")
+        if (
+            not isinstance(tombstones, list)
+            or len(tombstones) > MAX_TOMBSTONES
+            or any(
+                not isinstance(item, Mapping)
+                or set(item)
+                - {
+                    "cursor",
+                    "dispatch_id",
+                    "owner",
+                    "reason",
+                    "tool_input_sha256",
+                    "tool_use_id",
+                }
+                or not isinstance(item.get("cursor"), int)
+                or isinstance(item.get("cursor"), bool)
+                or item["cursor"] < 0
+                or not isinstance(item.get("dispatch_id"), str)
+                or SHA256_RE.fullmatch(item["dispatch_id"]) is None
+                or not isinstance(item.get("reason"), str)
+                or not item["reason"]
+                or (
+                    item.get("owner") is not None
+                    and (
+                        not isinstance(item.get("owner"), str)
+                        or TASK_PATH_RE.fullmatch(item["owner"]) is None
+                    )
+                )
+                or (
+                    item.get("tool_input_sha256") is not None
+                    and (
+                        not isinstance(item.get("tool_input_sha256"), str)
+                        or SHA256_RE.fullmatch(item["tool_input_sha256"]) is None
+                    )
+                )
+                or (
+                    item.get("tool_input_sha256") is not None
+                    and item.get("tool_use_id") is None
+                )
+                or (
+                    item.get("tool_use_id") is not None
+                    and (
+                        not _tool_use_id_valid(item.get("tool_use_id"))
+                    )
+                )
+                for item in tombstones
+            )
+        ):
+            raise ControlPlaneError("lifecycle tombstone collection is invalid")
         # Isolate records are derivable from cooperative dispatches. Retaining
         # a duplicate mirror risks cleanup using stale roots after recovery.
         if "cooperative_isolates" in normalized:
@@ -3237,6 +3399,26 @@ class ControlPlane:
                     dispatch["state"] = "paused"
                     for member in dispatch["members"]:
                         state["logical"][member]["state"] = "paused"
+                changed = True
+            # Expiry cannot prove whether the host executed an interrupt.
+            # Detach the stale reservation, but fence owner reuse until an
+            # explicit restart/result establishes a safe terminal outcome.
+            interrupt_deadline = dispatch.get("interrupt_claim_expires_at")
+            if (
+                dispatch.get("state") in ACTIVE_STATES
+                and isinstance(dispatch.get("interrupt_receipt_id"), str)
+                and isinstance(dispatch.get("interrupt_tool_use_id"), str)
+                and isinstance(interrupt_deadline, int)
+                and not isinstance(interrupt_deadline, bool)
+                and interrupt_deadline <= current
+            ):
+                interrupt_receipt = self._interrupt_attempt_for_dispatch(dispatch)
+                dispatch["interrupt_receipt_id"] = None
+                dispatch["interrupt_tool_use_id"] = None
+                dispatch["interrupt_claim_expires_at"] = None
+                dispatch["interrupt_unresolved"] = True
+                if interrupt_receipt is not None:
+                    released.append(("finalize_interrupt", interrupt_receipt))
                 changed = True
             if (
                 dispatch.get("state") in {"retired", "fenced", "rejected"}
@@ -3710,8 +3892,9 @@ class ControlPlane:
                 or "isolate_baselines" in wave
                 or not isinstance(canonical_baseline, Mapping)
                 or not isinstance(isolate_snapshots, Mapping)
-                or len(cooperative_units) != MAX_COOPERATIVE_WRITERS
+                or not _cooperative_group_size_valid(len(cooperative_units))
                 or set(isolate_snapshots) != {str(unit.get("id")) for unit in cooperative_units}
+                or not _cooperative_units_disjoint(cooperative_units)
             ):
                 raise ControlPlaneError("cooperative wave canonical baseline is invalid")
             try:
@@ -4012,64 +4195,69 @@ class ControlPlane:
         units: list[dict[str, Any]],
         *,
         capacity: int,
-    ) -> list[dict[str, Any]] | None:
-        """Admit only the intentionally tiny, standalone cooperative shape.
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """Select one bounded, maximal compatible set of ready writers.
 
-        Anything less exact deliberately falls through to the established serial
-        selector.  In particular, a cooperative request never combines logical
-        nodes, inherits context, reuses a child, or mixes readers/reviewers.
+        Cooperative isolation is intentionally still narrow: each member is a
+        fresh standalone writer and the group is bounded by both native
+        capacity and the writer-isolation module's explicit isolate limit.
+        Unlike the original two-writer experiment, the plan may have more
+        writers and a wave takes every compatible ready writer it can fit.
         """
 
-        if plan.get("writer_isolation", "serial") != COOPERATIVE or capacity < 2:
-            return None
+        if plan.get("writer_isolation", "serial") != COOPERATIVE:
+            return None, None
+        limit = min(capacity, MAX_COOPERATIVE_WRITERS)
+        if limit < 2:
+            return None, "cooperative_capacity_below_two"
         # Retain a fenced/recovery candidate as lifecycle evidence instead of
-        # overwriting its two owned roots with a later experimental batch.
-        # Ordinary serial retry remains available without destroying it.
+        # overwriting its owned roots with a later experimental batch.
         if state.get("cooperative_preparing") is not None:
-            return None
+            return None, "cooperative_preparation_already_reserved"
         if self._cooperative_isolate_records(state):
-            return None
-        nodes = list(plan.get("nodes", []))
-        writer_nodes = [
-            node
-            for node in nodes
-            if isinstance(node, Mapping) and node.get("role") == "worker"
-        ]
-        if len(writer_nodes) != MAX_COOPERATIVE_WRITERS:
-            return None
-        if any(
-            node.get("depends_on") != []
-            or node.get("review_of") is not None
-            or node.get("context_turns") != 0
-            for node in writer_nodes
-        ):
-            return None
-        trailing = [node for node in nodes if node not in writer_nodes]
-        writer_ids = sorted(str(node["id"]) for node in writer_nodes)
-        if trailing and (
-            len(trailing) != 1
-            or not isinstance(trailing[0], Mapping)
-            or trailing[0].get("role") != "reviewer"
-            or trailing[0].get("depends_on") != writer_ids
-            or trailing[0].get("review_of") is not None
-            or trailing[0].get("context_turns") != 0
-        ):
-            return None
-        if any(item.get("role") != "worker" or len(item.get("members", [])) != 1 for item in units):
-            return None
-        by_member = {
-            item["members"][0]: item
-            for item in units
-            if isinstance(item.get("members"), list) and len(item["members"]) == 1
-        }
-        if set(by_member) != set(writer_ids):
-            return None
-        selected = [by_member[node_id] for node_id in writer_ids]
-        if _scopes_overlap(selected[0]["scopes"], selected[1]["scopes"]):
-            return None
+            return None, "cooperative_isolates_still_owned"
         if self._has_live_cross_task_work(plan["workspace_root"]):
-            return None
-        return selected
+            return None, "cooperative_cross_task_work_is_active"
+
+        candidates = [
+            item
+            for item in units
+            if item.get("role") == "worker"
+            and isinstance(item.get("members"), list)
+            and len(item["members"]) == 1
+            and item.get("context_turns") == 0
+        ]
+        if len(candidates) < 2:
+            return None, "cooperative_requires_two_ready_standalone_writers"
+        candidates.sort(key=lambda item: (-int(item["downstream_count"]), str(item["id"])))
+
+        # The isolate limit is a small explicit constant.  This bounded DFS
+        # finds a largest disjoint group without introducing a second scheduler
+        # or arbitrarily privileging a conflicting high-priority writer.
+        def choose(target: int) -> list[dict[str, Any]] | None:
+            def visit(start: int, selected: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+                if len(selected) == target:
+                    return selected
+                if len(selected) + len(candidates) - start < target:
+                    return None
+                for index in range(start, len(candidates)):
+                    candidate = candidates[index]
+                    if all(
+                        not _scopes_overlap(candidate["scopes"], prior["scopes"])
+                        for prior in selected
+                    ):
+                        found = visit(index + 1, [*selected, candidate])
+                        if found is not None:
+                            return found
+                return None
+
+            return visit(0, [])
+
+        for target in range(min(limit, len(candidates)), 1, -1):
+            selected = choose(target)
+            if selected is not None:
+                return sorted(selected, key=lambda item: str(item["id"])), None
+        return None, "cooperative_ready_writer_scopes_overlap"
 
     def _dependency_evidence(
         self,
@@ -4429,13 +4617,16 @@ class ControlPlane:
                 ready.append(node)
             if not ready:
                 self._write_state(state)
-                return {
+                result = {
                     "dispatches": [],
                     "plan_id": state["plan_id"],
                     "protocol": BATCH_PROTOCOL,
                     "state": self._overall_state(state, plan),
                     "wave_id": None,
                 }
+                if plan.get("writer_isolation", "serial") == COOPERATIVE:
+                    result["cooperative_reason"] = "cooperative_no_ready_writers"
+                return result
             routes, route_errors = self._routes(plan, ready, catalog)
             for node_id, error in route_errors.items():
                 state["logical"][node_id]["state"] = "fenced"
@@ -4446,7 +4637,7 @@ class ControlPlane:
             routable = [item for item in ready if item["id"] in routes]
             if not routable:
                 self._write_state(state)
-                return {
+                result = {
                     **self._public_batch(state, []),
                     "blocked": [
                         {"node": node, "reason": route_errors[node]}
@@ -4454,13 +4645,24 @@ class ControlPlane:
                     ],
                     "state": "blocked",
                 }
+                if plan.get("writer_isolation", "serial") == COOPERATIVE:
+                    result["cooperative_reason"] = "cooperative_no_routable_ready_writers"
+                return result
             downstream = _descendant_counts(plan)
             units = _logical_units(
                 routable,
                 routes,
                 downstream=downstream,
             )
-            cooperative_selected = self._cooperative_writer_units(
+            # A completed cooperative wave retains its immutable dispatches
+            # for audit, but its now-terminal roots and applied journal must
+            # not consume the bounded isolate namespace forever.  This helper
+            # detaches only a fully settled batch before reclaiming it; any
+            # fenced or recovery-required evidence remains owned and yields a
+            # serial fallback with an observable cooperative reason below.
+            if plan.get("writer_isolation", "serial") == COOPERATIVE:
+                self._cleanup_terminal_cooperative_artifacts_locked(state)
+            cooperative_selected, cooperative_reason = self._cooperative_writer_units(
                 state,
                 plan,
                 units,
@@ -4488,13 +4690,14 @@ class ControlPlane:
                 route_cursors[unit["id"]] = cursor
                 available.append(unit)
             selected = available
-            if cooperative and len(selected) != MAX_COOPERATIVE_WRITERS:
+            if cooperative and not _cooperative_group_size_valid(len(selected)):
                 # A route failure already fenced its logical member.  The one
                 # remaining writer proceeds through the ordinary serial path.
                 cooperative = False
+                cooperative_reason = "cooperative_selected_writer_route_unavailable"
             if not selected:
                 self._write_state(state)
-                return {
+                result = {
                     **self._public_batch(state, []),
                     "blocked": [
                         {"node": node, "reason": route_errors[node]}
@@ -4502,6 +4705,9 @@ class ControlPlane:
                     ],
                     "state": "blocked",
                 }
+                if cooperative_reason is not None:
+                    result["cooperative_reason"] = cooperative_reason
+                return result
             reuse_sources: dict[str, str | None] = {}
             reserved_owners: set[str] = set()
             for unit in selected:
@@ -4769,6 +4975,8 @@ class ControlPlane:
                 result = self._public_batch(state, created)
                 if blocked:
                     result["blocked"] = blocked
+                if cooperative_reason is not None:
+                    result["cooperative_reason"] = cooperative_reason
                 return result
         except (WriterIsolationError, WriterIsolationUnavailable) as error:
             raise ControlPlaneUnavailable(str(error)) from error
@@ -5411,6 +5619,7 @@ class ControlPlane:
             if (
                 dispatch.get("interrupt_receipt_id") is not None
                 or dispatch.get("interrupt_tool_use_id") is not None
+                or dispatch.get("interrupt_unresolved") is True
             ):
                 raise ControlPlaneError(
                     "continuation owner has an unresolved interrupt attempt"
@@ -5456,16 +5665,62 @@ class ControlPlane:
             ),
         )
 
-    def _append_tombstone(self, state: dict[str, Any], dispatch: Mapping[str, Any], reason: str) -> None:
-        state["tombstones"].append(
-            {
-                "cursor": dispatch["cursor"],
-                "dispatch_id": dispatch["dispatch_id"],
-                "owner": dispatch.get("owner"),
-                "reason": reason,
-            }
-        )
-        state["tombstones"] = state["tombstones"][-MAX_TOMBSTONES:]
+    def _append_tombstone(
+        self,
+        state: dict[str, Any],
+        dispatch: Mapping[str, Any],
+        reason: str,
+        *,
+        receipt: Mapping[str, Any] | None = None,
+        consumed_tool_use_id: str | None = None,
+    ) -> None:
+        if receipt is not None and consumed_tool_use_id is not None:
+            raise ControlPlaneError("tombstone has conflicting native anchors")
+        tombstone: dict[str, Any] = {
+            "cursor": dispatch["cursor"],
+            "dispatch_id": dispatch["dispatch_id"],
+            "owner": dispatch.get("owner"),
+            "reason": reason,
+        }
+        if receipt is not None:
+            if not _tool_use_id_valid(receipt.get("tool_use_id")):
+                raise ControlPlaneError("tombstone native call identity is invalid")
+            tombstone["tool_input_sha256"] = receipt["tool_input_sha256"]
+            tombstone["tool_use_id"] = receipt["tool_use_id"]
+        elif consumed_tool_use_id is not None:
+            if not _tool_use_id_valid(consumed_tool_use_id):
+                raise ControlPlaneError("tombstone native call identity is invalid")
+            tombstone["tool_use_id"] = consumed_tool_use_id
+        state["tombstones"].append(tombstone)
+        # Native attempt anchors are replay proof, not ordinary historical
+        # status.  Dropping one would permit a later opaque envelope or call
+        # ID to reuse a consumed native admission.  Refuse a transition that
+        # would evict one instead of silently weakening that invariant.
+        if len(state["tombstones"]) > MAX_TOMBSTONES:
+            unanchored = next(
+                (
+                    index
+                    for index, item in enumerate(state["tombstones"])
+                    if item.get("tool_use_id") is None
+                    and item.get("tool_input_sha256") is None
+                ),
+                None,
+            )
+            if unanchored is not None:
+                del state["tombstones"][unanchored]
+            elif (
+                tombstone.get("tool_use_id") is not None
+                or tombstone.get("tool_input_sha256") is not None
+            ):
+                state["tombstones"].pop()
+                raise ControlPlaneUnavailable(
+                    "lifecycle tombstone replay-anchor capacity is exhausted"
+                )
+            else:
+                # Historical terminal status is non-authoritative. Preserve
+                # every existing replay anchor and make this unanchored entry
+                # best-effort rather than failing an otherwise safe cleanup.
+                state["tombstones"].pop()
 
     def _settle_wave(self, state: dict[str, Any]) -> None:
         wave_id = state.get("active_wave_id")
@@ -5543,6 +5798,10 @@ class ControlPlane:
         for item in dispatches:
             for kind, receipt in self._attempt_receipts_for_dispatch(state, item):
                 receipts[str(receipt["event_id"])] = (kind, receipt)
+                if kind == "native":
+                    self._append_tombstone(
+                        state, item, "native_attempt_consumed", receipt=receipt
+                    )
             item["receipt_id"] = None
 
             if item.get("interrupt_receipt_id") is not None:
@@ -5770,6 +6029,7 @@ class ControlPlane:
             if (
                 dispatch.get("interrupt_receipt_id") is not None
                 or dispatch.get("interrupt_tool_use_id") is not None
+                or dispatch.get("interrupt_unresolved") is True
             ):
                 raise ControlPlaneError(
                     "continuation owner has an unresolved interrupt attempt"
@@ -5803,7 +6063,10 @@ class ControlPlane:
         if not self.state_path.exists():
             return False
         with self._coordinated_state() as state:
-            return any(item.get("owner") == owner for item in state["dispatches"].values())
+            return any(
+                _interrupt_target_matches_dispatch(owner, item)
+                for item in state["dispatches"].values()
+            )
 
     def preflight_interrupt(self, payload: Mapping[str, Any]) -> bool:
         tool_input = payload.get("tool_input")
@@ -5815,7 +6078,7 @@ class ControlPlane:
             or not tool_use_id
         ):
             raise ControlPlaneError("interrupt input is incomplete")
-        owner = tool_input["target"]
+        target = tool_input["target"]
         if not self.state_path.exists():
             return False
         with self._coordinated_state() as state:
@@ -5827,17 +6090,22 @@ class ControlPlane:
             matches = [
                 item
                 for item in state["dispatches"].values()
-                if item.get("owner") == owner
+                if _interrupt_target_matches_dispatch(target, item)
                 and item["state"] in {"running", "ready_to_apply", "paused"}
             ]
             managed = any(
-                item.get("owner") == owner for item in state["dispatches"].values()
+                _interrupt_target_matches_dispatch(target, item)
+                for item in state["dispatches"].values()
             )
             if not matches and not managed:
                 return False
             if len(matches) != 1:
                 raise ControlPlaneError("interrupt target has no unique active dispatch")
             dispatch = matches[0]
+            if dispatch.get("interrupt_unresolved") is True:
+                raise ControlPlaneError(
+                    "interrupt target has an unresolved interrupt attempt"
+                )
             existing_receipt_id = dispatch.get("interrupt_receipt_id")
             if isinstance(existing_receipt_id, str):
                 existing = self._interrupt_attempt_for_dispatch(dispatch)
@@ -5848,6 +6116,10 @@ class ControlPlane:
                 if dispatch.get("interrupt_tool_use_id") == tool_use_id:
                     # Host retries of one exact preflight are idempotent; they
                     # retain the same immutable attempt receipt.
+                    if existing.get("owner") != target:
+                        raise ControlPlaneError(
+                            "interrupt target changed for the existing tool call"
+                        )
                     return True
                 raise ControlPlaneError(
                     "interrupt target already has an unresolved attempt"
@@ -5859,7 +6131,7 @@ class ControlPlane:
             receipt = self._reserve_interrupt_attempt_receipt(
                 state,
                 dispatch,
-                owner,
+                target,
                 tool_use_id,
             )
             try:
@@ -5885,7 +6157,7 @@ class ControlPlane:
         if normalized.get("kind") != "interrupt_attempt_observation":
             raise ControlPlaneError("interrupt observation is invalid")
         receipt = self._find_interrupt_attempt_receipt(
-            str(normalized["owner"]),
+            str(normalized["target"]),
             str(normalized["tool_use_id"]),
         )
         if receipt is None:
@@ -5906,23 +6178,10 @@ class ControlPlane:
             raise ControlPlaneError("interrupt receipt observation is not active")
         settlement_event = dict(normalized)
         settlement_event["previous_status"] = observed["previous_status"]
-        settled = self._settle_interrupt_event(settlement_event)
+        settled = self._settle_interrupt_event(settlement_event, receipt=observed)
         if not settled:
             self._finalize_interrupt_attempt_receipt(observed)
             return False
-
-        if self.state_path.exists():
-            with self._coordinated_state() as state:
-                dispatch = state["dispatches"].get(receipt["dispatch_id"])
-                if (
-                    isinstance(dispatch, dict)
-                    and dispatch.get("interrupt_receipt_id") == receipt.get("event_id")
-                ):
-                    dispatch["interrupt_receipt_id"] = None
-                    dispatch["interrupt_tool_use_id"] = None
-                    dispatch["interrupt_claim_expires_at"] = None
-                    dispatch["interrupt_unresolved"] = False
-                    self._write_state(state)
         self._finalize_interrupt_attempt_receipt(observed)
         return True
 
@@ -5932,32 +6191,29 @@ class ControlPlane:
             raise ControlPlaneError("native tool result is not an interrupt")
         return self._observe_interrupt_attempt(event)
 
-    def _settle_interrupt_event(self, event: Mapping[str, Any]) -> bool:
+    def _settle_interrupt_event(
+        self,
+        event: Mapping[str, Any],
+        *,
+        receipt: Mapping[str, Any],
+    ) -> bool:
         tool_use_id = str(event["tool_use_id"])
-        owner = str(event["owner"])
+        target = str(event["target"])
         previous_status = str(event["previous_status"])
+        if (
+            receipt.get("tool_use_id") != tool_use_id
+            or receipt.get("owner") != target
+        ):
+            raise ControlPlaneError("interrupt observation is not receipt-bound")
         if not self.state_path.exists():
             return False
         receipts: list[tuple[str, dict[str, Any]]] = []
         with self._coordinated_state() as state:
-            matches = [
-                item
-                for item in state["dispatches"].values()
-                if item.get("owner") == owner
-                and item.get("interrupt_tool_use_id") == tool_use_id
-            ]
-            if not matches:
-                managed = any(
-                    item.get("owner") == owner
-                    for item in state["dispatches"].values()
-                )
-                return managed
-            if len(matches) != 1:
-                raise ControlPlaneError("interrupt result has no unique prepared dispatch")
-            dispatch = matches[0]
-            dispatch["interrupt_tool_use_id"] = None
-            dispatch["interrupt_claim_expires_at"] = None
-            dispatch["interrupt_unresolved"] = False
+            dispatch = state["dispatches"].get(receipt.get("dispatch_id"))
+            if not isinstance(dispatch, dict) or not self._interrupt_receipt_is_current(
+                state, dispatch, receipt
+            ):
+                return False
             if (
                 previous_status in {"interrupted", "pending_init", "running"}
                 and dispatch["state"] in {"running", "ready_to_apply", "paused"}
@@ -5967,6 +6223,13 @@ class ControlPlane:
                         state, dispatch, "interrupted"
                     )
                 )
+            # Observation and pointer release are one settlement transaction.
+            # A second state write would leave replay linked to an already-
+            # consumed native call if the Hook exited between those writes.
+            dispatch["interrupt_receipt_id"] = None
+            dispatch["interrupt_tool_use_id"] = None
+            dispatch["interrupt_claim_expires_at"] = None
+            dispatch["interrupt_unresolved"] = False
             self._write_state(state)
         deduplicated = {
             item["event_id"]: (kind, item) for kind, item in receipts
@@ -6014,8 +6277,8 @@ class ControlPlane:
             and item.get("wave_id") == dispatch.get("wave_id")
             and _is_cooperative_dispatch(item)
         ]
-        if len(records) != MAX_COOPERATIVE_WRITERS:
-            raise ControlPlaneError("cooperative wave does not contain exactly two writers")
+        if not _cooperative_group_size_valid(len(records)):
+            raise ControlPlaneError("cooperative wave has an invalid writer count")
         if len({item.get("unit_id") for item in records}) != len(records):
             raise ControlPlaneError("cooperative wave unit identity is ambiguous")
         return sorted(records, key=lambda item: str(item["unit_id"]))
@@ -6025,7 +6288,7 @@ class ControlPlane:
         owner: str,
         result: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Hold a successful isolate result until its sole peer is also ready."""
+        """Hold a successful isolate result until every batch peer is ready."""
 
         with self._coordinated_state() as state:
             dispatch = self._find_dispatch(state, result["dispatch_id"])
@@ -6193,7 +6456,7 @@ class ControlPlane:
         return self._integrate_cooperative_wave(wave_id) if ready else settled
 
     def _integrate_cooperative_wave(self, wave_id: str) -> dict[str, Any]:
-        """Apply two fully verified isolate deltas as one recoverable transaction."""
+        """Apply every verified isolate delta as one recoverable transaction."""
 
         with self._coordinated_state() as state:
             if state.get("active_wave_id") != wave_id:
@@ -6204,7 +6467,7 @@ class ControlPlane:
                 for item in state["dispatches"].values()
                 if item.get("wave_id") == wave_id and _is_cooperative_dispatch(item)
             ]
-            if len(dispatches) != MAX_COOPERATIVE_WRITERS or not all(
+            if not _cooperative_group_size_valid(len(dispatches)) or not all(
                 item.get("state") == "ready_to_apply" and isinstance(item.get("result"), Mapping)
                 for item in dispatches
             ):
@@ -6822,7 +7085,25 @@ class ControlPlane:
             ):
                 raise ControlPlaneError("only a prepared owner reuse can be unavailable")
             receipt = self._native_attempt_for_dispatch(dispatch)
+            consumed_tool_use_id = dispatch.get("tool_use_id")
+            if not _tool_use_id_valid(consumed_tool_use_id):
+                consumed_tool_use_id = (
+                    receipt.get("tool_use_id") if isinstance(receipt, Mapping) else None
+                )
+            if not _tool_use_id_valid(consumed_tool_use_id):
+                raise ControlPlaneError("native failure has no consumed call identity")
             receipts: list[tuple[str, dict[str, Any]]] = []
+            # A typed host failure means this exact call reached the native
+            # boundary even though it has no PostToolUse success receipt. Keep
+            # its call identity durably before releasing the receipt pointer.
+            # Deliberately do not retain the input digest here: a *new* native
+            # call ID is allowed to retry the same prepared envelope.
+            self._append_tombstone(
+                state,
+                dispatch,
+                "native_failure_consumed",
+                consumed_tool_use_id=consumed_tool_use_id,
+            )
             result = self._settle_native_failure_locked(
                 state, dispatch, kind, receipts
             )

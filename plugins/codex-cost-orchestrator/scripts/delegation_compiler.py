@@ -24,6 +24,7 @@ DECISIONS = frozenset({"mechanical", "bounded"})
 VERIFICATIONS = frozenset({"deterministic", "semantic", "manual"})
 SCOPE_KINDS = frozenset({"exact", "prefix"})
 WRITER_ISOLATION_MODES = frozenset({"serial", "cooperative"})
+MAX_PLAN_NODES = 128
 NODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 ACCEPTANCE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -457,8 +458,14 @@ def normalize_closed_plan(value: object) -> dict[str, Any]:
     acceptance = _normalize_acceptance(value["acceptance"])
     accept_risk = _boolean(value.get("accept_risk", False), "plan accept_risk")
     nodes_value = value["nodes"]
-    if not isinstance(nodes_value, list) or not nodes_value:
-        raise DelegationCompilerError("plan nodes must be a non-empty list")
+    if (
+        not isinstance(nodes_value, list)
+        or not nodes_value
+        or len(nodes_value) > MAX_PLAN_NODES
+    ):
+        raise DelegationCompilerError(
+            f"plan nodes must contain between 1 and {MAX_PLAN_NODES} items"
+        )
     nodes = [_normalize_node(node, index, acceptance) for index, node in enumerate(nodes_value)]
     node_ids = {item["id"] for item in nodes}
     if len(node_ids) != len(nodes):

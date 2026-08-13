@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import closing
 from unittest.mock import patch
@@ -434,23 +435,309 @@ class HostEdgeRepairTests(unittest.TestCase):
         journals = self.home / "backups" / "cco-host-edge-repair"
         self.assertFalse(list(journals.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")))
 
-    def test_repair_checks_proof_after_retention_before_commit(self) -> None:
-        child = child_id(142)
+    def test_precommit_proof_mutation_is_durably_compensated_at_finalization(self) -> None:
+        child = child_id(144)
         self.add_edge(child, [event("task_started"), event("task_complete")])
+        real_verify = repair_host_edges._verify_commit_proofs
+        calls = 0
 
-        def mutate_during_retention(_journal: Path) -> list[str]:
-            self.write_rollout(child, [event("task_started")])
-            return []
+        def mutate_after_first_verify(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            real_verify(*args, **kwargs)
+            if calls == 1:
+                self.write_rollout(child, [event("task_started")])
 
         with patch.object(
             repair_host_edges,
-            "_post_commit_warnings",
-            side_effect=mutate_during_retention,
+            "_verify_commit_proofs",
+            side_effect=mutate_after_first_verify,
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "proof changed before repair commit"):
+                self.repair([child])
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(self.status(child), "open")
+        journals = self.home / "backups" / "cco-host-edge-repair"
+        self.assertFalse(list(journals.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")))
+
+    def test_post_commit_proof_mutation_is_durably_compensated(self) -> None:
+        child = child_id(146)
+        self.add_edge(child, [event("task_started"), event("task_complete")])
+        real_commit = repair_host_edges._commit_transaction
+        commits = 0
+
+        def mutate_after_repair_commit(connection: sqlite3.Connection) -> None:
+            nonlocal commits
+            real_commit(connection)
+            commits += 1
+            if commits == 1:
+                self.write_rollout(child, [event("task_started")])
+
+        with patch.object(
+            repair_host_edges,
+            "_commit_transaction",
+            side_effect=mutate_after_repair_commit,
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "proof changed before repair commit"):
+                self.repair([child])
+
+        self.assertEqual(commits, 2)
+        self.assertEqual(self.status(child), "open")
+        journals = self.home / "backups" / "cco-host-edge-repair"
+        self.assertFalse(list(journals.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")))
+
+    def test_rollback_and_journal_cleanup_keep_the_original_failure(self) -> None:
+        child = child_id(147)
+        self.add_edge(child, [event("task_complete")])
+        primary = HostEdgeRepairError("primary proof failure")
+
+        with (
+            patch.object(
+                repair_host_edges,
+                "_verify_commit_proofs",
+                side_effect=primary,
+            ),
+            patch.object(
+                repair_host_edges,
+                "_rollback_transaction",
+                side_effect=OSError("rollback failed"),
+            ) as rollback,
+            patch.object(
+                repair_host_edges,
+                "_discard_uncommitted_journal",
+                side_effect=OSError("journal cleanup failed"),
+            ) as cleanup,
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "primary proof failure") as raised:
+                self.repair([child])
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(rollback.call_count, 1)
+        self.assertEqual(cleanup.call_count, 1)
+        notes = getattr(raised.exception, "__notes__", [])
+        self.assertTrue(any("rollback failed" in note for note in notes))
+        self.assertTrue(any("journal cleanup failed" in note for note in notes))
+
+    def test_uncommitted_journal_is_deleted_while_publication_lock_is_held(self) -> None:
+        child = child_id(150)
+        self.add_edge(child, [event("task_complete")])
+        real_discard = repair_host_edges._discard_uncommitted_journal
+        contenders: list[bool] = []
+
+        def discard_under_lock(journal: Path | None) -> None:
+            self.assertIsNotNone(journal)
+
+            def contend() -> None:
+                try:
+                    with repair_host_edges.acquire_state_lock(
+                        Path(journal).parent,
+                        repair_host_edges.JOURNAL_LOCK_IDENTITY,
+                        timeout=0,
+                    ):
+                        contenders.append(False)
+                except repair_host_edges.StateLockBusy:
+                    contenders.append(True)
+
+            thread = threading.Thread(target=contend)
+            thread.start()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+            real_discard(journal)
+
+        with (
+            patch.object(
+                repair_host_edges,
+                "_verify_commit_proofs",
+                side_effect=HostEdgeRepairError("proof failure"),
+            ),
+            patch.object(
+                repair_host_edges,
+                "_discard_uncommitted_journal",
+                side_effect=discard_under_lock,
+            ),
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "proof failure"):
+                self.repair([child])
+
+        self.assertEqual(contenders, [True])
+        self.assertEqual(self.status(child), "open")
+
+    def test_journal_directory_creation_is_published_before_repair(self) -> None:
+        child = child_id(148)
+        self.add_edge(child, [event("task_complete")])
+        real_sync = repair_host_edges._sync_directory
+        calls: list[Path] = []
+
+        def observe_sync(path: Path, *, label: str) -> None:
+            calls.append(path)
+            real_sync(path, label=label)
+
+        with patch.object(
+            repair_host_edges,
+            "_sync_directory",
+            side_effect=observe_sync,
+        ):
+            self.repair([child])
+
+        journal_root = self.home / "backups" / "cco-host-edge-repair"
+        normalized_calls = {path.resolve(strict=False) for path in calls}
+        self.assertIn(journal_root.resolve(strict=False), normalized_calls)
+        self.assertIn(journal_root.parent.resolve(strict=False), normalized_calls)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows write-through publication")
+    def test_windows_uncommitted_journal_deletion_uses_write_through_rename(self) -> None:
+        journal_dir = self.home / "backups" / "cco-host-edge-repair"
+        journal_dir.mkdir(parents=True)
+        journal = journal_dir / f"{JOURNAL_PREFIX}abort{JOURNAL_SUFFIX}"
+        journal.write_text("{}\n", encoding="utf-8")
+        replacements: list[tuple[Path, Path]] = []
+
+        def replace(source: Path, target: Path) -> None:
+            replacements.append((source, target))
+            os.replace(source, target)
+
+        with patch.object(repair_host_edges, "_replace_journal", side_effect=replace):
+            repair_host_edges._discard_uncommitted_journal(journal)
+
+        self.assertEqual(replacements[0][0], journal)
+        self.assertFalse(journal.exists())
+        self.assertFalse(list(journal_dir.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")))
+
+    def test_published_journal_cleanup_syncs_parent_directory(self) -> None:
+        child = child_id(145)
+        self.add_edge(child, [event("task_started"), event("task_complete")])
+        edge = self.edge(child)
+        journals = self.home / "backups" / "cco-host-edge-repair"
+        repair_host_edges._journal_root(self.home)
+        real_sync = repair_host_edges._sync_directory
+        sync_calls: list[Path] = []
+
+        def fail_publication_sync(path: Path, *, label: str) -> None:
+            del label
+            sync_calls.append(path)
+            if len(sync_calls) == 1:
+                raise HostEdgeRepairError("publication sync failed")
+            real_sync(path, label="host-edge rollback journal directory")
+
+        with patch.object(
+            repair_host_edges,
+            "_sync_directory",
+            side_effect=fail_publication_sync,
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "publication sync failed"):
+                repair_host_edges._write_rollback_journal(
+                    self.database,
+                    codex_home=self.home,
+                    edges=[edge],
+                    parent_thread_id=PARENT,
+                )
+
+        # The Windows publication path itself is write-through.  POSIX must
+        # additionally synchronize the journal directory after unlinking the
+        # failed publication.
+        if os.name != "nt":
+            self.assertGreaterEqual(len(sync_calls), 2)
+            self.assertEqual(sync_calls[0], sync_calls[1])
+        else:
+            self.assertEqual(len(sync_calls), 1)
+        self.assertFalse(list(journals.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")))
+
+    def test_journal_publication_failure_survives_cleanup_failure(self) -> None:
+        child = child_id(151)
+        self.add_edge(child, [event("task_complete")])
+        edge = self.edge(child)
+        journal_root = repair_host_edges._journal_root(self.home)
+        primary = HostEdgeRepairError("journal publication sync failed")
+
+        with (
+            patch.object(repair_host_edges, "_sync_directory", side_effect=primary),
+            patch.object(
+                repair_host_edges,
+                "_remove_journal_durably",
+                side_effect=OSError("journal cleanup failed"),
+            ) as cleanup,
+        ):
+            with self.assertRaisesRegex(
+                HostEdgeRepairError, "journal publication sync failed"
+            ) as raised:
+                repair_host_edges._write_rollback_journal(
+                    self.database,
+                    codex_home=self.home,
+                    edges=[edge],
+                    parent_thread_id=PARENT,
+                    journal_root=journal_root,
+                )
+
+        self.assertIs(raised.exception, primary)
+        self.assertEqual(cleanup.call_count, 1)
+        notes = getattr(raised.exception, "__notes__", [])
+        self.assertTrue(any("journal cleanup failed" in note for note in notes))
+
+    def test_first_use_journal_directory_publication_failure_leaves_edge_open(self) -> None:
+        child = child_id(149)
+        self.add_edge(child, [event("task_complete")])
+
+        with patch.object(
+            repair_host_edges,
+            "_replace_journal",
+            side_effect=OSError("directory publication failed"),
+        ):
+            with self.assertRaisesRegex(HostEdgeRepairError, "parent directory failed"):
+                self.repair([child])
+
+        self.assertEqual(self.status(child), "open")
+        self.assertFalse((self.home / "backups").exists())
+
+    def test_failed_repair_preserves_prior_rollback_journals(self) -> None:
+        child = child_id(142)
+        self.add_edge(child, [event("task_started"), event("task_complete")])
+        journals = self.home / "backups" / "cco-host-edge-repair"
+        journals.mkdir(parents=True)
+        prior = []
+        for index in range(ROLLBACK_RETENTION + 2):
+            journal = journals / (
+                f"{JOURNAL_PREFIX}20000101T00000{index}.000000Z-prior{index}{JOURNAL_SUFFIX}"
+            )
+            journal.write_text(f'{{"prior":{index}}}\n', encoding="utf-8")
+            prior.append(journal)
+        expected = {path.name: path.read_bytes() for path in prior}
+
+        with patch.object(
+            repair_host_edges,
+            "_verify_commit_proofs",
+            side_effect=HostEdgeRepairError("proof changed before repair commit"),
         ):
             with self.assertRaisesRegex(HostEdgeRepairError, "proof changed before repair commit"):
                 self.repair([child])
 
         self.assertEqual(self.status(child), "open")
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in journals.glob(f"{JOURNAL_PREFIX}*{JOURNAL_SUFFIX}")},
+            expected,
+        )
+
+    def test_retention_runs_only_after_committed_repair(self) -> None:
+        child = child_id(143)
+        self.add_edge(child, [event("task_started"), event("task_complete")])
+        real_prune = repair_host_edges._prune_rollback_journals
+        observed: list[str] = []
+
+        def prune_after_commit(journal: Path) -> None:
+            observed.append(self.status(child))
+            self.assertEqual(observed[-1], "closed")
+            real_prune(journal)
+
+        with patch.object(
+            repair_host_edges,
+            "_prune_rollback_journals",
+            side_effect=prune_after_commit,
+        ):
+            result = self.repair([child])
+
+        self.assertEqual(self.status(child), "closed")
+        self.assertEqual(observed, ["closed"])
+        self.assertEqual(result["warnings"], [])
 
     def test_journal_is_minimal_private_retained_and_journal_failure_rolls_back(self) -> None:
         child = child_id(15)

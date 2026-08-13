@@ -876,6 +876,10 @@ class V9HookTests(unittest.TestCase):
             def preflight_interrupt(_payload: object) -> bool:
                 return False
 
+            @staticmethod
+            def process_postflight_event(_payload: object) -> bool:
+                return False
+
         with patch.object(cco_hook, "_control", return_value=Control()):
             post = cco_hook.evaluate(
                 {
@@ -890,8 +894,18 @@ class V9HookTests(unittest.TestCase):
                     "tool_name": "interrupt_agent",
                 }
             )
+            interrupt_post = cco_hook.evaluate(
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_input": {"target": "unmanaged_task"},
+                    "tool_name": "interrupt_agent",
+                    "tool_response": {"previous_status": "running"},
+                    "tool_use_id": "unmanaged-interrupt",
+                }
+            )
         self.assertEqual(post, {})
         self.assertEqual(interrupt, {})
+        self.assertEqual(interrupt_post, {})
 
     def test_ambiguous_session_state_blocks_raw_managed_message(self) -> None:
         class Control:

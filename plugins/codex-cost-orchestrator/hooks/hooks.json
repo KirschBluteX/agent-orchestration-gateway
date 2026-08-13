@@ -61,7 +61,7 @@
     ],
     "SubagentStop": [
       {
-        "matcher": "cost_orchestrator_read_leaf|cost_orchestrator_write_leaf",
+        "matcher": "^(cost_orchestrator_read_leaf|cost_orchestrator_write_leaf)$",
         "hooks": [
           {
             "type": "command",

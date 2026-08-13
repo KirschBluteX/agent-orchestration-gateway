@@ -22,7 +22,7 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 Doctor rejects missing, duplicate, or unknown CCO Hook definitions from the authoritative host
 inventory.
 
-CCO is pre-1.0. Version `0.9.2` is the plain public, installer, and manifest identity: it has no
+CCO is pre-1.0. Version `0.9.3` is the plain public, installer, and manifest identity: it has no
 build metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
 through 5.x are compressed into pre-0.9 development history; Git history remains unchanged.
 Current records are `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. If predecessor state,
@@ -37,11 +37,11 @@ Use the single canonical preparation command:
 python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <PROJECT> --capacity <N>
 ```
 
-Send a closed `cco.delegation.v1` envelope on stdin. Each repository scope is an exact or prefix
-object. Invoke returned `tool_name` values only with their supplied `tool_input`. `next` advances a
-settled plan. After dispatch, repeat long `wait_agent` windows until completion or required
-attention. A `timed_out` result means another long wait, not a retry, progress report, or duplicate
-execution.
+Send a closed `cco.delegation.v1` envelope with 1–128 nodes on stdin. Each repository scope is an
+exact or prefix object. Invoke returned `tool_name` values only with their supplied `tool_input`.
+`next` advances a settled plan. After dispatch, repeat long `wait_agent` windows until completion
+or required attention. A `timed_out` result means another long wait, not a retry, progress report,
+or duplicate execution.
 
 The default `trusted_host` policy supports the opaque whole-message input emitted by current Codex
 Desktop builds. Preflight requires one uniquely matching prepared visible envelope and durably
@@ -66,10 +66,12 @@ paused work. Do not edit lifecycle JSON by hand.
 
 ## Experimental cooperative writers
 
-Cooperative isolation is opt-in and accepts only two independent, non-overlapping fresh writers,
-optionally followed by the compiler's single final reviewer.
-Clean Git workspaces receive managed worktrees; dirty Git and directory workspaces receive bounded
-copies. CCO stages exact backups and a bounded apply journal before integration. Successful cleanup
+Cooperative isolation is opt-in. It admits the largest pairwise-disjoint set of fresh writers that
+fits the requested native capacity, with a four-writer safety ceiling, optionally followed by the
+compiler's single final reviewer. Clean Git workspaces receive managed worktrees; dirty Git and
+directory workspaces receive bounded copies. File, byte, and journal limits are aggregate wave
+budgets rather than per-writer allowances. CCO stages exact backups and one bounded apply journal
+before integration. Successful cleanup
 removes completed isolate and journal material; incomplete journals and backups are retained until
 rollback or explicit intervention. This is a coordination boundary, not a sandbox.
 

@@ -30,20 +30,31 @@ from workspace_guard import WorkspaceGuardError, discover_workspace
 
 
 PLUGIN_ID = "codex-cost-orchestrator@codex-cost-orchestrator"
-PLUGIN_VERSION = "0.9.2"
+PLUGIN_VERSION = "0.9.3"
 PLUGIN_RELEASE = PLUGIN_VERSION
 PROFILES = {
     "read": ("codex-cost-orchestrator-read-leaf.toml", "cost_orchestrator_read_leaf"),
     "write": ("codex-cost-orchestrator-write-leaf.toml", "cost_orchestrator_write_leaf"),
 }
-EXPECTED_HOOKS = Counter(
-    {
-        "sessionStart": 1,
-        "preToolUse": 1,
-        "postToolUse": 1,
-        "stop": 1,
-        "subagentStop": 1,
-    }
+
+# These names and matchers are the host-facing contract. Keep them independent
+# of hooks.json so a damaged local manifest cannot redefine what doctor accepts.
+HOST_HOOK_CONTRACT: tuple[tuple[str, str | None], ...] = (
+    ("sessionStart", None),
+    (
+        "preToolUse",
+        "^(Agent|spawn_agent|collaborationspawn_agent|send_message|followup_task|"
+        "collaborationsend_message|collaborationfollowup_task|interrupt_agent|"
+        "interruptAgent|collaborationinterrupt_agent)$",
+    ),
+    (
+        "postToolUse",
+        "^(Agent|spawn_agent|collaborationspawn_agent|followup_task|"
+        "collaborationfollowup_task|interrupt_agent|interruptAgent|"
+        "collaborationinterrupt_agent)$",
+    ),
+    ("stop", None),
+    ("subagentStop", "^(cost_orchestrator_read_leaf|cost_orchestrator_write_leaf)$"),
 )
 
 
@@ -60,6 +71,108 @@ def compressed_rollout_supported() -> bool:
 
 class InstallError(RuntimeError):
     pass
+
+
+def _canonical_hook_schema(
+    hook_value: object,
+    *,
+    plugin_root: Path,
+) -> Counter[tuple[str, str | None, str, str, int | float, str]]:
+    """Translate hooks.json into the Hook fields reported by Codex."""
+
+    if not isinstance(hook_value, dict) or not hook_value:
+        raise ValueError("Hook definition has no lifecycle entries")
+    command_key = "commandWindows" if os.name == "nt" else "command"
+    schema: Counter[tuple[str, str | None, str, str, int | float, str]] = Counter()
+    for lifecycle, groups in hook_value.items():
+        if not isinstance(lifecycle, str) or not lifecycle or not isinstance(groups, list):
+            raise ValueError("Hook lifecycle definition is malformed")
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ValueError("Hook matcher group is malformed")
+            matcher = group.get("matcher")
+            handlers = group.get("hooks")
+            if (
+                (matcher is not None and not isinstance(matcher, str))
+                or not isinstance(handlers, list)
+                or not handlers
+            ):
+                raise ValueError("Hook matcher group is incomplete")
+            for handler in handlers:
+                if not isinstance(handler, dict):
+                    raise ValueError("Hook handler is malformed")
+                handler_type = handler.get("type")
+                command = handler.get(command_key)
+                timeout = handler.get("timeout")
+                status_message = handler.get("statusMessage")
+                if (
+                    not isinstance(handler_type, str)
+                    or not isinstance(handler.get("command"), str)
+                    or not isinstance(handler.get("commandWindows"), str)
+                    or not isinstance(command, str)
+                    or not isinstance(timeout, (int, float))
+                    or isinstance(timeout, bool)
+                    or not isinstance(status_message, str)
+                    or not isinstance(handler.get("async"), bool)
+                ):
+                    raise ValueError("Hook handler is incomplete")
+                schema[
+                    (
+                        lifecycle[:1].lower() + lifecycle[1:],
+                        matcher,
+                        handler_type,
+                        command.replace("${PLUGIN_ROOT}", str(plugin_root)),
+                        timeout,
+                        status_message,
+                    )
+                ] += 1
+    if not schema:
+        raise ValueError("Hook definition has no handlers")
+    return schema
+
+
+def _inventory_hook_schema(
+    item: Mapping[str, object],
+) -> tuple[str, str | None, str, str, int | float, str]:
+    event_name = item["eventName"]
+    matcher = item["matcher"]
+    handler_type = item["handlerType"]
+    command = item["command"]
+    timeout = item["timeoutSec"]
+    status_message = item["statusMessage"]
+    if (
+        not isinstance(event_name, str)
+        or (matcher is not None and not isinstance(matcher, str))
+        or not isinstance(handler_type, str)
+        or not isinstance(command, str)
+        or not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not isinstance(status_message, str)
+    ):
+        raise ValueError("Hook inventory definition is malformed")
+    return event_name, matcher, handler_type, command, timeout, status_message
+
+
+def _validate_local_hook_contract(hook_value: object) -> None:
+    """Ensure the shipped manifest still declares the fixed host surface."""
+
+    if not isinstance(hook_value, dict):
+        raise ValueError("Hook lifecycle definition is malformed")
+    expected_lifecycles = {
+        event[:1].upper() + event[1:] for event, _matcher in HOST_HOOK_CONTRACT
+    }
+    if set(hook_value) != expected_lifecycles:
+        raise ValueError("Hook lifecycle surface is incomplete or contains unknown entries")
+    for event, expected_matcher in HOST_HOOK_CONTRACT:
+        lifecycle = event[:1].upper() + event[1:]
+        groups = hook_value.get(lifecycle)
+        if (
+            not isinstance(groups, list)
+            or len(groups) != 1
+            or not isinstance(groups[0], dict)
+            or groups[0].get("matcher") != expected_matcher
+        ):
+            raise ValueError(f"{lifecycle} Hook matcher is not canonical")
 
 
 def _default_target() -> Path:
@@ -341,16 +454,22 @@ def doctor(
     plugin_root = Path(__file__).resolve().parents[1]
     manifest = plugin_root / ".codex-plugin" / "plugin.json"
     hooks = plugin_root / "hooks" / "hooks.json"
+    canonical_hook_schema: Counter[
+        tuple[str, str | None, str, str, int | float, str]
+    ] | None = None
     try:
         manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
         if manifest_value.get("version") != PLUGIN_RELEASE:
             errors.append("plugin manifest version does not match the installer")
         hook_value = json.loads(hooks.read_text(encoding="utf-8"))["hooks"]
-        if set(hook_value) != {"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SubagentStop"}:
-            errors.append("Hook lifecycle surface is incomplete")
-        if '"matcher": ".*"' in hooks.read_text(encoding="utf-8"):
+        _validate_local_hook_contract(hook_value)
+        canonical_hook_schema = _canonical_hook_schema(
+            hook_value,
+            plugin_root=plugin_root,
+        )
+        if any(entry[1] == ".*" for entry in canonical_hook_schema):
             errors.append("global all-tool Hook matcher is forbidden")
-    except (OSError, UnicodeError, json.JSONDecodeError, KeyError):
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         errors.append("plugin manifest or Hook definition is unreadable")
     if check(target) != 0:
         errors.append("installed CCO profiles are not ready")
@@ -361,20 +480,46 @@ def doctor(
             for item in inventory.get("hooks", [])
             if isinstance(item, dict) and item.get("pluginId") == PLUGIN_ID
         ]
+        expected_events = Counter(event for event, _matcher in HOST_HOOK_CONTRACT)
+        expected_matchers = dict(HOST_HOOK_CONTRACT)
         counts: Counter[str] = Counter()
         unknown_definitions = False
         for item in discovered:
             event = item.get("eventName")
-            if not isinstance(event, str) or event not in EXPECTED_HOOKS:
+            if not isinstance(event, str) or event not in expected_events:
                 unknown_definitions = True
                 continue
             counts[event] += 1
-        if any(counts[event] < count for event, count in EXPECTED_HOOKS.items()):
-            errors.append("Codex did not discover every current CCO Hook")
-        if any(counts[event] > count for event, count in EXPECTED_HOOKS.items()):
+            # Older hosts omitted detailed fields. When a matcher is present,
+            # still bind it to the fixed event contract.
+            if "matcher" in item and item.get("matcher") != expected_matchers[event]:
+                errors.append(f"Codex {event} Hook matcher is not canonical")
+        if any(counts[event] < count for event, count in expected_events.items()):
+            errors.append("Codex did not discover every required CCO Hook")
+        if any(counts[event] > count for event, count in expected_events.items()):
             errors.append("Codex discovered duplicate CCO Hook definitions")
         if unknown_definitions:
             errors.append("Codex discovered unknown CCO Hook definitions")
+        if canonical_hook_schema is not None:
+            schema_fields = (
+                "matcher",
+                "handlerType",
+                "command",
+                "timeoutSec",
+                "statusMessage",
+            )
+            if any(any(field in item for field in schema_fields) for item in discovered):
+                try:
+                    discovered_schema = Counter(
+                        _inventory_hook_schema(item) for item in discovered
+                    )
+                except (KeyError, TypeError, ValueError):
+                    errors.append("Codex returned incomplete CCO Hook definitions")
+                else:
+                    if discovered_schema != canonical_hook_schema:
+                        errors.append(
+                            "Codex Hook definitions do not match the canonical local Hook schema"
+                        )
         if any(
             item.get("enabled") is not True
             or str(item.get("trustStatus", "")).casefold() not in {"managed", "trusted"}

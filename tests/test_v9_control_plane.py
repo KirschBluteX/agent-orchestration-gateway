@@ -146,10 +146,12 @@ class V9ControlPlaneTests(unittest.TestCase):
         return node
 
     def start_dispatch(self, control: ControlPlane, native: dict[str, object]) -> tuple[str, str]:
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        tool_use_id = "call-" + dispatch_id[7:19]
         control.preflight_spawn(
             {
                 "tool_input": native,
-                "tool_use_id": "call-1",
+                "tool_use_id": tool_use_id,
             }
         )
         owner = "/root/" + str(native["task_name"])
@@ -157,10 +159,9 @@ class V9ControlPlaneTests(unittest.TestCase):
             {
                 "tool_input": native,
                 "tool_response": {"task_name": owner},
-                "tool_use_id": "call-1",
+                "tool_use_id": tool_use_id,
             }
         )
-        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
         return dispatch_id, owner
 
     def test_trusted_host_opaque_spawn_binds_the_observed_ciphertext(self) -> None:
@@ -256,6 +257,76 @@ class V9ControlPlaneTests(unittest.TestCase):
             if item.get("owner") == owner and item.get("state") == "running"
         ]
         self.assertEqual(len(running), 1)
+
+    def test_consumed_opaque_attempt_cannot_bind_a_later_reuse(self) -> None:
+        control = self.control("opaque-cross-attempt")
+        nodes = [
+            self.node("first", "A01", "a.txt"),
+            self.node("second", "A02", "a.txt", depends_on=["first"]),
+            self.node("third", "A03", "a.txt", depends_on=["second"]),
+        ]
+        control.create_plan(self.repo, self.brief(nodes))
+        first_action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        first_id, owner = self.start_dispatch(control, first_action["tool_input"])
+        control.record_result(
+            owner,
+            result_text(first_id, evidence={"A01": "first complete"}),
+        )
+
+        second_action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        second_native = second_action["tool_input"]
+        second_opaque = {**second_native, "message": "gAAAA" + ("r" * 100)}
+        second_payload = {
+            "tool_input": second_opaque,
+            "tool_use_id": "opaque-replayed-call",
+        }
+        control.preflight_opaque_followup(second_payload)
+        control.process_postflight_event(
+            {**second_payload, "tool_response": {}},
+            opaque_message=True,
+        )
+        second_id = parse_task_message(second_native["message"])["dispatch_id"]
+        control.record_result(
+            owner,
+            result_text(second_id, evidence={"A02": "second complete"}),
+        )
+
+        third_action = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]
+        third_native = third_action["tool_input"]
+        self.assertEqual(third_native["target"], owner)
+        replayed = {**second_opaque, "target": owner}
+        with self.assertRaisesRegex(ControlPlaneError, "reuses a completed"):
+            control.preflight_opaque_followup(
+                {
+                    "tool_input": replayed,
+                    "tool_use_id": "opaque-replayed-call",
+                }
+            )
+        with self.assertRaisesRegex(ControlPlaneError, "reuses a completed"):
+            control.preflight_opaque_followup(
+                {
+                    "tool_input": replayed,
+                    "tool_use_id": "opaque-new-call",
+                }
+            )
+        with self.assertRaisesRegex(ControlPlaneError, "no matching preflight"):
+            control.process_postflight_event(
+                {**second_payload, "tool_response": {}},
+                opaque_message=True,
+            )
+        third_id = parse_task_message(third_native["message"])["dispatch_id"]
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["dispatches"][third_id]["state"], "starting")
+        self.assertIsNone(state["dispatches"][third_id]["receipt_id"])
 
     def test_trusted_host_opaque_continuation_advances_the_cursor(self) -> None:
         control = self.control("opaque-continuation")
@@ -389,6 +460,23 @@ class V9ControlPlaneTests(unittest.TestCase):
             native_catalog=catalog("gpt-5.6-terra"),
         )["dispatches"]
         self.assertEqual(len(actions), 2)
+        return control, actions
+
+    def cooperative_actions_for_nodes(
+        self,
+        session: str,
+        nodes: list[dict[str, object]],
+        *,
+        capacity: int,
+    ) -> tuple[ControlPlane, list[dict[str, object]]]:
+        control = self.control(session)
+        plan = self.brief(nodes)
+        plan["writer_isolation"] = "cooperative"
+        control.create_plan(self.repo, plan)
+        actions = control.next_wave(
+            capacity=capacity,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"]
         return control, actions
 
     def assert_no_live_batch_receipts(self, control: ControlPlane) -> None:
@@ -1824,6 +1912,66 @@ class V9ControlPlaneTests(unittest.TestCase):
             1,
         )
 
+    def test_task_name_interrupt_settles_ownerless_running_spawn(self) -> None:
+        control = self.control("interrupt-ownerless")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        spawn_call = "ownerless-spawn"
+        control.preflight_spawn(
+            {"tool_input": native, "tool_use_id": spawn_call}
+        )
+        control.process_postflight_event(
+            {
+                "tool_input": native,
+                "tool_response": {},
+                "tool_use_id": spawn_call,
+            }
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["dispatches"][dispatch_id]["state"], "running")
+        self.assertIsNone(state["dispatches"][dispatch_id]["owner"])
+
+        target = str(native["task_name"])
+        self.assertTrue(control.owner_is_managed(target))
+        interrupt_call = "ownerless-interrupt"
+        self.assertTrue(
+            control.preflight_interrupt(
+                {
+                    "tool_input": {"target": target},
+                    "tool_use_id": interrupt_call,
+                }
+            )
+        )
+        self.assertTrue(
+            control.process_postflight_event(
+                {
+                    "tool_input": {"target": target},
+                    "tool_response": {"previous_status": "running"},
+                    "tool_use_id": interrupt_call,
+                }
+            )
+        )
+        self.assertEqual(control.status()["counts"]["fenced"], 1)
+
+    def test_unmanaged_interrupt_postflight_is_inert(self) -> None:
+        control = self.control("interrupt-unmanaged")
+        self.assertFalse(
+            control.postflight_interrupt(
+                {
+                    "tool_input": {"target": "unmanaged_task"},
+                    "tool_response": {"previous_status": "running"},
+                    "tool_use_id": "unmanaged-interrupt",
+                }
+            )
+        )
+
     def test_natural_result_wins_interrupt_postflight_race(self) -> None:
         control = self.control("interrupt-race")
         control.create_plan(self.repo, self.brief([self.node("n01", "A01", "a.txt")]))
@@ -1893,6 +2041,48 @@ class V9ControlPlaneTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_expired_interrupt_becomes_unresolved_and_requires_restart(self) -> None:
+        control = self.control("interrupt-expired")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        control.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "expired-interrupt"}
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        state["dispatches"][dispatch_id]["interrupt_claim_expires_at"] = 1
+        control.state_path.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        control.status()
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        self.assertTrue(dispatch["interrupt_unresolved"])
+        self.assertIsNone(dispatch["interrupt_receipt_id"])
+        self.assertIsNone(dispatch["interrupt_tool_use_id"])
+        self.assertIsNone(dispatch["interrupt_claim_expires_at"])
+        remaining = [
+            control._read_pending_event(path)
+            for path in self.state_root.glob(".cco-pending-*.event")
+        ]
+        self.assertTrue(
+            all(event.get("kind") != "interrupt_attempt" for event in remaining)
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "unresolved interrupt"):
+            control.preflight_interrupt(
+                {"tool_input": {"target": owner}, "tool_use_id": "new-interrupt"}
+            )
+        self.assertGreaterEqual(control.restart(), 1)
+        self.assertEqual(control.status()["counts"]["fenced"], 1)
 
     def test_paused_continuation_rejects_out_of_scope_change(self) -> None:
         control = self.control()
@@ -3683,6 +3873,473 @@ class V9ControlPlaneTests(unittest.TestCase):
         )["dispatches"][0]
 
         self.assertEqual(next_action["action"], "spawn_new_owner")
+
+    def test_interrupt_replay_uses_receipt_target_and_rejects_spoofed_alias(self) -> None:
+        control = self.control("interrupt-replay-target")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        control.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": "replay-target"}
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        receipt = control._interrupt_attempt_for_dispatch(dispatch)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+
+        observed = dict(receipt)
+        observed["previous_status"] = "running"
+        observed["phase"] = "observed"
+        control._write_interrupt_attempt_receipt(observed)
+        self.assertGreaterEqual(control.replay_pending_events(), 1)
+        self.assertEqual(control.status()["counts"]["fenced"], 1)
+
+        spoof = self.control("interrupt-spoofed-target")
+        spoof.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        spoof_native = spoof.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _spoof_id, spoof_owner = self.start_dispatch(spoof, spoof_native)
+        canonical_spoof = "/root/unrelated/" + str(spoof_native["task_name"])
+        self.assertFalse(
+            spoof.preflight_interrupt(
+                {
+                    "tool_input": {"target": canonical_spoof},
+                    "tool_use_id": "spoofed-target",
+                }
+            )
+        )
+        self.assertTrue(
+            spoof.preflight_interrupt(
+                {"tool_input": {"target": spoof_owner}, "tool_use_id": "safe-target"}
+            )
+        )
+
+    def test_interrupt_duplicate_preflight_requires_the_stored_target(self) -> None:
+        control = self.control("interrupt-idempotent-target")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        _dispatch_id, owner = self.start_dispatch(control, native)
+        call_id = "same-interrupt-call"
+        self.assertTrue(
+            control.preflight_interrupt(
+                {"tool_input": {"target": owner}, "tool_use_id": call_id}
+            )
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "target changed"):
+            control.preflight_interrupt(
+                {
+                    "tool_input": {"target": str(native["task_name"])},
+                    "tool_use_id": call_id,
+                }
+            )
+
+    def test_interrupt_settlement_unlinks_receipt_in_its_authoritative_write(self) -> None:
+        control = self.control("interrupt-single-write-settlement")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id, owner = self.start_dispatch(control, native)
+        tool_use_id = "single-write-interrupt"
+        control.preflight_interrupt(
+            {"tool_input": {"target": owner}, "tool_use_id": tool_use_id}
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        receipt = control._interrupt_attempt_for_dispatch(
+            state["dispatches"][dispatch_id]
+        )
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        observed = dict(receipt)
+        observed["phase"] = "observed"
+        observed["previous_status"] = "completed"
+        observed = control._write_interrupt_attempt_receipt(observed)
+
+        self.assertTrue(
+            control._settle_interrupt_event(
+                {
+                    "kind": "interrupt_attempt_observation",
+                    "previous_status": "completed",
+                    "target": owner,
+                    "tool_use_id": tool_use_id,
+                },
+                receipt=observed,
+            )
+        )
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        self.assertIsNone(dispatch["interrupt_receipt_id"])
+        self.assertIsNone(dispatch["interrupt_tool_use_id"])
+        self.assertIsNone(dispatch["interrupt_claim_expires_at"])
+        self.assertFalse(dispatch["interrupt_unresolved"])
+        self.assertEqual(dispatch["state"], "running")
+        self.assertGreaterEqual(control.replay_pending_events(), 1)
+        remaining = [
+            control._read_pending_event(path)
+            for path in self.state_root.glob(".cco-pending-*.event")
+        ]
+        self.assertTrue(
+            all(event.get("kind") != "interrupt_attempt" for event in remaining)
+        )
+
+    def test_native_failure_consumes_one_call_id_but_allows_a_new_retry(self) -> None:
+        control = self.control("native-failure-consumed-call")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "failed-call"})
+        control.settle_native_failure(dispatch_id, "service")
+
+        with self.assertRaisesRegex(ControlPlaneError, "reuses a completed"):
+            control.preflight_spawn(
+                {"tool_input": native, "tool_use_id": "failed-call"}
+            )
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "fresh-call"})
+
+    def test_native_failure_crash_keeps_the_consumed_call_anchor(self) -> None:
+        control = self.control("native-failure-crash-anchor")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "crashed-call"})
+        write_state = control._write_state
+
+        def publish_then_report_uncertain(state: dict[str, object]) -> None:
+            write_state(state)
+            raise control_plane_module._AtomicWriteUncertain(
+                "simulated native-failure state sync failure"
+            )
+
+        with patch.object(
+            control,
+            "_write_state",
+            side_effect=publish_then_report_uncertain,
+        ):
+            with self.assertRaises(control_plane_module._AtomicWriteUncertain):
+                control.settle_native_failure(dispatch_id, "service")
+
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertIn(
+            "crashed-call",
+            [item.get("tool_use_id") for item in state["tombstones"]],
+        )
+        with self.assertRaisesRegex(ControlPlaneError, "reuses a completed"):
+            control.preflight_spawn(
+                {"tool_input": native, "tool_use_id": "crashed-call"}
+            )
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "fresh-call"})
+
+    def test_late_postflight_after_native_failure_is_inert_against_a_fresh_retry(self) -> None:
+        control = self.control("late-postflight-native-failure")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        owner = "/root/" + str(native["task_name"])
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "failed-call"})
+        control.settle_native_failure(dispatch_id, "service")
+        control.preflight_spawn({"tool_input": native, "tool_use_id": "fresh-call"})
+
+        self.assertFalse(
+            control.process_postflight_event(
+                {
+                    "tool_input": native,
+                    "tool_response": {"task_name": owner},
+                    "tool_use_id": "failed-call",
+                }
+            )
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        dispatch = state["dispatches"][dispatch_id]
+        self.assertEqual(dispatch["state"], "starting")
+        self.assertEqual(dispatch["tool_use_id"], "fresh-call")
+
+    def test_opaque_anchor_capacity_retains_the_original_ciphertext_proof(self) -> None:
+        control = self.control("opaque-anchor-capacity")
+        nodes = [
+            self.node("first", "A01", "a.txt"),
+            self.node("second", "A02", "a.txt", depends_on=["first"]),
+        ]
+        control.create_plan(self.repo, self.brief(nodes))
+        first_native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        first_opaque = {**first_native, "message": "gAAAA" + ("o" * 100)}
+        first_id = parse_task_message(first_native["message"])["dispatch_id"]
+        owner = "/root/" + str(first_native["task_name"])
+        control.preflight_spawn(
+            {"tool_input": first_opaque, "tool_use_id": "opaque-first-call"},
+            opaque_message=True,
+        )
+        control.process_postflight_event(
+            {
+                "tool_input": first_opaque,
+                "tool_response": {"task_name": owner},
+                "tool_use_id": "opaque-first-call",
+            },
+            opaque_message=True,
+        )
+        control.record_result(
+            owner,
+            result_text(first_id, evidence={"A01": "first complete"}),
+        )
+        opaque_digest = control_plane_module._digest(
+            b"cco.native-input.v1\0", first_opaque
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        opaque_anchor = next(
+            item
+            for item in state["tombstones"]
+            if item.get("tool_input_sha256") == opaque_digest
+        )
+        state["tombstones"] = [
+            opaque_anchor,
+            *[
+                {
+                    "cursor": 0,
+                    "dispatch_id": first_id,
+                    "owner": owner,
+                    "reason": "native_attempt_consumed",
+                    "tool_input_sha256": "sha256:" + ("b" * 64),
+                    "tool_use_id": f"retained-anchor-{index}",
+                }
+                for index in range(control_plane_module.MAX_TOMBSTONES - 1)
+            ],
+        ]
+        control.state_path.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        second_native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        second_opaque = {**second_native, "message": "gAAAA" + ("p" * 100)}
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "replay-anchor capacity"):
+            control.preflight_opaque_followup(
+                {"tool_input": second_opaque, "tool_use_id": "opaque-second-call"}
+            )
+        persisted = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertIn(opaque_anchor, persisted["tombstones"])
+
+    def test_tombstone_anchor_capacity_fails_closed(self) -> None:
+        control = self.control("tombstone-anchor-capacity")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        control.preflight_spawn(
+            {"tool_input": native, "tool_use_id": "capacity-failure-call"}
+        )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        state["tombstones"] = [
+            {
+                "cursor": 0,
+                "dispatch_id": dispatch_id,
+                "owner": None,
+                "reason": "native_attempt_consumed",
+                "tool_input_sha256": "sha256:" + ("a" * 64),
+                "tool_use_id": "anchor-call",
+            }
+            for _ in range(control_plane_module.MAX_TOMBSTONES)
+        ]
+        control.state_path.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ControlPlaneUnavailable, "replay-anchor capacity"):
+            control.settle_native_failure(dispatch_id, "service")
+
+    def test_tombstone_anchor_capacity_blocks_before_native_admission(self) -> None:
+        control = self.control("tombstone-anchor-preflight-capacity")
+        control.create_plan(
+            self.repo,
+            self.brief([self.node("n01", "A01", "a.txt")]),
+        )
+        native = control.next_wave(
+            capacity=1,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"][0]["tool_input"]
+        dispatch_id = parse_task_message(native["message"])["dispatch_id"]
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        state["tombstones"] = [
+            {
+                "cursor": 0,
+                "dispatch_id": dispatch_id,
+                "owner": None,
+                "reason": "native_attempt_consumed",
+                "tool_use_id": f"retained-call-{index}",
+            }
+            for index in range(control_plane_module.MAX_TOMBSTONES)
+        ]
+        control.state_path.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ControlPlaneUnavailable,
+            "replay-anchor capacity is exhausted before native admission",
+        ):
+            control.preflight_spawn(
+                {"tool_input": native, "tool_use_id": "must-not-run"}
+            )
+        state = json.loads(control.state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(state["dispatches"][dispatch_id]["receipt_id"])
+        self.assertIsNone(state["dispatches"][dispatch_id]["tool_use_id"])
+        self.assertEqual(list(self.state_root.glob(".cco-pending-*.event")), [])
+
+    def test_three_writer_cooperative_wave_is_bounded_and_settles_all_members(self) -> None:
+        nodes = [
+            self.node("left", "A01", "a.txt"),
+            self.node("middle", "A02", "b.txt"),
+            self.node("right", "A03", "c.txt"),
+        ]
+        control, actions = self.cooperative_actions_for_nodes(
+            "cooperative-three-writers", nodes, capacity=3
+        )
+        self.assertEqual(len(actions), 3)
+        tasks = [parse_task_message(action["tool_input"]["message"]) for action in actions]
+        owners = [self.start_dispatch(control, action["tool_input"])[1] for action in actions]
+        for task in tasks:
+            path = task["scopes"][0]["path"]
+            (Path(task["workspace_root"]) / path).write_text("changed\n", encoding="utf-8")
+        for index, task in enumerate(tasks):
+            settled = control.record_result(
+                owners[index],
+                result_text(
+                    task["dispatch_id"],
+                    changed_paths=[task["scopes"][0]["path"]],
+                    evidence={next(iter(task["acceptance"])): "complete"},
+                ),
+            )
+        self.assertEqual(settled["state"], "retired")
+        self.assertEqual(control.status()["counts"]["retired"], 3)
+        self.assertEqual((self.repo / "a.txt").read_text(encoding="utf-8"), "changed\n")
+        self.assertEqual((self.repo / "b.txt").read_text(encoding="utf-8"), "changed\n")
+        self.assertEqual((self.repo / "c.txt").read_text(encoding="utf-8"), "changed\n")
+
+    def test_cooperative_wave_fills_capacity_up_to_its_explicit_safety_bound(self) -> None:
+        (self.repo / "d.txt").write_text("d0\n", encoding="utf-8")
+        (self.repo / "e.txt").write_text("e0\n", encoding="utf-8")
+        nodes = [
+            self.node(f"writer_{index}", f"A0{index}", f"{name}.txt")
+            for index, name in enumerate(("a", "b", "c", "d", "e"), start=1)
+        ]
+        control, actions = self.cooperative_actions_for_nodes(
+            "cooperative-safety-bound",
+            nodes,
+            capacity=5,
+        )
+
+        self.assertEqual(len(actions), control_plane_module.MAX_COOPERATIVE_WRITERS)
+        selected = {
+            parse_task_message(action["tool_input"]["message"])["members"][0]["id"]
+            for action in actions
+        }
+        self.assertEqual(len(selected), control_plane_module.MAX_COOPERATIVE_WRITERS)
+        status = control.status()
+        self.assertEqual(status["counts"]["starting"], 4)
+        self.assertEqual(status["counts"]["ready"], 1)
+
+    def test_cooperative_capacity_reclaims_a_settled_wave_for_the_next_pair(self) -> None:
+        nodes = [
+            self.node("left", "A01", "a.txt"),
+            self.node("middle", "A02", "b.txt"),
+            self.node("right", "A03", "c.txt"),
+            self.node("tail", "A04", "d.txt"),
+        ]
+        control, actions = self.cooperative_actions_for_nodes(
+            "cooperative-two-waves", nodes, capacity=2
+        )
+        self.assertEqual(len(actions), 2)
+        for action in actions:
+            task = parse_task_message(action["tool_input"]["message"])
+            owner = self.start_dispatch(control, action["tool_input"])[1]
+            path = task["scopes"][0]["path"]
+            (Path(task["workspace_root"]) / path).write_text("changed\n", encoding="utf-8")
+            control.record_result(
+                owner,
+                result_text(
+                    task["dispatch_id"],
+                    changed_paths=[path],
+                    evidence={next(iter(task["acceptance"])): "complete"},
+                ),
+            )
+
+        next_actions = control.next_wave(
+            capacity=2,
+            native_catalog=catalog("gpt-5.6-terra"),
+        )["dispatches"]
+        self.assertEqual(len(next_actions), 2)
+        next_tasks = [
+            parse_task_message(action["tool_input"]["message"])
+            for action in next_actions
+        ]
+        self.assertTrue(
+            all(task["workspace_root"] != str(self.repo) for task in next_tasks)
+        )
+
+    def test_cooperative_capacity_reason_is_observable(self) -> None:
+        plan = self.brief(
+            [
+                self.node("left", "A01", "a.txt"),
+                self.node("right", "A02", "b.txt"),
+            ]
+        )
+        plan["writer_isolation"] = "cooperative"
+        control = self.control("cooperative-capacity-reason")
+        control.create_plan(self.repo, plan)
+        wave = control.next_wave(capacity=1, native_catalog=catalog("gpt-5.6-terra"))
+        self.assertEqual(wave["cooperative_reason"], "cooperative_capacity_below_two")
+        self.assertEqual(len(wave["dispatches"]), 1)
 
     def test_receipt_rejects_fields_that_exceed_its_durable_bound(self) -> None:
         control = self.control("oversized-receipt-field")

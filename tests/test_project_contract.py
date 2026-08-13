@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
 ORCHESTRATE = PLUGIN / "skills" / "orchestrate"
 MANAGE = PLUGIN / "skills" / "manage-cco"
-RELEASE = "0.9.2"
+RELEASE = "0.9.3"
 RELEASE_DOCUMENTS = (
     "CHANGELOG.md",
     "README.md",
@@ -42,7 +42,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertIn("[English](README.md)", chinese)
         self.assertEqual(manifest["name"], "codex-cost-orchestrator")
         self.assertEqual(manifest["version"], RELEASE)
-        self.assertIn('PLUGIN_VERSION = "0.9.2"', installer)
+        self.assertIn('PLUGIN_VERSION = "0.9.3"', installer)
         self.assertIn("PLUGIN_RELEASE = PLUGIN_VERSION", installer)
         self.assertNotIn("PLUGIN_BUILD_METADATA", installer)
         for document in release_documents:
@@ -50,7 +50,7 @@ class ProjectContractTests(unittest.TestCase):
         self.assertNotRegex(release_surface, r"\b0\.9\.0\+[A-Za-z0-9.-]+\b")
         self.assertNotRegex(release_surface, r"\bcodex\.\d{14}\b")
         self.assertNotRegex(release_surface, r"\b[1-9]\d*\.\d+\.\d+(?:\+[A-Za-z0-9.-]+)?\b")
-        self.assertRegex(changelog, r"(?m)^## 0\.9\.2 - 2026-08-11$")
+        self.assertRegex(changelog, r"(?m)^## 0\.9\.3 - 2026-08-12$")
         self.assertIn("pre-1.0", changelog)
         self.assertIn("2.x through 5.x", changelog)
         self.assertIn("pre-0.9 development history", changelog)
@@ -63,12 +63,19 @@ class ProjectContractTests(unittest.TestCase):
     def test_hot_path_uses_one_prepare_command_and_a_quiet_wait(self) -> None:
         agents = text(ROOT / "AGENTS.md")
         hot = text(ORCHESTRATE / "SKILL.md")
-        self.assertLessEqual(len(re.findall(r"\S+", hot)), 360)
+        self.assertLessEqual(len(re.findall(r"\S+", hot)), 480)
         self.assertIn("control_plane.py prepare --repo <WORKSPACE> --capacity <N>", hot)
         self.assertEqual(hot.count("control_plane.py prepare"), 1)
         self.assertIn("timed_out", hot)
         self.assertIn("without progress narration", hot)
-        self.assertIn("below 30 seconds", agents)
+        self.assertIn("total upper bound under", hot)
+        self.assertIn("do not spawn an unprepared", hot)
+        self.assertIn("not a route, lifecycle", hot)
+        self.assertIn("same live dispatch", hot)
+        self.assertIn("CCO lifecycle or status checks", hot)
+        self.assertIn("one owner per code revision", hot)
+        self.assertIn("total upper bound under", agents)
+        self.assertNotIn("bounded below 30 seconds", hot + agents)
         self.assertNotIn("control_plane.py plan", hot)
         self.assertNotIn("migrate-recoveries", hot)
         self.assertIn("allow_implicit_invocation: true", text(ORCHESTRATE / "agents" / "openai.yaml"))
@@ -102,6 +109,11 @@ class ProjectContractTests(unittest.TestCase):
         self.assertNotIn("migrate-recoveries", public)
         self.assertNotIn("Terra, then Luna", public)
         self.assertNotIn("billing", public.casefold())
+        self.assertNotIn("supports only two", public)
+        self.assertNotIn("accepts only two", public)
+        self.assertNotIn("仅支持两个", public)
+        self.assertIn("four-writer safety ceiling", public)
+        self.assertIn("四个 writer 的安全上限", public)
         operations = text(ROOT / "docs" / "OPERATIONS.md")
         self.assertIn("duplicate", operations)
         self.assertIn("unknown", operations)
@@ -152,11 +164,19 @@ class ProjectContractTests(unittest.TestCase):
 
     def test_hooks_ci_and_published_files_cover_release_validation(self) -> None:
         hooks = json.loads(text(PLUGIN / "hooks" / "hooks.json"))["hooks"]
+        installer = text(PLUGIN / "scripts" / "install_agents.py")
         workflow = text(ROOT / ".github" / "workflows" / "ci.yml")
         self.assertEqual(
             set(hooks),
             {"SessionStart", "PreToolUse", "PostToolUse", "Stop", "SubagentStop"},
         )
+        self.assertEqual(
+            hooks["SubagentStop"][0]["matcher"],
+            "^(cost_orchestrator_read_leaf|cost_orchestrator_write_leaf)$",
+        )
+        self.assertIn("HOST_HOOK_CONTRACT", installer)
+        self.assertIn("_validate_local_hook_contract", installer)
+        self.assertIn("Hook matcher is not canonical", installer)
         self.assertNotIn('"matcher": ".*"', json.dumps(hooks))
         self.assertIn("ruff check plugins tests benchmarks .github/scripts", workflow)
         self.assertIn("validate_plugin.py plugins/codex-cost-orchestrator", workflow)

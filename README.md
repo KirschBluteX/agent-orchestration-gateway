@@ -5,7 +5,7 @@
 Codex Cost Orchestrator (CCO) is a local control plane for Codex native Agents.
 Primary keeps intent, integration, and final acceptance; CCO dispatches closed,
 scoped work and returns exact acceptance evidence. CCO is pre-1.0: its public,
-installer, and manifest identity is `0.9.2` with no build metadata, and a
+installer, and manifest identity is `0.9.3` with no build metadata, and a
 pre-1.0 minor release may include breaking changes. Historical labels from 2.x
 through 5.x are compressed into pre-0.9 development history; Git history
 remains unchanged.
@@ -21,10 +21,10 @@ acceptance IDs, and repository-relative scopes. Every scope is exactly one of
 python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --capacity <N>
 ```
 
-Invoke each returned action with only its supplied tool input. A complex unresolved
-task may first use one ordinary read-only Terra/max planning task; its proposal is
-only a stateless `cco.planner-proposal.v1` DAG input. CCO does not create a planner
-route or a second planner lifecycle.
+Invoke each returned action with only its supplied tool input. Primary must clarify or close
+unresolved work before `prepare`; every native child must be prepared by CCO. A pre-existing
+`cco.planner-proposal.v1` value is accepted only as stateless, schema-validated DAG input. It is
+not a planner route, lifecycle, or direct-spawn permission.
 
 Current Codex Desktop builds may replace the prepared Agent message with opaque
 ciphertext at the Hook boundary. The default `trusted_host` policy admits it only
@@ -37,10 +37,11 @@ the hidden plaintext equals the prepared message. Set
 inputs until the host exposes an authenticated plaintext digest.
 
 Primary stays in control only for explicit authority, clarification, an explicit
-direct request, or one declared tool bounded below 30 seconds. After dispatch,
+direct request, or exactly one declared tool with a total upper bound under 30 seconds.
+After dispatch,
 repeat long `wait_agent` windows until completion or required attention. A
-`timed_out` result is only an expired wait window: do not treat the child as failed,
-narrate unchanged progress, or duplicate its work.
+`timed_out` result is only an expired wait window: wait again on the same live dispatch;
+do not treat the child as failed, narrate unchanged progress, or duplicate its work.
 
 ## Deterministic routing and review
 
@@ -71,7 +72,7 @@ still has a fresh dispatch and baseline.
 
 Current runtime records use `cco.wave.v3`, `cco.lifecycle.v2`, and
 `cco.receipt.v2`. Earlier active state, wave, lifecycle, receipt, and aggregation
-artifacts are not upgraded in place: clean them up before starting a 0.9.2 task.
+artifacts are not upgraded in place: clean them up before starting a 0.9.3 task.
 There is no migration command and no active-state compatibility layer.
 
 Readers scan only their declared scopes. CCO admits one normal writer at a time for
@@ -81,11 +82,13 @@ current task; see [operations](docs/OPERATIONS.md).
 
 ## Experimental cooperative writers
 
-`writer_isolation=cooperative` is opt-in and supports only two independent,
-non-overlapping fresh writer nodes. A clean Git workspace uses managed worktrees;
-dirty Git and directory workspaces use bounded copies. CCO stages exact backups and
-a bounded apply journal before integration. Guarded writers may be followed by the
-single compiler-injected final reviewer; no other cooperative DAG shape is admitted.
+`writer_isolation=cooperative` is opt-in and admits the largest pairwise-disjoint set
+of fresh writer nodes that fits the requested native capacity, with a four-writer
+safety ceiling. A clean Git workspace uses managed worktrees; dirty Git and directory
+workspaces use bounded copies. File, byte, and journal limits apply to the whole wave,
+not once per writer. CCO stages exact backups and one bounded apply journal before
+integration. Guarded writers may be followed by the single compiler-injected final
+reviewer; no other cooperative DAG shape is admitted.
 Successful cleanup removes completed isolate and journal material; an incomplete
 journal and its backups remain until
 rollback or explicit intervention establishes a safe outcome.

@@ -138,6 +138,25 @@ class DelegationCompilerTests(unittest.TestCase):
             ["inspect_a", "inspect_b"],
         )
 
+    def test_plan_node_count_is_bounded_before_graph_normalization(self) -> None:
+        plan = {
+            "acceptance": {"A01": "bounded graph"},
+            "goal": "reject an oversized graph",
+            "nodes": [
+                {
+                    "acceptance": ["A01"],
+                    "id": f"node_{index:03d}",
+                    "objective": "bounded node",
+                    "role": "explorer",
+                    "scopes": [{"kind": "exact", "path": "a.txt"}],
+                }
+                for index in range(129)
+            ],
+        }
+
+        with self.assertRaisesRegex(DelegationCompilerError, "plan nodes"):
+            normalize_closed_plan(plan)
+
     def test_incomplete_or_route_capable_planner_proposals_fail_closed(self) -> None:
         incomplete = atomic_request(
             work={

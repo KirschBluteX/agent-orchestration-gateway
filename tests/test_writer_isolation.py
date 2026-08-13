@@ -454,6 +454,91 @@ class CooperativeWriterTests(unittest.TestCase):
         self.assertEqual((canonical / "a.txt").read_text(encoding="utf-8"), "a0\n")
         self.assertEqual((canonical / "b.txt").read_text(encoding="utf-8"), "b0\n")
 
+    def test_apply_copy_failures_remove_owned_partial_file_before_recovery(self) -> None:
+        canonical = self.root / "deadline-canonical"
+        source = self.root / "deadline-source"
+        canonical.mkdir()
+        source.mkdir()
+        target = canonical / "a.bin"
+        replacement = source / "a.bin"
+        before = b"before\n"
+        target.write_bytes(before)
+        replacement.write_bytes(b"x" * (isolation_module._CHUNK_BYTES * 2 + 1))
+        replacement_stat = replacement.stat()
+        replacement_identity = (replacement_stat.st_dev, replacement_stat.st_ino)
+        original_read = os.read
+
+        def interrupt_during_replacement() -> object:
+            matching_reads = 0
+
+            def interrupted_read(descriptor: int, size: int) -> bytes:
+                nonlocal matching_reads
+                current = os.fstat(descriptor)
+                if (
+                    (current.st_dev, current.st_ino) == replacement_identity
+                    and target.exists()
+                    and target.stat().st_size != len(before)
+                ):
+                    matching_reads += 1
+                    if matching_reads == 2:
+                        raise KeyboardInterrupt("simulated process exit during copy")
+                return original_read(descriptor, size)
+
+            return interrupted_read
+
+        def deadline_during_replacement() -> object:
+            matching_reads = 0
+
+            def expired_read(descriptor: int, size: int) -> bytes:
+                nonlocal matching_reads
+                current = os.fstat(descriptor)
+                if (
+                    (current.st_dev, current.st_ino) == replacement_identity
+                    and target.exists()
+                    and target.stat().st_size != len(before)
+                ):
+                    matching_reads += 1
+                    if matching_reads == 2:
+                        raise control_plane_module.OperationDeadlineExceeded(
+                            "simulated copy deadline"
+                        )
+                return original_read(descriptor, size)
+
+            return expired_read
+
+        for failure, injected_read in (
+            (KeyboardInterrupt, interrupt_during_replacement),
+            (control_plane_module.OperationDeadlineExceeded, deadline_during_replacement),
+        ):
+            with self.subTest(failure=failure.__name__):
+                target.write_bytes(before)
+                journal = isolation_module.stage_apply_journal(
+                    self.root / f"{failure.__name__}-state",
+                    wave_id=(
+                        "sha256:" + ("a" if failure is KeyboardInterrupt else "b") * 64
+                    ),
+                    canonical_root=canonical,
+                    changes={"a.bin": {"source_root": str(source)}},
+                )
+                with patch.object(
+                    isolation_module.os,
+                    "read",
+                    side_effect=injected_read(),
+                ):
+                    with self.assertRaises(failure):
+                        isolation_module.apply_journal(
+                            journal,
+                            self.root / f"{failure.__name__}-state",
+                        )
+
+                self.assertEqual(journal["entries"][0]["phase"], "applying")
+                self.assertFalse(target.exists())
+                isolation_module.rollback_journal(
+                    journal,
+                    self.root / f"{failure.__name__}-state",
+                )
+                self.assertEqual(target.read_bytes(), before)
+
     def test_control_plane_apply_failure_fences_without_partial_success(self) -> None:
         repo = self.make_workspace()
         control = self.control("apply-failure")
@@ -1360,6 +1445,216 @@ class CooperativeWriterTests(unittest.TestCase):
         self.assertLessEqual(kwargs["timeout"], 5)
         self.assertNotIn("GIT_DIR", kwargs["env"])
         self.assertNotIn("GIT_WORK_TREE", kwargs["env"])
+
+        with (
+            patch.object(isolation_module, "MAX_GIT_OUTPUT_BYTES", 1),
+            self.assertRaisesRegex(
+                isolation_module.WriterIsolationUnavailable,
+                "output capacity",
+            ),
+        ):
+            isolation_module._git(canonical, "rev-parse", "--show-toplevel")
+
+    def test_three_writer_group_is_bounded_and_uses_distinct_slots(self) -> None:
+        canonical = self.make_workspace("directory")
+        (canonical / "c.txt").write_text("c0\n", encoding="utf-8")
+        state_root = self.root / "three-writer-state"
+        members = [
+            {"id": "left", "scopes": [{"kind": "exact", "path": "a.txt"}]},
+            {"id": "middle", "scopes": [{"kind": "exact", "path": "b.txt"}]},
+            {"id": "right", "scopes": [{"kind": "exact", "path": "c.txt"}]},
+        ]
+
+        records = isolation_module.prepare_isolates(
+            state_root,
+            canonical,
+            backend="directory",
+            session_id="three-writers",
+            batch_id="sha256:" + "f" * 64,
+            members=members,
+        )
+
+        self.assertEqual(len(records), 3)
+        self.assertEqual(
+            [Path(record["isolate_root"]).name for record in records],
+            ["n00", "n01", "n02"],
+        )
+        self.assertTrue(all(Path(record["isolate_root"]).is_dir() for record in records))
+        self.assertEqual(isolation_module.cleanup_isolates(state_root, records), 3)
+
+        # The group budget is not multiplied by its member count.
+        with patch.object(isolation_module, "MAX_GROUP_FILES", 8):
+            with self.assertRaisesRegex(
+                isolation_module.WriterIsolationError,
+                "aggregate copy capacity",
+            ):
+                isolation_module.prepare_isolates(
+                    self.root / "three-writer-over-budget",
+                    canonical,
+                    backend="directory",
+                    session_id="three-writers-over-budget",
+                    batch_id="sha256:" + "0" * 64,
+                    members=members,
+                )
+        with patch.object(isolation_module, "MAX_GROUP_BYTES", 8):
+            with self.assertRaisesRegex(
+                isolation_module.WriterIsolationError,
+                "aggregate copy capacity",
+            ):
+                isolation_module.prepare_isolates(
+                    self.root / "three-writer-byte-over-budget",
+                    canonical,
+                    backend="directory",
+                    session_id="three-writers-byte-over-budget",
+                    batch_id="sha256:" + "3" * 64,
+                    members=members,
+                )
+
+    def test_preparation_baseexception_reclaims_only_owned_copy_tree(self) -> None:
+        canonical = self.make_workspace("directory")
+        state_root = self.root / "preparation-baseexception-state"
+        batch_id = "sha256:" + "1" * 64
+        original_copy_tree = isolation_module._copy_tree
+
+        def copy_then_exit(
+            source_path: Path, target_path: Path, **kwargs: object
+        ) -> tuple[int, int]:
+            original_copy_tree(source_path, target_path, **kwargs)
+            raise KeyboardInterrupt("simulated preparation exit")
+
+        with patch.object(
+            isolation_module,
+            "_copy_tree",
+            side_effect=copy_then_exit,
+        ):
+            with self.assertRaisesRegex(KeyboardInterrupt, "preparation exit"):
+                isolation_module.prepare_isolates(
+                    state_root,
+                    canonical,
+                    backend="directory",
+                    session_id="preparation-baseexception",
+                    batch_id=batch_id,
+                    members=[
+                        {
+                            "id": "writer",
+                            "scopes": [{"kind": "exact", "path": "a.txt"}],
+                        }
+                    ],
+                )
+
+        roots = isolation_module.preparing_isolate_roots(
+            state_root,
+            canonical_root=canonical,
+            session_id="preparation-baseexception",
+            batch_id=batch_id,
+            count=1,
+        )
+        self.assertFalse(Path(roots[0]).exists())
+
+    def test_backup_staging_baseexception_preserves_external_replacement(self) -> None:
+        canonical = self.root / "backup-canonical"
+        source = self.root / "backup-source"
+        canonical.mkdir()
+        source.mkdir()
+        for root, suffix in ((canonical, "0"), (source, "1")):
+            (root / "a.txt").write_text(f"a{suffix}\n", encoding="utf-8")
+            (root / "b.txt").write_text(f"b{suffix}\n", encoding="utf-8")
+        state_root = self.root / "backup-baseexception-state"
+        original_copy_node = isolation_module._copy_node
+
+        def copy_then_replace(source_path: Path, target_path: Path) -> None:
+            original_copy_node(source_path, target_path)
+            if target_path.name == "b0001":
+                target_path.write_text("external replacement\n", encoding="utf-8")
+                raise SystemExit("simulated staging exit")
+
+        with patch.object(
+            isolation_module,
+            "_copy_node",
+            side_effect=copy_then_replace,
+        ):
+            with self.assertRaisesRegex(SystemExit, "staging exit"):
+                isolation_module.stage_apply_journal(
+                    state_root,
+                    wave_id="sha256:" + "2" * 64,
+                    canonical_root=canonical,
+                    changes={
+                        "a.txt": {"source_root": str(source)},
+                        "b.txt": {"source_root": str(source)},
+                    },
+                )
+
+        backups = list((state_root / "isolate-journals").rglob("b000*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].name, "b0001")
+        self.assertEqual(backups[0].read_text(encoding="utf-8"), "external replacement\n")
+
+    def test_journal_file_budget_is_aggregate_across_all_writer_changes(self) -> None:
+        canonical = self.root / "journal-file-canonical"
+        source = self.root / "journal-file-source"
+        canonical.mkdir()
+        source.mkdir()
+        for root, suffix in ((canonical, "0"), (source, "1")):
+            (root / "a.txt").write_text(f"a{suffix}\n", encoding="utf-8")
+            (root / "b.txt").write_text(f"b{suffix}\n", encoding="utf-8")
+
+        with patch.object(isolation_module, "MAX_JOURNAL_FILES", 3):
+            with self.assertRaisesRegex(
+                isolation_module.WriterIsolationError,
+                "journal exceeds its file capacity",
+            ):
+                isolation_module.stage_apply_journal(
+                    self.root / "journal-file-state",
+                    wave_id="sha256:" + "4" * 64,
+                    canonical_root=canonical,
+                    changes={
+                        "a.txt": {"source_root": str(source)},
+                        "b.txt": {"source_root": str(source)},
+                    },
+                )
+
+    def test_copy_failure_preserves_an_in_place_external_edit(self) -> None:
+        source = self.root / "copy-race-source.bin"
+        target = self.root / "copy-race-target.bin"
+        source.write_bytes(b"x" * (isolation_module._CHUNK_BYTES * 2 + 1))
+        source_stat = source.stat()
+        original_read = os.read
+        external = b"external in-place edit\n"
+
+        def edit_then_interrupt(descriptor: int, size: int) -> bytes:
+            current = os.fstat(descriptor)
+            if (
+                (current.st_dev, current.st_ino)
+                == (source_stat.st_dev, source_stat.st_ino)
+                and target.exists()
+                and target.stat().st_size > 0
+            ):
+                target.write_bytes(external)
+                raise KeyboardInterrupt("simulated external in-place edit")
+            return original_read(descriptor, size)
+
+        with patch.object(isolation_module.os, "read", side_effect=edit_then_interrupt):
+            with self.assertRaisesRegex(KeyboardInterrupt, "in-place edit"):
+                isolation_module._copy_file(source, target)
+
+        self.assertEqual(target.read_bytes(), external)
+
+    def test_copy_permissions_are_applied_through_the_open_descriptor(self) -> None:
+        source = self.root / "permission-source.txt"
+        target = self.root / "permission-target.txt"
+        source.write_text("content\n", encoding="utf-8")
+
+        with patch.object(
+            isolation_module.os,
+            "chmod",
+            side_effect=AssertionError("pathname chmod must not be used"),
+        ):
+            self.assertEqual(
+                isolation_module._copy_file(source, target),
+                len(source.read_bytes()),
+            )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "content\n")
 
     def test_identity_and_empty_scope_apis_fail_before_isolate_materialization(self) -> None:
         canonical = self.make_workspace("directory")

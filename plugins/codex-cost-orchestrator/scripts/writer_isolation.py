@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
+import tempfile
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from git_environment import clean_git_environment
@@ -34,12 +36,25 @@ PROTOCOL = "cco.writer-isolation.v1"
 COOPERATIVE = "cooperative"
 WORKTREE = "git_worktree"
 COPY = "bounded_copy"
-MAX_GROUP_SIZE = 2
-MAX_ISOLATE_ROOTS = 2
+MAX_GROUP_SIZE = 4
+# Keep slot validation coupled to the exported native writer capacity.  The
+# control plane imports ``MAX_GROUP_SIZE`` as its cooperative-wave limit, while
+# persisted layouts use this alias to make the same bound explicit at every
+# filesystem admission point.
+MAX_ISOLATE_ROOTS = MAX_GROUP_SIZE
 MAX_FILES = 2_048
 MAX_BYTES = 64 * 1024 * 1024
 MAX_JOURNAL_BYTES = 16 * 1024 * 1024
 MAX_JOURNAL_ENTRIES = 512
+MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
+# The journal retains both sides of every apply mutation.  Cap its total file
+# descriptions as well as its existing byte and entry reservations.
+MAX_JOURNAL_FILES = MAX_FILES
+# A group can use every native writer slot, but no member can turn that into an
+# unbounded multiplication of the copy budget.  These are deliberately one
+# aggregate reservation for the group, rather than per-isolate reservations.
+MAX_GROUP_FILES = MAX_FILES
+MAX_GROUP_BYTES = MAX_BYTES
 _CHUNK_BYTES = 1024 * 1024
 _MARKER = ".cco-writer-isolation-owned-v1"
 _MARKER_BYTES = b"cco.writer-isolation-owned.v1\n"
@@ -463,13 +478,33 @@ def _walk_visible(root: Path, *, exclude_git: bool) -> tuple[int, int]:
     return int(description["files"]), int(description["bytes"])
 
 
-def _make_directory(path: Path, label: str) -> None:
-    if _lstat(path, label, missing=True) is None:
+def _make_directory(
+    path: Path,
+    label: str,
+    *,
+    mode: int | None = None,
+    require_new: bool = False,
+) -> os.stat_result:
+    """Create a real directory without adopting a raced copy target.
+
+    Copy destinations receive their final directory mode at creation time.  In
+    particular, do not ``chmod(path)`` afterwards: a pathname can have been
+    replaced between creation and that call.  The default preserves the normal
+    ``mkdir`` behaviour for CCO namespace parents.
+    """
+
+    existing = _lstat(path, label, missing=True)
+    if existing is None:
         try:
-            path.mkdir()
+            path.mkdir(mode=0o777 if mode is None else mode)
+        except FileExistsError:
+            if require_new:
+                raise WriterIsolationError(f"{label} already exists") from None
         except OSError as error:
             raise WriterIsolationUnavailable(f"{label} cannot be created") from error
-    _lstat_directory(path, label)
+    elif require_new:
+        raise WriterIsolationError(f"{label} already exists")
+    return _lstat_directory(path, label)
 
 
 def _ensure_parent(path: Path) -> None:
@@ -483,7 +518,121 @@ def _ensure_parent(path: Path) -> None:
         _make_directory(candidate, "cooperative target parent")
 
 
-def _copy_file(source: Path, target: Path, *, limit: int = MAX_BYTES) -> int:
+def _same_open_object(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare the object bound to an open descriptor, not its path spelling."""
+
+    return (
+        stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and int(left.st_dev) == int(right.st_dev)
+        and int(left.st_ino) == int(right.st_ino)
+    )
+
+
+def _descriptor_has_content(
+    descriptor: int,
+    *,
+    size: int,
+    digest: str,
+) -> bool:
+    """Boundedly compare one open regular file with the bytes CCO wrote.
+
+    This intentionally does not call ``checkpoint``.  It is also used while
+    unwinding a cancellation, where a second deadline/interrupt must never
+    obscure the original exception.
+    """
+
+    if size < 0:
+        return False
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    observed = hashlib.sha256()
+    total = 0
+    while total <= size:
+        chunk = os.read(descriptor, min(_CHUNK_BYTES, size - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > size:
+            return False
+        observed.update(chunk)
+    return total == size and observed.hexdigest() == digest
+
+
+def _copy_target_matches(
+    target: Path,
+    expected_object: os.stat_result,
+    *,
+    size: int,
+    digest: str,
+    mode: int,
+    descriptor: int | None = None,
+    suppress_errors: bool = False,
+) -> bool:
+    """Prove a failed copy still names the object and bytes CCO created."""
+
+    try:
+        current = os.lstat(target)
+        if (
+            _is_reparse(current)
+            or not stat.S_ISREG(current.st_mode)
+            or not _same_node(current, expected_object)
+            or stat.S_IMODE(current.st_mode) != mode
+            or int(current.st_size) != size
+        ):
+            return False
+        if descriptor is not None:
+            opened = os.fstat(descriptor)
+            if not _same_node(opened, expected_object):
+                return False
+            return _descriptor_has_content(descriptor, size=size, digest=digest)
+        with _open_regular(target, "cooperative copy target") as candidate:
+            opened = os.fstat(candidate)
+            if not _same_node(opened, expected_object):
+                return False
+            return _descriptor_has_content(candidate, size=size, digest=digest)
+    except BaseException:
+        # Cleanup is best-effort and must preserve the original materialisation
+        # exception.  A failed proof leaves the pathname untouched.  Normal
+        # materialisation still propagates cancellation/deadline exceptions.
+        if suppress_errors:
+            return False
+        raise
+
+
+def _discard_owned_copy(
+    target: Path,
+    expected_object: os.stat_result,
+    *,
+    size: int,
+    digest: str,
+    mode: int,
+    descriptor: int | None = None,
+) -> bool:
+    """Remove only a still-owned failed target; never adopt a replacement."""
+
+    if not _copy_target_matches(
+        target,
+        expected_object,
+        size=size,
+        digest=digest,
+        mode=mode,
+        descriptor=descriptor,
+        suppress_errors=True,
+    ):
+        return False
+    try:
+        os.unlink(target)
+    except BaseException:
+        return False
+    return True
+
+
+def _copy_file(
+    source: Path,
+    target: Path,
+    *,
+    limit: int = MAX_BYTES,
+    ownership: _OwnedCopyTree | None = None,
+) -> int:
     source_path = _absolute(source)
     target_path = _absolute(target)
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
@@ -494,7 +643,7 @@ def _copy_file(source: Path, target: Path, *, limit: int = MAX_BYTES) -> int:
     if _lstat(target_path, "cooperative copy target", missing=True) is not None:
         raise WriterIsolationError("cooperative copy target already exists")
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_BINARY", 0)
@@ -504,10 +653,18 @@ def _copy_file(source: Path, target: Path, *, limit: int = MAX_BYTES) -> int:
         output = os.open(target_path, flags, 0o600)
     except OSError as error:
         raise WriterIsolationUnavailable("cooperative file target cannot be opened") from error
+    opened_identity: os.stat_result | None = None
+    owned_identity: os.stat_result | None = None
+    copied = 0
+    output_digest = hashlib.sha256()
+    output_mode = 0o600
     try:
+        opened_identity = os.fstat(output)
+        owned_identity = opened_identity
+        output_mode = stat.S_IMODE(opened_identity.st_mode)
         with _open_regular(source_path, "cooperative copy source") as input_descriptor:
-            source_stat = os.fstat(input_descriptor)
-            copied = 0
+            source_before = os.fstat(input_descriptor)
+            source_digest = hashlib.sha256()
             while True:
                 checkpoint()
                 chunk = os.read(input_descriptor, _CHUNK_BYTES)
@@ -523,19 +680,101 @@ def _copy_file(source: Path, target: Path, *, limit: int = MAX_BYTES) -> int:
                     written = os.write(output, view)
                     if written <= 0:
                         raise WriterIsolationUnavailable("cooperative file copy failed")
+                    output_digest.update(view[:written])
                     view = view[written:]
+                    # This snapshot is the last state CCO itself observed
+                    # after writing.  Cleanup compares against it instead of
+                    # re-fstat'ing after an external race has already won.
+                    owned_identity = os.fstat(output)
+                source_digest.update(chunk)
+            source_stat = os.fstat(input_descriptor)
+            if (
+                not _same_node(source_before, source_stat)
+                or stat.S_IMODE(source_before.st_mode)
+                != stat.S_IMODE(source_stat.st_mode)
+            ):
+                raise WriterIsolationError("cooperative copy source changed during materialization")
             if not stat.S_ISREG(os.fstat(output).st_mode):
                 raise WriterIsolationError("cooperative copy target changed type")
-            os.chmod(target_path, stat.S_IMODE(source_stat.st_mode))
-    except OSError as error:
-        raise WriterIsolationUnavailable("cooperative file copy failed") from error
-    finally:
-        os.close(output)
-    if _describe(source_path, limit=limit)["content_id"] != _describe(
-        target_path, limit=limit
-    )["content_id"]:
-        raise WriterIsolationError("cooperative file copy identity changed")
-    return copied
+            try:
+                os.fchmod(output, stat.S_IMODE(source_stat.st_mode))
+            except OSError as error:
+                raise WriterIsolationUnavailable(
+                    "cooperative file target permissions cannot be applied"
+                ) from error
+            output_stat = os.fstat(output)
+            output_mode = stat.S_IMODE(output_stat.st_mode)
+            if output_mode != stat.S_IMODE(source_stat.st_mode):
+                raise WriterIsolationError("cooperative file target permissions changed")
+            if not _same_open_object(opened_identity, output_stat):
+                raise WriterIsolationError("cooperative copy target changed while being written")
+            owned_identity = output_stat
+            if source_digest.hexdigest() != output_digest.hexdigest() or not _descriptor_has_content(
+                output,
+                size=copied,
+                digest=output_digest.hexdigest(),
+            ):
+                raise WriterIsolationError("cooperative file copy identity changed")
+            if not _copy_target_matches(
+                target_path,
+                output_stat,
+                size=copied,
+                digest=output_digest.hexdigest(),
+                mode=output_mode,
+                descriptor=output,
+            ):
+                raise WriterIsolationError("cooperative file copy target changed")
+            claim_owner = ownership if ownership is not None else _ACTIVE_COPY_OWNERSHIP.get()
+            if claim_owner is not None:
+                claim_owner.add_file(
+                    target_path,
+                    output_stat,
+                    {
+                        "bytes": copied,
+                        "mode": output_mode,
+                        "sha256": output_digest.hexdigest(),
+                    },
+                )
+        try:
+            os.close(output)
+        finally:
+            output = -1
+        return copied
+    except BaseException as error:
+        # Keep the descriptor open for the first unlink attempt.  That binds
+        # the pathname to the object CCO opened and prevents inode reuse while
+        # checking the byte identity.  Windows may require a close before
+        # unlinking, so re-prove both identities after that close as well.
+        expected_object = owned_identity
+        if output >= 0:
+            try:
+                if expected_object is not None:
+                    _discard_owned_copy(
+                        target_path,
+                        expected_object,
+                        size=copied,
+                        digest=output_digest.hexdigest(),
+                        mode=output_mode,
+                        descriptor=output,
+                    )
+            except BaseException:
+                pass
+            try:
+                os.close(output)
+            except BaseException:
+                pass
+            output = -1
+        if expected_object is not None:
+            _discard_owned_copy(
+                target_path,
+                expected_object,
+                size=copied,
+                digest=output_digest.hexdigest(),
+                mode=output_mode,
+            )
+        if isinstance(error, OSError):
+            raise WriterIsolationUnavailable("cooperative file copy failed") from error
+        raise
 
 
 def _remove_tree(
@@ -605,12 +844,114 @@ def _remove_tree(
 
 
 def _remove_partial_tree(path: Path) -> None:
+    """Retire only an empty failed root when no ownership manifest exists."""
+
     try:
-        _remove_tree(path, allow_missing=True)
-    except WriterIsolationError:
-        # Do not turn a failed materialisation into a deletion through a reparse
-        # point. The durable preparation reservation keeps it fenced.
+        metadata = _lstat(path, "CCO isolate partial tree", missing=True)
+        if (
+            metadata is not None
+            and not _is_reparse(metadata)
+            and stat.S_ISDIR(metadata.st_mode)
+        ):
+            os.rmdir(path)
+    except BaseException:
+        # Without exact file claims, recursive deletion could adopt a raced
+        # replacement. The durable preparation reservation keeps it fenced.
         pass
+
+
+class _GroupCopyBudget:
+    """Shared file/byte capacity for every bounded-copy isolate in one group."""
+
+    def __init__(self) -> None:
+        self.files = 0
+        self.bytes = 0
+
+    def consume_file(self) -> None:
+        if self.files >= MAX_GROUP_FILES:
+            raise WriterIsolationError(
+                "cooperative writer group exceeds its aggregate file capacity"
+            )
+        self.files += 1
+
+    def remaining_bytes(self) -> int:
+        return max(0, MAX_GROUP_BYTES - self.bytes)
+
+    def consume_bytes(self, value: int) -> None:
+        if value < 0 or value > self.remaining_bytes():
+            raise WriterIsolationError(
+                "cooperative writer group exceeds its aggregate byte capacity"
+            )
+        self.bytes += value
+
+
+class _OwnedCopyTree:
+    """The exact fresh nodes one failed bounded copy may reclaim.
+
+    A preparation path is CCO-owned, but that does not make a concurrent
+    replacement CCO-owned.  Claims pair each file's content with its object
+    identity and retain each created directory identity.  Cleanup only unlinks
+    a still matching file and only removes an empty still matching directory.
+    """
+
+    def __init__(self) -> None:
+        self.directories: list[tuple[Path, os.stat_result]] = []
+        self.files: list[tuple[Path, os.stat_result, dict[str, Any]]] = []
+
+    def add_directory(self, path: Path, metadata: os.stat_result) -> None:
+        self.directories.append((path, metadata))
+
+    def add_file(
+        self,
+        path: Path,
+        metadata: os.stat_result,
+        content: Mapping[str, Any],
+    ) -> None:
+        self.files.append((path, metadata, dict(content)))
+
+    def cleanup(self) -> None:
+        for path, metadata, content in reversed(self.files):
+            try:
+                _discard_owned_copy(
+                    path,
+                    metadata,
+                    size=int(content["bytes"]),
+                    digest=str(content["sha256"]),
+                    mode=int(content["mode"]),
+                )
+            except BaseException:
+                pass
+        for path, metadata in reversed(self.directories):
+            try:
+                current = _lstat(path, "CCO isolate cleanup directory", missing=True)
+                if (
+                    current is not None
+                    and not _is_reparse(current)
+                    and stat.S_ISDIR(current.st_mode)
+                    and _same_open_object(current, metadata)
+                ):
+                    os.rmdir(path)
+            except BaseException:
+                # An external child/replacement leaves the directory fenced for
+                # terminal recovery instead of deleting someone else's tree.
+                pass
+
+
+_ACTIVE_COPY_OWNERSHIP: ContextVar[_OwnedCopyTree | None] = ContextVar(
+    "cco_active_copy_ownership",
+    default=None,
+)
+
+
+@contextmanager
+def _copy_ownership(ownership: _OwnedCopyTree) -> Iterator[None]:
+    """Carry claims through `_copy_node` without widening its public shape."""
+
+    token = _ACTIVE_COPY_OWNERSHIP.set(ownership)
+    try:
+        yield
+    finally:
+        _ACTIVE_COPY_OWNERSHIP.reset(token)
 
 
 def _copy_tree(
@@ -619,6 +960,8 @@ def _copy_tree(
     *,
     exclude_git: bool = False,
     limit: int = MAX_BYTES,
+    group_budget: _GroupCopyBudget | None = None,
+    ownership: _OwnedCopyTree | None = None,
 ) -> tuple[int, int]:
     source_path = _absolute(source)
     target_path = _absolute(target)
@@ -633,15 +976,30 @@ def _copy_tree(
     if _lstat(target_path, "cooperative copy target", missing=True) is not None:
         raise WriterIsolationError("cooperative copy target already exists")
     _ensure_parent(target_path)
+    owned = ownership if ownership is not None else _OwnedCopyTree()
     try:
-        _make_directory(target_path, "cooperative copy target")
-        stack: list[tuple[Path, Path]] = [(source_path, target_path)]
+        target_identity = _make_directory(
+            target_path,
+            "cooperative copy target",
+            mode=stat.S_IMODE(source_identity.st_mode),
+            require_new=True,
+        )
+        owned.add_directory(target_path, target_identity)
+        stack: list[tuple[Path, Path, os.stat_result]] = [
+            (source_path, target_path, target_identity)
+        ]
         copied_files = 0
         copied_bytes = 0
         while stack:
-            source_dir, target_dir = stack.pop()
-            source_stat = _lstat_directory(source_dir, "cooperative copy source")
-            os.chmod(target_dir, stat.S_IMODE(source_stat.st_mode))
+            source_dir, target_dir, expected_target_dir = stack.pop()
+            _lstat_directory(source_dir, "cooperative copy source")
+            current_target_dir = _lstat_directory(
+                target_dir, "cooperative copy target"
+            )
+            if not _same_open_object(expected_target_dir, current_target_dir):
+                raise WriterIsolationError(
+                    "cooperative copy target directory changed during materialization"
+                )
             for child, name, child_stat in _scan_directory(
                 source_dir, "cooperative copy source"
             ):
@@ -657,23 +1015,40 @@ def _copy_tree(
                     raise WriterIsolationUnsupported(
                         "cooperative isolation exceeds its fixed file budget"
                     )
+                if group_budget is not None:
+                    group_budget.consume_file()
                 if stat.S_ISDIR(child_stat.st_mode):
-                    _make_directory(target_child, "cooperative copy target")
-                    stack.append((child, target_child))
+                    target_child_identity = _make_directory(
+                        target_child,
+                        "cooperative copy target",
+                        mode=stat.S_IMODE(child_stat.st_mode),
+                        require_new=True,
+                    )
+                    owned.add_directory(target_child, target_child_identity)
+                    stack.append((child, target_child, target_child_identity))
                     continue
                 if not stat.S_ISREG(child_stat.st_mode):
                     raise WriterIsolationUnsupported(
                         "cooperative copy has an unsupported entry"
                     )
-                copied_bytes += _copy_file(
+                copied_file = _copy_file(
                     child,
                     target_child,
-                    limit=limit - copied_bytes,
+                    limit=min(
+                        limit - copied_bytes,
+                        group_budget.remaining_bytes()
+                        if group_budget is not None
+                        else limit - copied_bytes,
+                    ),
+                    ownership=owned,
                 )
+                copied_bytes += copied_file
                 if copied_bytes > limit:
                     raise WriterIsolationUnsupported(
                         "cooperative isolation exceeds its fixed byte budget"
                     )
+                if group_budget is not None:
+                    group_budget.consume_bytes(copied_file)
         after = _describe(source_path, limit=limit, exclude_git=exclude_git)
         copied = _describe(target_path, limit=limit, exclude_git=exclude_git)
         if (
@@ -686,8 +1061,8 @@ def _copy_tree(
         ):
             raise WriterIsolationError("cooperative copy source changed during materialization")
         return int(before["files"]), int(before["bytes"])
-    except Exception:
-        _remove_partial_tree(target_path)
+    except BaseException:
+        owned.cleanup()
         raise
 
 
@@ -695,17 +1070,37 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     remaining = remaining_seconds()
     timeout = 20.0 if remaining is None else min(20.0, remaining)
     try:
-        return subprocess.run(
-            ["git", "-c", "core.longpaths=true", "-C", str(root), *args],
-            check=False,
-            env=clean_git_environment(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
+        with (
+            tempfile.TemporaryFile(mode="w+b") as stdout,
+            tempfile.TemporaryFile(mode="w+b") as stderr,
+        ):
+            completed = subprocess.run(
+                ["git", "-c", "core.longpaths=true", "-C", str(root), *args],
+                check=False,
+                env=clean_git_environment(),
+                stdout=stdout,
+                stderr=stderr,
+                timeout=timeout,
+            )
+            stdout_size = os.fstat(stdout.fileno()).st_size
+            stderr_size = os.fstat(stderr.fileno()).st_size
+            if stdout_size + stderr_size > MAX_GIT_OUTPUT_BYTES:
+                raise WriterIsolationUnavailable(
+                    "Git cooperative isolation exceeds its output capacity"
+                )
+            stdout.seek(0)
+            stderr.seek(0)
+            return subprocess.CompletedProcess(
+                completed.args,
+                completed.returncode,
+                stdout=stdout.read(MAX_GIT_OUTPUT_BYTES + 1),
+                stderr=stderr.read(MAX_GIT_OUTPUT_BYTES + 1),
+            )
     except subprocess.TimeoutExpired as error:
         checkpoint()
         raise WriterIsolationUnavailable("Git cooperative isolation timed out") from error
+    except WriterIsolationUnavailable:
+        raise
     except OSError as error:
         raise WriterIsolationUnavailable("Git cooperative isolation is unavailable") from error
 
@@ -917,6 +1312,30 @@ def _remove_worktree(canonical: Path, isolate: Path, *, terminal_recovery: bool)
             + (": " + detail if detail else "")
         )
     _remove_tree(isolate, terminal_recovery=terminal_recovery)
+
+
+def _cleanup_preparing_worktree(canonical: Path, isolate: Path) -> None:
+    """Reclaim only an unmodified worktree that never reached a child."""
+
+    try:
+        status = _git(
+            isolate,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        )
+        if status.returncode or status.stdout:
+            return
+        removed = _git(canonical, "worktree", "remove", str(isolate))
+        if removed.returncode:
+            return
+        _git(canonical, "worktree", "prune")
+    except BaseException:
+        # A failed proof or a cancellation leaves the reservation for terminal
+        # recovery; it must not turn into a forced deletion of a replacement.
+        return
 
 
 def _remove_isolate(record: Mapping[str, Any], state_root: Path) -> None:
@@ -1205,7 +1624,7 @@ def prepare_isolates(
     batch_id: str,
     members: list[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Create up to two bounded isolates before native child admission."""
+    """Create one bounded cooperative writer group before child admission."""
 
     if backend not in {"git", "directory"}:
         raise WriterIsolationUnsupported("cooperative workspace backend is unsupported")
@@ -1241,8 +1660,17 @@ def prepare_isolates(
         if backend == "git" and _clean_git_workspace(canonical, writer_scopes)
         else COPY
     )
+    copy_budget: _GroupCopyBudget | None = None
     if mode == COPY:
-        _walk_visible(canonical, exclude_git=True)
+        source_files, source_bytes = _walk_visible(canonical, exclude_git=True)
+        if (
+            source_files * len(prepared_members) > MAX_GROUP_FILES
+            or source_bytes * len(prepared_members) > MAX_GROUP_BYTES
+        ):
+            raise WriterIsolationError(
+                "cooperative writer group exceeds its aggregate copy capacity"
+            )
+        copy_budget = _GroupCopyBudget()
     namespace = _namespace_base(state_root, "isolates", canonical_root=canonical)
     session = _layout_digest(session_id)
     batch = _layout_digest(
@@ -1257,7 +1685,9 @@ def prepare_isolates(
         raise WriterIsolationError("cooperative isolate batch already exists")
     _make_directory(base, "CCO isolate batch namespace")
     records: list[dict[str, Any]] = []
+    prepared: list[tuple[dict[str, Any], _OwnedCopyTree | None]] = []
     current_isolate: Path | None = None
+    current_ownership: _OwnedCopyTree | None = None
     try:
         for index, member in enumerate(prepared_members):
             member_id = member.get("id")
@@ -1270,33 +1700,47 @@ def prepare_isolates(
             if mode == WORKTREE:
                 result = _git(canonical, "worktree", "add", "--detach", str(isolate), "HEAD")
                 if result.returncode:
-                    _remove_worktree(canonical, isolate, terminal_recovery=True)
+                    _cleanup_preparing_worktree(canonical, isolate)
                     raise WriterIsolationUnsupported(
                         "clean Git workspace cannot create a detached managed worktree"
                     )
             else:
-                _copy_tree(canonical, isolate, exclude_git=True)
+                current_ownership = _OwnedCopyTree()
+                _copy_tree(
+                    canonical,
+                    isolate,
+                    exclude_git=True,
+                    group_budget=copy_budget,
+                    ownership=current_ownership,
+                )
             records.append(record)
+            prepared.append((record, current_ownership))
             current_isolate = None
-    except Exception:
-        for record in reversed(records):
+            current_ownership = None
+    except BaseException:
+        for record, ownership in reversed(prepared):
             try:
-                _remove_isolate(record, state_root)
-            except (WriterIsolationError, WriterIsolationUnavailable):
+                if ownership is not None:
+                    ownership.cleanup()
+                else:
+                    _cleanup_preparing_worktree(canonical, Path(record["isolate_root"]))
+            except BaseException:
                 pass
         if current_isolate is not None:
             try:
                 if mode == WORKTREE:
-                    _remove_worktree(canonical, current_isolate, terminal_recovery=True)
-                else:
-                    _remove_partial_tree(current_isolate)
-            except (WriterIsolationError, WriterIsolationUnavailable):
+                    _cleanup_preparing_worktree(canonical, current_isolate)
+                elif current_ownership is not None:
+                    current_ownership.cleanup()
+            except BaseException:
                 pass
-        _remove_partial_tree(base)
-        for directory in (session_root, root_partition):
+        # All materialized children have either been reclaimed through a
+        # matching ownership claim or intentionally left fenced.  Only remove
+        # deterministic namespace directories when they are now empty.
+        for directory in (base, session_root, root_partition):
             try:
                 os.rmdir(directory)
-            except OSError:
+            except BaseException:
                 pass
         raise
     return records
@@ -1401,9 +1845,19 @@ def _copy_node(source: Path, target: Path, *, limit: int = MAX_JOURNAL_BYTES) ->
     if description["kind"] == "missing":
         return
     if description["kind"] == "file":
-        _copy_file(source, target, limit=limit)
+        _copy_file(
+            source,
+            target,
+            limit=limit,
+            ownership=_ACTIVE_COPY_OWNERSHIP.get(),
+        )
         return
-    _copy_tree(source, target, limit=limit)
+    _copy_tree(
+        source,
+        target,
+        limit=limit,
+        ownership=_ACTIVE_COPY_OWNERSHIP.get(),
+    )
 
 
 def _remove_node(path: Path) -> None:
@@ -1424,6 +1878,53 @@ def _remove_node(path: Path) -> None:
         raise WriterIsolationError("cooperative apply target is unsupported")
 
 
+def _cleanup_staged_backups(
+    backup_root: Path,
+    root_identity: os.stat_result,
+    claims: Iterable[tuple[Path, Mapping[str, Any], os.stat_result]],
+) -> None:
+    """Best-effort staging cleanup that cannot adopt a raced backup path."""
+
+    for backup, expected, identity in reversed(tuple(claims)):
+        try:
+            kind = expected.get("kind")
+            if kind == "file":
+                _discard_owned_copy(
+                    backup,
+                    identity,
+                    size=int(expected["bytes"]),
+                    digest=str(expected["sha256"]),
+                    mode=int(expected["mode"]),
+                )
+            elif kind == "directory":
+                current = _lstat(backup, "cooperative apply backup", missing=True)
+                if (
+                    current is not None
+                    and not _is_reparse(current)
+                    and stat.S_ISDIR(current.st_mode)
+                    and _same_open_object(current, identity)
+                    and _content_matches(backup, expected)
+                ):
+                    _remove_tree(backup, allow_missing=True)
+        except BaseException:
+            # Preserve the preparation/staging failure. A nonmatching backup
+            # stays inside the marker-validated journal namespace for recovery.
+            pass
+    try:
+        current_root = _lstat(
+            backup_root, "cooperative apply journal", missing=True
+        )
+        if (
+            current_root is not None
+            and not _is_reparse(current_root)
+            and stat.S_ISDIR(current_root.st_mode)
+            and _same_open_object(current_root, root_identity)
+        ):
+            os.rmdir(backup_root)
+    except BaseException:
+        pass
+
+
 def stage_apply_journal(
     state_root: Path,
     *,
@@ -1442,7 +1943,11 @@ def stage_apply_journal(
     ) / wave
     if _lstat(backup_root, "cooperative apply journal", missing=True) is not None:
         raise WriterIsolationError("cooperative apply journal already exists")
-    _make_directory(backup_root, "cooperative apply journal")
+    backup_root_identity = _make_directory(
+        backup_root,
+        "cooperative apply journal",
+        require_new=True,
+    )
     paths: list[str] = []
     for raw_path in sorted(changes):
         try:
@@ -1452,44 +1957,55 @@ def stage_apply_journal(
         if not any(path == parent or path.startswith(parent + "/") for parent in paths):
             paths.append(path)
     entries: list[dict[str, Any]] = []
+    backup_claims: list[tuple[Path, Mapping[str, Any], os.stat_result]] = []
+    backup_ownership = _OwnedCopyTree()
     total_bytes = 0
+    total_files = 0
     try:
-        for index, relative in enumerate(paths):
-            change = changes[relative]
-            source_root_value = change.get("source_root")
-            if not isinstance(source_root_value, str) or not Path(source_root_value).is_absolute():
-                raise WriterIsolationError("cooperative source root is invalid")
-            source_root = _absolute(source_root_value)
-            _lstat_directory(source_root, "cooperative source root")
-            _assert_apply_source_safe(state_root, canonical, source_root)
-            source = _require_child(source_root, relative, "cooperative source path")
-            target = _require_child(canonical, relative, "cooperative canonical path")
-            before = _describe(target, limit=MAX_JOURNAL_BYTES - total_bytes)
-            after = _describe(source, limit=MAX_JOURNAL_BYTES - total_bytes)
-            total_bytes += int(before["bytes"]) + int(after["bytes"])
-            if total_bytes > MAX_JOURNAL_BYTES:
-                raise WriterIsolationError("cooperative apply journal exceeds its byte capacity")
-            backup = backup_root / f"b{index:04d}"
-            if before["kind"] != "missing":
-                _copy_node(target, backup)
-                if _describe(backup, limit=MAX_JOURNAL_BYTES)["content_id"] != before[
-                    "content_id"
-                ]:
-                    raise WriterIsolationError("cooperative apply backup identity changed")
-                before = {**before, "backup_root": str(backup)}
-            else:
-                before = {**before, "backup_root": None}
-            entries.append(
-                {
-                    "after": after,
-                    "before": before,
-                    "path": relative,
-                    "phase": "staged",
-                    "source_root": str(source_root),
-                }
-            )
-    except Exception:
-        _remove_partial_tree(backup_root)
+        with _copy_ownership(backup_ownership):
+            for index, relative in enumerate(paths):
+                change = changes[relative]
+                source_root_value = change.get("source_root")
+                if not isinstance(source_root_value, str) or not Path(source_root_value).is_absolute():
+                    raise WriterIsolationError("cooperative source root is invalid")
+                source_root = _absolute(source_root_value)
+                _lstat_directory(source_root, "cooperative source root")
+                _assert_apply_source_safe(state_root, canonical, source_root)
+                source = _require_child(source_root, relative, "cooperative source path")
+                target = _require_child(canonical, relative, "cooperative canonical path")
+                before = _describe(target, limit=MAX_JOURNAL_BYTES - total_bytes)
+                after = _describe(source, limit=MAX_JOURNAL_BYTES - total_bytes)
+                total_bytes += int(before["bytes"]) + int(after["bytes"])
+                total_files += int(before["files"]) + int(after["files"])
+                if total_bytes > MAX_JOURNAL_BYTES:
+                    raise WriterIsolationError("cooperative apply journal exceeds its byte capacity")
+                if total_files > MAX_JOURNAL_FILES:
+                    raise WriterIsolationError("cooperative apply journal exceeds its file capacity")
+                backup = backup_root / f"b{index:04d}"
+                if before["kind"] != "missing":
+                    _copy_node(target, backup)
+                    backup_identity = _lstat(backup, "cooperative apply backup")
+                    assert backup_identity is not None
+                    backup_claims.append((backup, before, backup_identity))
+                    if _describe(backup, limit=MAX_JOURNAL_BYTES)["content_id"] != before[
+                        "content_id"
+                    ]:
+                        raise WriterIsolationError("cooperative apply backup identity changed")
+                    before = {**before, "backup_root": str(backup)}
+                else:
+                    before = {**before, "backup_root": None}
+                entries.append(
+                    {
+                        "after": after,
+                        "before": before,
+                        "path": relative,
+                        "phase": "staged",
+                        "source_root": str(source_root),
+                    }
+                )
+    except BaseException:
+        backup_ownership.cleanup()
+        _cleanup_staged_backups(backup_root, backup_root_identity, backup_claims)
         raise
     journal = {
         "backup_root": str(backup_root),
@@ -1500,7 +2016,8 @@ def stage_apply_journal(
         "wave_id": wave_id,
     }
     if len(canonical_bytes(journal)) > MAX_JOURNAL_BYTES:
-        _remove_partial_tree(backup_root)
+        backup_ownership.cleanup()
+        _cleanup_staged_backups(backup_root, backup_root_identity, backup_claims)
         raise WriterIsolationError("cooperative lifecycle journal exceeds its byte capacity")
     return journal
 
@@ -1569,6 +2086,7 @@ def validate_journal(journal: object, state_root: Path) -> dict[str, Any]:
     seen: set[str] = set()
     entries: list[dict[str, Any]] = []
     total = 0
+    files = 0
     for entry in journal["entries"]:
         if not isinstance(entry, Mapping) or set(entry) != {
             "after",
@@ -1593,6 +2111,7 @@ def validate_journal(journal: object, state_root: Path) -> dict[str, Any]:
         before = _validate_content(entry.get("before"), "cooperative journal before identity")
         after = _validate_content(entry.get("after"), "cooperative journal after identity")
         total += int(before["bytes"]) + int(after["bytes"])
+        files += int(before["files"]) + int(after["files"])
         backup_root = before.get("backup_root")
         if before["kind"] == "missing":
             if backup_root is not None:
@@ -1614,6 +2133,8 @@ def validate_journal(journal: object, state_root: Path) -> dict[str, Any]:
         )
     if total > MAX_JOURNAL_BYTES:
         raise WriterIsolationError("cooperative apply journal exceeds its byte capacity")
+    if files > MAX_JOURNAL_FILES:
+        raise WriterIsolationError("cooperative apply journal exceeds its file capacity")
     return {
         "backup_root": str(backup),
         "canonical_root": str(canonical),

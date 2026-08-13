@@ -110,6 +110,31 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     command = ["git", *args]
     process: subprocess.Popen[bytes] | None = None
+    def terminate_and_reap() -> None:
+        """Leave no Git child behind, including on process-level exits."""
+
+        if process is None:
+            return
+        try:
+            active = process.poll() is None
+        except BaseException:
+            # An interrupted/failed status probe must not mask the triggering
+            # cancellation. Try the process operations conservatively below.
+            active = True
+        if active:
+            try:
+                process.kill()
+            except BaseException:
+                # A concurrent natural exit or failed kill still gets a reap
+                # attempt; either cleanup failure must preserve the trigger.
+                pass
+        try:
+            process.wait()
+        except BaseException:
+            # Reaping is mandatory best effort on an exceptional boundary, but
+            # never replaces KeyboardInterrupt/SystemExit/deadline evidence.
+            pass
+
     try:
         with tempfile.TemporaryFile(mode="w+b") as output:
             checkpoint()
@@ -128,8 +153,7 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
                         process.wait(timeout=wait_slice)
                     except subprocess.TimeoutExpired:
                         if os.fstat(output.fileno()).st_size > MAX_GIT_OUTPUT_BYTES:
-                            process.kill()
-                            process.wait()
+                            terminate_and_reap()
                             raise StateUnavailable(
                                 "Git repository inspection exceeds the "
                                 f"{MAX_GIT_OUTPUT_BYTES} output byte limit"
@@ -137,8 +161,7 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
                         continue
                     break
             except OperationDeadlineExceeded as error:
-                process.kill()
-                process.wait()
+                terminate_and_reap()
                 raise OperationDeadlineExceeded(
                     "Git workspace inspection exceeded the CCO Hook deadline"
                 ) from error
@@ -152,10 +175,11 @@ def _run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     except (OperationDeadlineExceeded, StateUnavailable):
         raise
     except OSError as error:
-        if process is not None and process.poll() is None:
-            process.kill()
-            process.wait()
+        terminate_and_reap()
         raise StateUnavailable("Git repository inspection is unavailable") from error
+    except BaseException:
+        terminate_and_reap()
+        raise
     if len(raw) > MAX_GIT_OUTPUT_BYTES:
         raise StateUnavailable(
             "Git repository inspection exceeds the "

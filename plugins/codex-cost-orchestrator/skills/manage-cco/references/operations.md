@@ -38,7 +38,7 @@ python -B scripts/control_plane.py cleanup
 not a native failure. `retry` makes a guarded newer generation. `cleanup` is current-task-only
 and refuses active or paused work.
 
-CCO is pre-1.0. Its current public, installer, and manifest identity is `0.9.2` with no build
+CCO is pre-1.0. Its current public, installer, and manifest identity is `0.9.3` with no build
 metadata, and a pre-1.0 minor release may make breaking changes. Historical labels from 2.x
 through 5.x are pre-0.9 development history; Git history remains unchanged. Predecessor active
 state, wave, lifecycle, and receipt artifacts are rejected before use. Remove those old artifacts

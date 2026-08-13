@@ -43,6 +43,52 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             ):
                 workspace_state_module.git(repo, "rev-parse", "--show-toplevel")
 
+    def test_git_subprocess_is_terminated_and_reaped_on_process_level_exit(self) -> None:
+        repo = Path("unused")
+        for exit_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(exit_type=exit_type.__name__):
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.wait.side_effect = [exit_type("simulated exit"), None]
+                with mock.patch.object(
+                    workspace_state_module.subprocess,
+                    "Popen",
+                    return_value=process,
+                ):
+                    with self.assertRaises(exit_type):
+                        workspace_state_module._run_git(repo, "status", "--porcelain=v1")
+                process.kill.assert_called_once_with()
+                self.assertEqual(process.wait.call_count, 2)
+
+    def test_git_subprocess_is_terminated_and_reaped_on_deadline(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            subprocess.TimeoutExpired(["git"], 0.01),
+            None,
+        ]
+        expired = workspace_state_module.OperationDeadlineExceeded("simulated deadline")
+        with (
+            mock.patch.object(
+                workspace_state_module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(workspace_state_module, "checkpoint"),
+            mock.patch.object(
+                workspace_state_module,
+                "remaining_seconds",
+                side_effect=[0.01, expired],
+            ),
+            self.assertRaisesRegex(
+                workspace_state_module.OperationDeadlineExceeded,
+                "workspace inspection exceeded",
+            ),
+        ):
+            workspace_state_module._run_git(Path("unused"), "status")
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+
     def test_git_record_count_is_bounded_before_records_are_materialized(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo = self.make_repo(Path(temp_dir))
