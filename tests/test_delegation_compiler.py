@@ -5,7 +5,7 @@ import sys
 import unittest
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "codex-cost-orchestrator" / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "agent-orchestration-gateway" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from delegation_compiler import (  # noqa: E402
@@ -24,7 +24,7 @@ def atomic_request(**changes: object) -> dict[str, object]:
         "closed": True,
         "declared_tools": [],
         "direct": False,
-        "protocol": "cco.delegation.v1",
+        "protocol": "aog.delegation.v1",
         "upper_bound_seconds": 30,
         "work": {
             "goal": "update one bounded file",
@@ -124,7 +124,7 @@ class DelegationCompilerTests(unittest.TestCase):
                 "kind": "planner_proposal",
                 "proposal": {
                     "plan": dag_plan(),
-                    "protocol": "cco.planner-proposal.v1",
+                    "protocol": "aog.planner-proposal.v1",
                 },
             }
         )
@@ -161,7 +161,7 @@ class DelegationCompilerTests(unittest.TestCase):
         incomplete = atomic_request(
             work={
                 "kind": "planner_proposal",
-                "proposal": {"protocol": "cco.planner-proposal.v1"},
+                "proposal": {"protocol": "aog.planner-proposal.v1"},
             }
         )
         route_capable = atomic_request(
@@ -169,7 +169,7 @@ class DelegationCompilerTests(unittest.TestCase):
                 "kind": "planner_proposal",
                 "proposal": {
                     "plan": dag_plan(),
-                    "protocol": "cco.planner-proposal.v1",
+                    "protocol": "aog.planner-proposal.v1",
                     "pin": {"model": "gpt-5.6-terra"},
                 },
             }
@@ -256,7 +256,7 @@ class DelegationCompilerTests(unittest.TestCase):
                             "kind": "planner_proposal",
                             "proposal": {
                                 "plan": plan,
-                                "protocol": "cco.planner-proposal.v1",
+                                "protocol": "aog.planner-proposal.v1",
                             },
                         }
                     )
@@ -270,7 +270,7 @@ class DelegationCompilerTests(unittest.TestCase):
                 "kind": "planner_proposal",
                 "proposal": {
                     "plan": plan,
-                    "protocol": "cco.planner-proposal.v1",
+                    "protocol": "aog.planner-proposal.v1",
                 },
             },
             writer_isolation="cooperative",

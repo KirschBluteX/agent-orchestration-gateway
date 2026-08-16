@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 
-from benchmarks.cco_benchmark import BenchmarkError, _validate_result
+from benchmarks.aog_benchmark import BenchmarkError, _validate_result
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -20,7 +20,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
     @staticmethod
     def _manifest() -> dict[str, object]:
         return {
-            "protocol": "cco.benchmark-manifest.v1",
+            "protocol": "aog.benchmark-manifest.v1",
             "study_id": "featurebench-pilot-v1",
             "dataset": {
                 "name": "LiberCoders/FeatureBench",
@@ -36,8 +36,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     "primary_effort": "max",
                 },
                 {
-                    "id": "cco-static",
-                    "mode": "cco_static",
+                    "id": "aog-static",
+                    "mode": "aog_static",
                     "primary_model": "gpt-5.6-sol",
                     "primary_effort": "max",
                 },
@@ -65,7 +65,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "plan",
                     "--manifest",
                     str(path),
@@ -78,7 +78,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         plan = json.loads(completed.stdout)
-        self.assertEqual(plan["protocol"], "cco.benchmark-plan.v1")
+        self.assertEqual(plan["protocol"], "aog.benchmark-plan.v1")
         self.assertEqual(len(plan["runs"]), 2)
         bindings = {
             (run["task_sha256"], run["acceptance_sha256"])
@@ -90,7 +90,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         )
         self.assertEqual(
             {run["arm_id"] for run in plan["runs"]},
-            {"primary-sol-max", "cco-static"},
+            {"primary-sol-max", "aog-static"},
         )
         self.assertEqual(len({run["run_id"] for run in plan["runs"]}), 2)
 
@@ -108,7 +108,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "validate",
                     "--manifest",
                     str(path),
@@ -143,7 +143,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             command = [
                 sys.executable,
                 "-m",
-                "benchmarks.cco_benchmark",
+                "benchmarks.aog_benchmark",
                 "plan",
                 "--manifest",
                 str(path),
@@ -171,9 +171,9 @@ class BenchmarkHarnessTests(unittest.TestCase):
             first_by_task.setdefault(run["task_id"], run["arm_id"])
         counts = {
             arm: list(first_by_task.values()).count(arm)
-            for arm in {"primary-sol-max", "cco-static"}
+            for arm in {"primary-sol-max", "aog-static"}
         }
-        self.assertEqual(counts, {"primary-sol-max": 3, "cco-static": 3})
+        self.assertEqual(counts, {"primary-sol-max": 3, "aog-static": 3})
         self.assertEqual([run["sequence"] for run in runs], list(range(1, 13)))
 
     def test_usage_sums_each_model_and_deduplicates_cumulative_events(self) -> None:
@@ -281,7 +281,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             command = [
                 sys.executable,
                 "-m",
-                "benchmarks.cco_benchmark",
+                "benchmarks.aog_benchmark",
                 "usage",
             ]
             for path in paths:
@@ -296,7 +296,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         usage = json.loads(completed.stdout)
-        self.assertEqual(usage["protocol"], "cco.benchmark-usage.v1")
+        self.assertEqual(usage["protocol"], "aog.benchmark-usage.v1")
         self.assertEqual(
             usage["families"]["sol"],
             {
@@ -357,7 +357,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "usage",
                     "--rollout",
                     str(path),
@@ -386,7 +386,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "validate",
                     "--manifest",
                     str(path),
@@ -420,8 +420,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
         assert isinstance(arms, list)
         arms.append(
             {
-                "id": "cco-static-alt",
-                "mode": "cco_static",
+                "id": "aog-static-alt",
+                "mode": "aog_static",
                 "primary_model": "gpt-5.6-sol",
                 "primary_effort": "max",
             }
@@ -437,7 +437,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "plan",
                     "--manifest",
                     str(manifest_path),
@@ -452,16 +452,16 @@ class BenchmarkHarnessTests(unittest.TestCase):
             plan = json.loads(planned.stdout)
             verdicts = {
                 "primary-sol-max": "fail",
-                "cco-static": "pass",
-                "cco-static-alt": "pass",
+                "aog-static": "pass",
+                "aog-static-alt": "pass",
             }
             for index, run in enumerate(plan["runs"], start=1):
-                is_cco = run["arm_mode"] == "cco_static"
+                is_aog = run["arm_mode"] == "aog_static"
                 root_thread_id = f"00000000-0000-4000-8000-{index:012d}"
                 usage = {
-                    "protocol": "cco.benchmark-usage.v1",
+                    "protocol": "aog.benchmark-usage.v1",
                     "root_thread_id": root_thread_id,
-                    "rollouts": 2 if is_cco else 1,
+                    "rollouts": 2 if is_aog else 1,
                     "unexpected_models": [],
                     "models": {
                         "gpt-5.6-sol/max": counters(
@@ -473,7 +473,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                                     input_tokens=50, cached=20, output=5, requests=1
                                 )
                             }
-                            if is_cco
+                            if is_aog
                             else {}
                         ),
                     },
@@ -482,16 +482,16 @@ class BenchmarkHarnessTests(unittest.TestCase):
                             input_tokens=100, cached=40, output=10, requests=1
                         ),
                         "terra": counters(
-                            input_tokens=50 if is_cco else 0,
-                            cached=20 if is_cco else 0,
-                            output=5 if is_cco else 0,
-                            requests=1 if is_cco else 0,
+                            input_tokens=50 if is_aog else 0,
+                            cached=20 if is_aog else 0,
+                            output=5 if is_aog else 0,
+                            requests=1 if is_aog else 0,
                         ),
                         "luna": counters(),
                     },
                 }
                 result = {
-                    "protocol": "cco.benchmark-result.v1",
+                    "protocol": "aog.benchmark-result.v1",
                     "run_id": run["run_id"],
                     "manifest_sha256": run["manifest_sha256"],
                     "task_id": run["task_id"],
@@ -499,7 +499,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     "root_thread_id": root_thread_id,
                     "repetition": run["repetition"],
                     "verdict": verdicts[run["arm_id"]],
-                    "wall_time_seconds": 120 if is_cco else 90,
+                    "wall_time_seconds": 120 if is_aog else 90,
                     "usage": usage,
                 }
                 (results / f"{run['run_id']}.json").write_text(
@@ -510,7 +510,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "summarize",
                     "--plan",
                     str(plan_path),
@@ -525,21 +525,21 @@ class BenchmarkHarnessTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         summary = json.loads(completed.stdout)
-        self.assertEqual(summary["protocol"], "cco.benchmark-summary.v1")
+        self.assertEqual(summary["protocol"], "aog.benchmark-summary.v1")
         self.assertEqual(summary["expected_runs"], 3)
         self.assertEqual(summary["recorded_runs"], 3)
         self.assertEqual(summary["missing_run_ids"], [])
-        self.assertEqual(summary["paired"]["cco_static_wins"], 2)
+        self.assertEqual(summary["paired"]["aog_static_wins"], 2)
         self.assertEqual(summary["paired"]["pairs"], 2)
         self.assertEqual(
             set(summary["paired"]["by_pair"]),
             {
-                "primary-sol-max__vs__cco-static",
-                "primary-sol-max__vs__cco-static-alt",
+                "primary-sol-max__vs__aog-static",
+                "primary-sol-max__vs__aog-static-alt",
             },
         )
         self.assertEqual(
-            summary["arms"]["cco-static"]["tokens"]["terra"]["input_tokens"],
+            summary["arms"]["aog-static"]["tokens"]["terra"]["input_tokens"],
             50,
         )
         self.assertEqual(
@@ -563,8 +563,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
             }
 
         expected = {
-            "arm_id": "cco-static",
-            "arm_mode": "cco_static",
+            "arm_id": "aog-static",
+            "arm_mode": "aog_static",
             "manifest_sha256": "sha256:" + "a" * 64,
             "repetition": 1,
             "run_id": "run-accounting",
@@ -573,7 +573,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         root_thread_id = "11111111-1111-4111-8111-111111111111"
         result = {
             **expected,
-            "protocol": "cco.benchmark-result.v1",
+            "protocol": "aog.benchmark-result.v1",
             "root_thread_id": root_thread_id,
             "verdict": "pass",
             "wall_time_seconds": 1,
@@ -587,7 +587,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                     "gpt-5.6-sol/max": counter(input_tokens=10, requests=1),
                     "gpt-5.6-terra/max": counter(input_tokens=5, requests=1),
                 },
-                "protocol": "cco.benchmark-usage.v1",
+                "protocol": "aog.benchmark-usage.v1",
                 "root_thread_id": root_thread_id,
                 "unexpected_models": [],
             },
@@ -609,7 +609,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "plan",
                     "--manifest",
                     str(manifest_path),
@@ -625,7 +625,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "summarize",
                     "--plan",
                     str(plan_path),
@@ -648,7 +648,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             [
                 sys.executable,
                 "-m",
-                "benchmarks.cco_benchmark",
+                "benchmarks.aog_benchmark",
                 "plan",
                 "--manifest",
                 str(PILOT),
@@ -674,7 +674,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertTrue(all("patch" not in task for task in manifest["tasks"]))
         self.assertEqual(len(plan["runs"]), 12)
 
-    def test_usage_discovers_exact_cco_children_from_a_primary_thread(self) -> None:
+    def test_usage_discovers_exact_aog_children_from_a_primary_thread(self) -> None:
         root_id = "11111111-1111-4111-8111-111111111111"
         child_id = "22222222-2222-4222-8222-222222222222"
 
@@ -781,7 +781,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                         child_id,
                         str(child_rollout),
                         "/root/worker_n01_luna_max_g01",
-                        "cost_orchestrator_write_leaf",
+                        "aog_write_leaf",
                     ),
                 )
                 connection.execute(
@@ -793,7 +793,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "usage",
                     "--codex-home",
                     str(codex_home),
@@ -832,7 +832,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             "uncached_input_tokens": 100,
         }
         usage = {
-            "protocol": "cco.benchmark-usage.v1",
+            "protocol": "aog.benchmark-usage.v1",
             "root_thread_id": "11111111-1111-4111-8111-111111111111",
             "rollouts": 1,
             "unexpected_models": [],
@@ -851,7 +851,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "plan",
                     "--manifest",
                     str(manifest_path),
@@ -869,7 +869,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
             command = [
                 sys.executable,
                 "-m",
-                "benchmarks.cco_benchmark",
+                "benchmarks.aog_benchmark",
                 "record",
                 "--plan",
                 str(plan_path),
@@ -918,7 +918,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "usage",
                     "--rollout",
                     str(rollout),
@@ -942,7 +942,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
                 [
                     sys.executable,
                     "-m",
-                    "benchmarks.cco_benchmark",
+                    "benchmarks.aog_benchmark",
                     "preflight",
                     "--manifest",
                     str(manifest_path),
@@ -957,7 +957,7 @@ class BenchmarkHarnessTests(unittest.TestCase):
 
         self.assertIn(completed.returncode, {0, 3})
         report = json.loads(completed.stdout)
-        self.assertEqual(report["protocol"], "cco.benchmark-preflight.v1")
+        self.assertEqual(report["protocol"], "aog.benchmark-preflight.v1")
         self.assertIn("docker", report["checks"])
         self.assertIn("featurebench_revision", report["checks"])
         self.assertIn("blockers", report)

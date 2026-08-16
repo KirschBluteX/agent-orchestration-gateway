@@ -1,102 +1,26 @@
 # Changelog
 
-CCO follows semantic versioning while it remains pre-1.0. A pre-1.0 minor release may include
+AOG follows semantic versioning while it remains pre-1.0. A pre-1.0 minor release may include
 breaking changes. Public, installer, and manifest identities use a plain release version without
 build metadata.
 
-## Unreleased
+## 0.10.0 - 2026-08-16
 
 ### Changed
 
+- Renamed the project to Agent Orchestration Gateway and defined the AOG namespace as the sole
+  public, plugin, Agent, Hook, environment, state, and protocol identity.
 - Native routing now treats every bundled capability entry except an explicitly disabled one as
   available, allowing current Codex builds to route mechanical work to Luna without a backend-
   version gate.
 - Automatic routing has one source of truth: static Luna/Terra defaults intersected with the host
-  catalogue. The undocumented global/project route override and its trusted-root configuration
-  path were removed; task-level explicit model and effort pins remain supported.
+  catalogue. The undocumented global/project route override and trusted-root configuration path
+  were removed; task-level explicit model and effort pins remain supported.
 - Removed the standalone offline task-card repair utility and consolidated duplicated repository
   policy, operations documentation, and overlapping contract tests.
 
-## 0.9.3 - 2026-08-12
+### Runtime
 
-### Changed
-
-- Native spawn and interrupt attempts now reserve durable replay capacity before invocation,
-  settle by the exact dispatch and tool call even when a reused owner is addressed by task name,
-  and retain unresolved evidence across restart instead of silently releasing a lease.
-- Cooperative writer apply cleans up partial copies on deadlines and other process-level
-  interruptions while preserving its replayable rollback journal. Cooperative waves now fill the
-  requested capacity with up to four pairwise-disjoint writers under one aggregate resource budget.
-  Offline host-edge repair binds the final rollout proof to the exact persisted path and durably
-  retains or removes journals.
-- Doctor validates the fixed five-event Hook contract, exact handler schema when the host exposes
-  it, and the anchored CCO-only SubagentStop matcher instead of trusting a mutable local surface.
-- The orchestration skill now states exact Primary exceptions, disjoint ownership, quiet
-  event-driven waiting, per-revision validation ownership, and the prohibition on unprepared
-  planner or child spawns. Its concise contract limit is 480 words, and closed plans are bounded
-  to 128 nodes before graph normalization.
-- The public, installer, and manifest identity is `0.9.3`; durable protocol versions are unchanged,
-  and no coordinator, compatibility runtime, background service, or second ledger was added.
-
-## 0.9.2 - 2026-08-11
-
-### Changed
-
-- Current Codex Desktop opaque V2 Agent inputs are usable again under the default
-  `trusted_host` policy. Preflight uniquely matches the visible prepared envelope and durably
-  binds the exact observed ciphertext digest plus `tool_use_id`; postflight must present the same
-  pair. Duplicate preflight for one native call is idempotent only when that observed digest is
-  identical; a changed ciphertext cannot replace its live receipt.
-- `CCO_OPAQUE_MESSAGE_POLICY=strict` retains fail-closed opaque admission for environments that do
-  not accept the documented host-trust boundary. Plaintext native calls remain exact-input bound,
-  and policy changes never prevent settlement of an already reserved attempt.
-- The public, installer, and manifest identity is `0.9.2`; lifecycle and receipt protocols remain
-  unchanged, with no additional runtime, ledger, background service, or compatibility layer.
-
-## 0.9.1 - 2026-08-10
-
-### Changed
-
-- `0.9.1` is the current public, installer, and manifest identity. It remains deliberately
-  pre-1.0 with no build metadata.
-- Offline host-edge repair now durably publishes the exact owner-only rollback journal, pins that
-  current journal through retention even when host clocks are out of order, and rechecks its
-  rollout proof immediately before the edge-close commit.
-- Benchmark results now require every model-route counter to add exactly to its `sol`, `terra`, or
-  `luna` family counter. Doctor rejects missing, duplicate, and unknown CCO Hook definitions from
-  the authoritative host inventory.
-- Unbound opaque Agent messages now fail closed; exact plaintext or trusted prepared-input digest
-  metadata is required before spawn, reuse, continuation, or postflight settlement. Git subprocesses
-  also clear repository-routing environment overrides before inspecting or mutating a workspace.
-- Cooperative writers use bounded copies when declared scopes contain ignored content, apply
-  deadlines retain a replayable journal, and prefix-scope reparse inspection has one shared entry
-  budget. Partial rollout tails are retryable rather than permanently fencing a valid result.
-- The dependency marker, Hook-trust instructions, operational security boundary, and release
-  documents are aligned with the current maintenance release.
-
-## 0.9.0 - 2026-08-10
-
-### Release policy
-
-- `0.9.0` introduced the pre-1.0 public release identity without build metadata.
-- Historical labels from 2.x through 5.x are compressed into the pre-0.9 development history
-  below. Git history remains unchanged; this release does not rewrite commits, tags, or branches.
-
-### Changed
-
-- CCO accepts the canonical `cco.delegation.v1` input and keeps routing static. Mechanical work
-  prefers Luna only when the active V2 native backend exposes it; bounded and guarded work use
-  Terra.
-- The current durable protocols are `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`.
-  Predecessor active state must be inactive and cleaned up before a new task; there is no active
-  state compatibility or migration command.
-- Planner proposals remain stateless, schema-validated DAG input. Guarded work receives one final
-  independent reviewer unless the current plan explicitly sets `accept_risk: true`.
-- Owner reuse, restart observations, cooperative cleanup, Git isolation, and offline host-edge
-  repair retain the exact-state and replay protections introduced during development.
-
-## Pre-0.9 development history (2.x through 5.x)
-
-The 2.x through 5.x labels described internal development iterations of routing, lifecycle,
-recovery, cooperative writers, and host-edge maintenance. They are summarized here as pre-0.9
-development history rather than release upgrade targets; the existing Git history is retained.
+- AOG remains a local admission and lifecycle gateway for Codex native Agents. It does not add a
+  network proxy, provider layer, background service, dynamic route scorer, or second scheduler.
+- Current durable protocols are `aog.wave.v1`, `aog.lifecycle.v1`, and `aog.receipt.v1`.

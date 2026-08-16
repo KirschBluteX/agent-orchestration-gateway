@@ -1,0 +1,7 @@
+interface:
+  display_name: "Agent Orchestration Gateway"
+  short_description: "Route closed native Agent work with static local policy"
+  default_prompt: "Use $agent-orchestration-gateway:orchestrate to compile one closed delegation, invoke only its returned Agent actions, wait on their events, and perform final acceptance without duplicating delegated work."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,6 +1,6 @@
 # Reproducible benchmark protocol
 
-Benchmarking is an explicit development activity outside the CCO runtime. A benchmark
+Benchmarking is an explicit development activity outside the AOG runtime. A benchmark
 run may read local Codex JSONL events for that run and store a user-approved result
 file; it is not a runtime reporting service.
 
@@ -16,7 +16,7 @@ are not included in the manifest.
 Every task is run in two paired arms:
 
 1. `primary-sol-max`: Primary only, fixed to `gpt-5.6-sol/max`;
-2. `cco-static`: the same `gpt-5.6-sol/max` Primary with CCO static routing enabled.
+2. `aog-static`: the same `gpt-5.6-sol/max` Primary with AOG static routing enabled.
 
 The task statement, base commit, and acceptance hash are identical in each pair.
 The plan generator balances which arm runs first and produces 12 immutable run IDs.
@@ -28,9 +28,9 @@ public model-performance or economic claim.
 Validate and create a deterministic plan without invoking a model:
 
 ```text
-python -m benchmarks.cco_benchmark validate \
+python -m benchmarks.aog_benchmark validate \
   --manifest benchmarks/manifests/featurebench-pilot-v1.json
-python -m benchmarks.cco_benchmark plan \
+python -m benchmarks.aog_benchmark plan \
   --manifest benchmarks/manifests/featurebench-pilot-v1.json \
   > benchmarks/runs/featurebench-pilot-v1.plan.json
 ```
@@ -38,22 +38,22 @@ python -m benchmarks.cco_benchmark plan \
 Check the pinned FeatureBench checkout and host prerequisites before starting:
 
 ```text
-python -m benchmarks.cco_benchmark preflight \
+python -m benchmarks.aog_benchmark preflight \
   --manifest benchmarks/manifests/featurebench-pilot-v1.json \
   --featurebench-root <FEATUREBENCH_CHECKOUT>
 ```
 
 FeatureBench currently uses POSIX `fcntl` and Docker. On Windows, run its evaluator
 through a WSL/Linux distribution after Docker Desktop's Linux engine is ready. Codex
-and CCO may remain on the Windows host while task workspaces are bind-mounted for
+and AOG may remain on the Windows host while task workspaces are bind-mounted for
 evaluation.
 
 After a run, collect usage from the Primary thread UUID. The command follows only
-the exact root and its direct CCO leaves, rejects nested or non-CCO children, and
+the exact root and its direct AOG leaves, rejects nested or non-AOG children, and
 uses `last_token_usage` deltas to avoid counting repeated cumulative events:
 
 ```text
-python -m benchmarks.cco_benchmark usage \
+python -m benchmarks.aog_benchmark usage \
   --root-thread-id <PRIMARY_THREAD_UUID> \
   --codex-home <CODEX_HOME> \
   > <RUN_ID>.usage.json
@@ -69,13 +69,13 @@ Bind the usage and evaluator verdict to the planned run, then summarize only com
 pairs:
 
 ```text
-python -m benchmarks.cco_benchmark record \
+python -m benchmarks.aog_benchmark record \
   --plan benchmarks/runs/featurebench-pilot-v1.plan.json \
   --run-id <RUN_ID> --usage <RUN_ID>.usage.json \
   --verdict pass --wall-time-seconds <SECONDS> \
   --results-dir benchmarks/results/featurebench-pilot-v1
 
-python -m benchmarks.cco_benchmark summarize \
+python -m benchmarks.aog_benchmark summarize \
   --plan benchmarks/runs/featurebench-pilot-v1.plan.json \
   --results-dir benchmarks/results/featurebench-pilot-v1
 ```
@@ -87,9 +87,9 @@ host-provided usage values and never infers a price.
 
 ## Comparison discipline
 
-Use the pilot to classify failures as CCO placement/lifecycle/scope defects, model
+Use the pilot to classify failures as AOG placement/lifecycle/scope defects, model
 capability failures, evaluator failures, or infrastructure failures. Fix only defects
-attributable to CCO, turn each confirmed defect into a regression test, and reserve a
+attributable to AOG, turn each confirmed defect into a regression test, and reserve a
 held-out task set for the final report. Do not repeatedly tune against the held-out
 set or combine runs from different Codex/model revisions.
 

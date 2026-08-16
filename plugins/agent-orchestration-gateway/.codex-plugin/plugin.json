@@ -1,0 +1,37 @@
+{
+  "name": "agent-orchestration-gateway",
+  "version": "0.10.0",
+  "description": "Fast role-aware Codex orchestration with thin skills, static native Agent routing, and exact-state acceptance evidence.",
+  "author": {
+    "name": "KirschQAQ",
+    "url": "https://github.com/KirschBluteX"
+  },
+  "homepage": "https://github.com/KirschBluteX/agent-orchestration-gateway#readme",
+  "repository": "https://github.com/KirschBluteX/agent-orchestration-gateway",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "orchestration",
+    "multi-agent",
+    "static-routing",
+    "model-routing"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Orchestration Gateway",
+    "shortDescription": "Static native Agent routes with exact-state acceptance.",
+    "longDescription": "A local admission and lifecycle gateway for closed, scoped Codex Agent work. AOG provides deterministic native routing, workspace verification, owner reuse, and acceptance evidence while Primary retains final authority.",
+    "developerName": "KirschQAQ",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/KirschBluteX/agent-orchestration-gateway",
+    "defaultPrompt": [
+      "Implement and verify this feature with AOG's default static route.",
+      "Inspect this system through a closed AOG explorer contract.",
+      "Review this exact state through an independent AOG reviewer."
+    ]
+  }
+}

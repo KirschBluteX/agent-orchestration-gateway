@@ -7,7 +7,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
+SCRIPTS = ROOT / "plugins" / "agent-orchestration-gateway" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from protocol_hash import (  # noqa: E402

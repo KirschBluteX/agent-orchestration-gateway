@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
+SCRIPTS = ROOT / "plugins" / "agent-orchestration-gateway" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from install_agents import (  # noqa: E402
@@ -43,7 +43,7 @@ def hook_inventory(*, trusted: bool = True) -> dict[str, object]:
             {
                 "enabled": True,
                 "eventName": event,
-                "pluginId": "codex-cost-orchestrator@codex-cost-orchestrator",
+                "pluginId": "agent-orchestration-gateway@agent-orchestration-gateway",
                 "trustStatus": "trusted" if trusted else "untrusted",
             }
             for event in events
@@ -96,7 +96,7 @@ class InstallerTests(unittest.TestCase):
 
             def fail_second_install(source: object, destination: object) -> None:
                 nonlocal install_calls
-                if Path(source).name.startswith(".cco-profile-"):
+                if Path(source).name.startswith(".aog-profile-"):
                     install_calls += 1
                     if install_calls == 2:
                         raise OSError("injected replace failure")
@@ -107,7 +107,7 @@ class InstallerTests(unittest.TestCase):
                     install(target, replace=True)
             for destination, contents in originals.items():
                 self.assertEqual(destination.read_bytes(), contents)
-            self.assertFalse(list(target.glob(".cco-profile-*")))
+            self.assertFalse(list(target.glob(".aog-profile-*")))
 
     def test_doctor_checks_profiles_hooks_and_static_route(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -132,7 +132,7 @@ class InstallerTests(unittest.TestCase):
                 1,
             )
 
-    def test_doctor_rejects_duplicate_and_unknown_cco_hook_definitions(self) -> None:
+    def test_doctor_rejects_duplicate_and_unknown_aog_hook_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "agents"
             install(target)
@@ -145,7 +145,7 @@ class InstallerTests(unittest.TestCase):
                         {
                             "enabled": True,
                             "eventName": event_name,
-                            "pluginId": "codex-cost-orchestrator@codex-cost-orchestrator",
+                            "pluginId": "agent-orchestration-gateway@agent-orchestration-gateway",
                             "trustStatus": "trusted",
                         }
                     )

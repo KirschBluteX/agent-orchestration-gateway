@@ -9,7 +9,7 @@ import unittest
 SCRIPTS = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "codex-cost-orchestrator"
+    / "agent-orchestration-gateway"
     / "scripts"
 )
 sys.path.insert(0, str(SCRIPTS))
@@ -52,9 +52,9 @@ class WorkspaceGuardIgnoredPolicyTests(unittest.TestCase):
         committed = self.git(
             repo,
             "-c",
-            "user.name=CCO Tests",
+            "user.name=AOG Tests",
             "-c",
-            "user.email=cco-tests@example.invalid",
+            "user.email=aog-tests@example.invalid",
             "commit",
             "-m",
             "initial",
@@ -164,7 +164,7 @@ class WorkspaceGuardIgnoredPolicyTests(unittest.TestCase):
                 workspace_guard.validate_baseline(rebound)
 
             predecessor = deepcopy(baseline)
-            predecessor["snapshot"]["schema"] = "cco.workspace-state.v3"
+            predecessor["snapshot"]["schema"] = "aog.workspace-state.v3"
             with self.assertRaisesRegex(
                 workspace_guard.WorkspaceGuardError,
                 "unsupported schema",
@@ -193,9 +193,9 @@ class WorkspaceGuardIgnoredPolicyTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-am",
                 "add submodule",
@@ -250,9 +250,9 @@ class WorkspaceGuardIgnoredPolicyTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-am",
                 "add submodules",

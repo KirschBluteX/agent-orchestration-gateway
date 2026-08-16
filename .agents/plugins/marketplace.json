@@ -1,14 +1,14 @@
 {
-  "name": "codex-cost-orchestrator",
+  "name": "agent-orchestration-gateway",
   "interface": {
-    "displayName": "Codex Cost Orchestrator"
+    "displayName": "Agent Orchestration Gateway"
   },
   "plugins": [
     {
-      "name": "codex-cost-orchestrator",
+      "name": "agent-orchestration-gateway",
       "source": {
         "source": "local",
-        "path": "./plugins/codex-cost-orchestrator"
+        "path": "./plugins/agent-orchestration-gateway"
       },
       "policy": {
         "installation": "AVAILABLE",

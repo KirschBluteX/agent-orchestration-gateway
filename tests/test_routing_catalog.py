@@ -5,7 +5,7 @@ import sys
 import unittest
 
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "codex-cost-orchestrator" / "scripts"
+SCRIPTS = Path(__file__).resolve().parents[1] / "plugins" / "agent-orchestration-gateway" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from routing_catalog import (  # noqa: E402

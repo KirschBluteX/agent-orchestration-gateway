@@ -10,7 +10,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
+PLUGIN = ROOT / "plugins" / "agent-orchestration-gateway"
 SCRIPTS = PLUGIN / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
@@ -50,7 +50,7 @@ def canonical_hook_inventory() -> dict[str, object]:
                         "eventName": lifecycle[:1].lower() + lifecycle[1:],
                         "handlerType": handler["type"],
                         "matcher": group.get("matcher"),
-                        "pluginId": "codex-cost-orchestrator@codex-cost-orchestrator",
+                        "pluginId": "agent-orchestration-gateway@agent-orchestration-gateway",
                         "statusMessage": handler["statusMessage"],
                         "timeoutSec": handler["timeout"],
                         "trustStatus": "trusted",
@@ -76,9 +76,9 @@ class InstallAgentsHookContractTests(unittest.TestCase):
 
     def test_doctor_rejects_each_canonical_hook_schema_field_drift(self) -> None:
         replacements = {
-            "command": "python -B \"not-the-cco-hook.py\"",
+            "command": "python -B \"not-the-aog-hook.py\"",
             "handlerType": "prompt",
-            "matcher": "cost_orchestrator_read_leaf",
+            "matcher": "aog_read_leaf",
             "statusMessage": "Unexpected Hook status",
             "timeoutSec": 1,
         }

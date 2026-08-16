@@ -8,9 +8,9 @@ private task content, or unredacted Codex logs.
 Use Python 3.11+ and install `requirements.txt`; `zstandard` is required on Python versions
 below 3.14. Codex CLI is needed only for live native-catalog and end-to-end checks.
 
-For installation changes, bootstrap the profiles, review and trust the five exact CCO Hook
+For installation changes, bootstrap the profiles, review and trust the five exact AOG Hook
 definitions in `/hooks`, start a new Codex task, and only then run `--doctor`. Doctor must fail
-for missing, duplicate, or unknown CCO Hook definitions.
+for missing, duplicate, or unknown AOG Hook definitions.
 
 Run before opening a pull request:
 
@@ -18,15 +18,15 @@ Run before opening a pull request:
 python -m pip install -r requirements.txt PyYAML==6.0.2 ruff==0.15.22
 python -X utf8 -B -m unittest discover -s tests -v
 python -m ruff check plugins tests benchmarks .github/scripts
-python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
-python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skills/orchestrate
-python <skill-validator>/quick_validate.py plugins/codex-cost-orchestrator/skills/manage-cco
+python .github/scripts/validate_plugin.py plugins/agent-orchestration-gateway
+python <skill-validator>/quick_validate.py plugins/agent-orchestration-gateway/skills/orchestrate
+python <skill-validator>/quick_validate.py plugins/agent-orchestration-gateway/skills/manage-aog
 git diff --check
 ```
 
 ## Project boundaries
 
-- Keep the canonical `cco.delegation.v1` compiler input closed and schema validated.
+- Keep the canonical `aog.delegation.v1` compiler input closed and schema validated.
 - Keep one deterministic assurance ladder and static Luna/Terra automatic routes.
 - Preserve exact/prefix scope handling, scoped reader scans, Primary final authority, and the
   current wave/lifecycle/receipt protocols.

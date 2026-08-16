@@ -1,1 +1,1 @@
-"""Explicit, development-only benchmark tooling for CCO."""
+"""Explicit, development-only benchmark tooling for AOG."""

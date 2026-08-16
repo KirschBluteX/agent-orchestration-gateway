@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "plugins" / "codex-cost-orchestrator" / "scripts"
+SCRIPTS = ROOT / "plugins" / "agent-orchestration-gateway" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import control_plane as control_plane_module  # noqa: E402
@@ -61,9 +61,9 @@ class CooperativeWriterTests(unittest.TestCase):
                 [
                     "git",
                     "-c",
-                    "user.name=CCO Tests",
+                    "user.name=AOG Tests",
                     "-c",
-                    "user.email=cco-tests@example.invalid",
+                    "user.email=aog-tests@example.invalid",
                     "commit",
                     "-qm",
                     "base",
@@ -218,9 +218,9 @@ class CooperativeWriterTests(unittest.TestCase):
             [
                 "git",
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-qm",
                 "ignore cache",
@@ -718,7 +718,7 @@ class CooperativeWriterTests(unittest.TestCase):
             "closed": True,
             "declared_tools": [],
             "direct": False,
-            "protocol": "cco.delegation.v1",
+            "protocol": "aog.delegation.v1",
             "upper_bound_seconds": 60,
             "work": {"kind": "dag", "plan": self.plan()},
             "writer_isolation": "cooperative",
@@ -1082,7 +1082,7 @@ class CooperativeWriterTests(unittest.TestCase):
                 batch_id="sha256:" + "1" * 64,
                 members=[{"id": "left", "scopes": [{"kind": "exact", "path": "a.txt"}]}],
             )
-        self.assertFalse((state_root / "isolates" / ".cco-writer-isolation-owned-v1").exists())
+        self.assertFalse((state_root / "isolates" / ".aog-writer-isolation-owned-v1").exists())
         with self.assertRaisesRegex(isolation_module.WriterIsolationError, "inside, above"):
             isolation_module.prepare_isolates(
                 canonical / "state",

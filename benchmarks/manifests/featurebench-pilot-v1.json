@@ -1,5 +1,5 @@
 {
-  "protocol": "cco.benchmark-manifest.v1",
+  "protocol": "aog.benchmark-manifest.v1",
   "study_id": "featurebench-pilot-v1",
   "dataset": {
     "name": "LiberCoders/FeatureBench",
@@ -13,7 +13,7 @@
     "version": "0.2.1"
   },
   "selection": {
-    "algorithm": "cco.featurebench-stratified-v1",
+    "algorithm": "aog.featurebench-stratified-v1",
     "source_rows": 100,
     "unique_repositories": true,
     "rank": "sha256(dataset.revision + ':' + task.id)",
@@ -42,8 +42,8 @@
       "primary_effort": "max"
     },
     {
-      "id": "cco-static",
-      "mode": "cco_static",
+      "id": "aog-static",
+      "mode": "aog_static",
       "primary_model": "gpt-5.6-sol",
       "primary_effort": "max"
     }

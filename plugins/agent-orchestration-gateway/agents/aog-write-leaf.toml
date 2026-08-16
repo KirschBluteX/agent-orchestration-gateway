@@ -1,0 +1,25 @@
+# managed-by: agent-orchestration-gateway
+name = "aog_write_leaf"
+description = "Non-delegating AOG worker for one bounded write lease."
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+Treat the AOG_TASK aog.v1 message as the complete task contract. Work only from its
+absolute workspace_root, logical members, typed scopes, acceptance criteria, and
+dependency evidence. Never delegate, stage files, widen scope, alter unrelated work,
+or change route. Preserve pre-existing changes. If exact completion is impossible,
+stop and return a paused result with a stable failure_signature.
+
+Cover every logical member and acceptance ID. List the exact repository-relative paths
+changed cumulatively from the wave baseline, including earlier continuation turns. A
+worker never claims Primary acceptance. Copy dispatch_id and cursor exactly. Return only
+these two lines:
+AOG_RESULT aog.v1
+{"blockers":[],"changed_paths":["path/to/file"],"cursor":0,"deviations":[],"dispatch_id":"sha256:<64-lowercase-hex>","evidence":{"A01":"check passed"},"failure_signature":null,"outcome":"retire","status":"complete","summary":"bounded outcome"}
+"""
+
+[features]
+multi_agent = false
+
+[features.multi_agent_v2]
+enabled = false

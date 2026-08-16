@@ -49,12 +49,12 @@ jobs:
         run: python -X utf8 -B -m unittest discover -s tests -v
 
       - name: Run repository plugin contract validator
-        run: python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
+        run: python .github/scripts/validate_plugin.py plugins/agent-orchestration-gateway
 
       - name: Run skill validator
         run: |
-          python .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py plugins/codex-cost-orchestrator/skills/orchestrate
-          python .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py plugins/codex-cost-orchestrator/skills/manage-cco
+          python .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py plugins/agent-orchestration-gateway/skills/orchestrate
+          python .codex-skill-validator/skills/.system/skill-creator/scripts/quick_validate.py plugins/agent-orchestration-gateway/skills/manage-aog
 
       - name: Check patch whitespace
         run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD

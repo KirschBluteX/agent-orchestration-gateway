@@ -14,7 +14,7 @@ from unittest import mock
 SCRIPTS = (
     Path(__file__).resolve().parents[1]
     / "plugins"
-    / "codex-cost-orchestrator"
+    / "agent-orchestration-gateway"
     / "scripts"
 )
 sys.path.insert(0, str(SCRIPTS))
@@ -25,7 +25,7 @@ from workspace_state import StateUnavailable  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 STATE_TOOL = (
-    REPO / "plugins" / "codex-cost-orchestrator" / "scripts" / "workspace_state.py"
+    REPO / "plugins" / "agent-orchestration-gateway" / "scripts" / "workspace_state.py"
 )
 
 
@@ -311,9 +311,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
         commit = self.git(
             repo,
             "-c",
-            "user.name=CCO Tests",
+            "user.name=AOG Tests",
             "-c",
-            "user.email=cco-tests@example.invalid",
+            "user.email=aog-tests@example.invalid",
             "commit",
             "-m",
             "initial",
@@ -391,9 +391,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-m",
                 "ignore generated trees",
@@ -536,9 +536,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-m",
                 "ignore generated trees",
@@ -805,7 +805,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
-            direct = repo / ".git" / "cco-device-baseline.json"
+            direct = repo / ".git" / "aog-device-baseline.json"
             device_alias = "\\\\?\\" + str(direct)
 
             capture = subprocess.run(
@@ -832,7 +832,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             repo = self.make_repo(root)
-            direct = repo / ".git" / "cco-unc-baseline.json"
+            direct = repo / ".git" / "aog-unc-baseline.json"
             drive = direct.drive.rstrip(":")
             if not drive:
                 self.skipTest("the temporary directory is not on a drive-letter volume")
@@ -1138,7 +1138,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             hooks = repo / ".git" / "hooks"
             target = root / "hooks-target"
             shutil.copytree(hooks, target)
-            marker = target / "cco-marker"
+            marker = target / "aog-marker"
             marker.write_text("baseline\n", encoding="utf-8")
             shutil.rmtree(hooks)
             linked = subprocess.run(
@@ -1318,9 +1318,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             commit = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-m",
                 "add distinct names",
@@ -1373,9 +1373,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-m",
                 "add distinct slash spellings",
@@ -1505,7 +1505,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             self.assertEqual(capture.returncode, 0, capture.stderr)
             baseline = root / "baseline.json"
             baseline.write_text(capture.stdout, encoding="utf-8")
-            configured = self.git(repo, "config", "core.hooksPath", ".cco-hooks")
+            configured = self.git(repo, "config", "core.hooksPath", ".aog-hooks")
             self.assertEqual(configured.returncode, 0, configured.stderr)
 
             verify = subprocess.run(
@@ -1905,7 +1905,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             )
 
             self.assertEqual(verify.returncode, 2)
-            self.assertIn("exact v4 required fields", verify.stderr)
+            self.assertIn("exact v1 required fields", verify.stderr)
 
     def test_already_dirty_submodule_content_remains_observed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1929,9 +1929,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-am",
                 "add submodule",
@@ -2096,9 +2096,9 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
             committed = self.git(
                 repo,
                 "-c",
-                "user.name=CCO Tests",
+                "user.name=AOG Tests",
                 "-c",
-                "user.email=cco-tests@example.invalid",
+                "user.email=aog-tests@example.invalid",
                 "commit",
                 "-am",
                 "add submodule",
@@ -2174,7 +2174,7 @@ class WorkspaceStateBehaviorTests(unittest.TestCase):
 
             self.assertEqual(verify.returncode, 1, verify.stderr)
             result = json.loads(verify.stdout)
-            self.assertEqual(result["schema"], "cco.workspace-verification.v3")
+            self.assertEqual(result["schema"], "aog.workspace-verification.v1")
             self.assertEqual(result["allowed_scopes"], [])
             self.assertEqual(result["violations"], ["outside_lease:src/owned.txt"])
 

@@ -8,10 +8,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN = ROOT / "plugins" / "codex-cost-orchestrator"
+PLUGIN = ROOT / "plugins" / "agent-orchestration-gateway"
 ORCHESTRATE = PLUGIN / "skills" / "orchestrate"
-MANAGE = PLUGIN / "skills" / "manage-cco"
-RELEASE = "0.9.3"
+MANAGE = PLUGIN / "skills" / "manage-aog"
+RELEASE = "0.10.0"
 
 
 def text(path: Path) -> str:
@@ -19,6 +19,46 @@ def text(path: Path) -> str:
 
 
 class ProjectContractTests(unittest.TestCase):
+    def test_previous_identity_is_absent_from_published_text_and_paths(self) -> None:
+        previous_short = "".join(("c", "co"))
+        previous_slug = "-".join(("codex", "cost", "orchestrator"))
+        previous_display = " ".join(("Codex", "Cost", "Orchestrator"))
+        previous_role = "_".join(("cost", "orchestrator"))
+        short_identity = re.compile(
+            rf"(^|[^A-Za-z0-9]){re.escape(previous_short)}([^A-Za-z0-9]|$)",
+            re.IGNORECASE,
+        )
+        roots = (
+            ROOT / ".agents",
+            ROOT / ".github",
+            ROOT / "benchmarks",
+            ROOT / "docs",
+            ROOT / "plugins",
+            ROOT / "tests",
+        )
+        paths = [
+            ROOT / "AGENTS.md",
+            ROOT / "CHANGELOG.md",
+            ROOT / "CONTRIBUTING.md",
+            ROOT / "README.md",
+            ROOT / "README.zh-CN.md",
+            ROOT / "SECURITY.md",
+            *(path for root in roots for path in root.rglob("*") if path.is_file()),
+        ]
+        for path in paths:
+            relative = path.relative_to(ROOT).as_posix()
+            if (ROOT / "benchmarks" / "runs") in path.parents:
+                continue
+            if path.suffix not in {".json", ".md", ".py", ".toml", ".yaml", ".yml"}:
+                continue
+            value = text(path)
+            with self.subTest(path=relative):
+                self.assertNotIn(previous_slug, relative)
+                self.assertNotIn(previous_slug, value)
+                self.assertNotIn(previous_display, value)
+                self.assertNotIn(previous_role, value)
+                self.assertIsNone(short_identity.search(value))
+
     def test_public_identity_and_bilingual_entrypoints_are_consistent(self) -> None:
         english = text(ROOT / "README.md")
         chinese = text(ROOT / "README.zh-CN.md")
@@ -28,7 +68,7 @@ class ProjectContractTests(unittest.TestCase):
 
         self.assertIn("[简体中文](README.zh-CN.md)", english)
         self.assertIn("[English](README.md)", chinese)
-        self.assertEqual(manifest["name"], "codex-cost-orchestrator")
+        self.assertEqual(manifest["name"], "agent-orchestration-gateway")
         self.assertEqual(manifest["version"], RELEASE)
         self.assertIn(f'PLUGIN_VERSION = "{RELEASE}"', installer)
         self.assertIn("PLUGIN_RELEASE = PLUGIN_VERSION", installer)
@@ -53,7 +93,7 @@ class ProjectContractTests(unittest.TestCase):
             "user explicitly requests direct execution",
         ):
             self.assertIn(required, hot)
-        self.assertIn("codex-cost-orchestrator:orchestrate", agents)
+        self.assertIn("agent-orchestration-gateway:orchestrate", agents)
         self.assertIn("explicit delegation instructions", agents)
         self.assertNotIn("control_plane.py plan", hot)
         self.assertIn(
@@ -77,10 +117,10 @@ class ProjectContractTests(unittest.TestCase):
             )
         )
         for value in (
-            "cco.delegation.v1",
-            "cco.wave.v3",
-            "cco.lifecycle.v2",
-            "cco.receipt.v2",
+            "aog.delegation.v1",
+            "aog.wave.v1",
+            "aog.lifecycle.v1",
+            "aog.receipt.v1",
             "exact",
             "prefix",
             "zstandard",
@@ -110,17 +150,13 @@ class ProjectContractTests(unittest.TestCase):
             "resolve_planner_route",
             "load_route_policy",
             "trusted_project_roots",
-            "cco.toml",
-            "migrate-recoveries",
-            "cco.lifecycle.v1",
-            "cco.pending-event.v1",
-            "cco.wave.v1",
+            "aog.toml",
         ):
             self.assertNotIn(forbidden, runtime)
         self.assertFalse((PLUGIN / "maintenance" / "repair_host_edges.py").exists())
-        self.assertIn('PROTOCOL = "cco.v9"', runtime)
-        self.assertIn('LIFECYCLE_PROTOCOL = "cco.lifecycle.v2"', runtime)
-        self.assertIn('PENDING_EVENT_PROTOCOL = "cco.receipt.v2"', runtime)
+        self.assertIn('PROTOCOL = "aog.v1"', runtime)
+        self.assertIn('LIFECYCLE_PROTOCOL = "aog.lifecycle.v1"', runtime)
+        self.assertIn('PENDING_EVENT_PROTOCOL = "aog.receipt.v1"', runtime)
 
     def test_profiles_are_model_neutral_non_delegating_leaves(self) -> None:
         profiles = {
@@ -130,8 +166,8 @@ class ProjectContractTests(unittest.TestCase):
         self.assertEqual(
             set(profiles),
             {
-                "codex-cost-orchestrator-read-leaf.toml",
-                "codex-cost-orchestrator-write-leaf.toml",
+                "aog-read-leaf.toml",
+                "aog-write-leaf.toml",
             },
         )
         for profile in profiles.values():
@@ -139,8 +175,8 @@ class ProjectContractTests(unittest.TestCase):
             self.assertNotIn("model_reasoning_effort", profile)
             self.assertFalse(profile["features"]["multi_agent"])
             self.assertEqual(profile["features"]["multi_agent_v2"], {"enabled": False})
-            self.assertIn("CCO_TASK cco.v9", profile["developer_instructions"])
-            self.assertIn("CCO_RESULT cco.v9", profile["developer_instructions"])
+            self.assertIn("AOG_TASK aog.v1", profile["developer_instructions"])
+            self.assertIn("AOG_RESULT aog.v1", profile["developer_instructions"])
 
     def test_hooks_ci_and_published_files_cover_release_validation(self) -> None:
         hooks = json.loads(text(PLUGIN / "hooks" / "hooks.json"))["hooks"]
@@ -153,20 +189,20 @@ class ProjectContractTests(unittest.TestCase):
         )
         self.assertEqual(
             hooks["SubagentStop"][0]["matcher"],
-            "^(cost_orchestrator_read_leaf|cost_orchestrator_write_leaf)$",
+            "^(aog_read_leaf|aog_write_leaf)$",
         )
         self.assertIn("HOST_HOOK_CONTRACT", installer)
         self.assertIn("_validate_local_hook_contract", installer)
         self.assertNotIn('"matcher": ".*"', json.dumps(hooks))
         self.assertIn("ruff check plugins tests benchmarks .github/scripts", workflow)
-        self.assertIn("validate_plugin.py plugins/codex-cost-orchestrator", workflow)
+        self.assertIn("validate_plugin.py plugins/agent-orchestration-gateway", workflow)
         self.assertIn("quick_validate.py", workflow)
         for relative in (
             "CHANGELOG.md",
             "CONTRIBUTING.md",
             "SECURITY.md",
             "docs/BENCHMARK.md",
-            "benchmarks/cco_benchmark.py",
+            "benchmarks/aog_benchmark.py",
         ):
             self.assertTrue((ROOT / relative).is_file(), relative)
 

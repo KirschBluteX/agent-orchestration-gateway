@@ -1,15 +1,17 @@
-# Codex Cost Orchestrator
+# Agent Orchestration Gateway
 
 [简体中文](README.zh-CN.md)
 
-Codex Cost Orchestrator (CCO) is a local control plane for Codex native Agents.
-Primary keeps intent, integration, and final acceptance; CCO dispatches closed,
-scoped work and returns exact acceptance evidence. CCO remains pre-1.0.
+Agent Orchestration Gateway (AOG) is a local control plane for Codex native Agents.
+Primary keeps intent, integration, and final acceptance; AOG dispatches closed,
+scoped work and returns exact acceptance evidence. Gateway means the admission and
+lifecycle boundary between Primary and native Agents, not a network or provider proxy.
+AOG remains pre-1.0.
 
 ## Delegation contract
 
 Normal work is delegated by default through one canonical `prepare` command. The
-input is a schema-validated `cco.delegation.v1` envelope: closed work, explicit
+input is a schema-validated `aog.delegation.v1` envelope: closed work, explicit
 acceptance IDs, and repository-relative scopes. Every scope is exactly one of
 `{"kind":"exact","path":"…"}` or `{"kind":"prefix","path":"…"}`.
 
@@ -18,8 +20,8 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --ca
 ```
 
 Invoke each returned action with only its supplied tool input. Primary must clarify or close
-unresolved work before `prepare`; every native child must be prepared by CCO. A pre-existing
-`cco.planner-proposal.v1` value is accepted only as stateless, schema-validated DAG input. It is
+unresolved work before `prepare`; every native child must be prepared by AOG. A pre-existing
+`aog.planner-proposal.v1` value is accepted only as stateless, schema-validated DAG input. It is
 not a planner route, lifecycle, or direct-spawn permission.
 
 Current Codex Desktop builds may replace the prepared Agent message with opaque
@@ -29,7 +31,7 @@ ciphertext digest and `tool_use_id` in the existing durable receipt and requires
 same pair at postflight. This restores native V2 spawn, reuse, and continuation
 without adding another runtime or ledger. It trusts the host; it does not prove that
 the hidden plaintext equals the prepared message. Set
-`CCO_OPAQUE_MESSAGE_POLICY=strict` before starting Codex to reject all opaque Agent
+`AOG_OPAQUE_MESSAGE_POLICY=strict` before starting Codex to reject all opaque Agent
 inputs until the host exposes an authenticated plaintext digest.
 
 Primary stays in control only for explicit authority, clarification, an explicit
@@ -48,9 +50,9 @@ do not treat the child as failed, narrate unchanged progress, or duplicate its w
 | Guarded work and final reviewer | Terra |
 
 The compiler filters routes through the active native capability catalogue, so a
-model not offered by the host is never attempted. CCO does not start another Agent
+model not offered by the host is never attempted. AOG does not start another Agent
 runtime to reach Luna; a valid Luna entry that is not explicitly disabled makes the
-existing static route eligible without a protocol migration. It marks work
+existing static route eligible. It marks work
 guarded for semantic or manual verification, public
 interfaces, security/authentication, concurrency, persistence, migration or
 recovery, installer work, filesystem transactions, irreversible actions, test
@@ -66,13 +68,13 @@ still has a fresh dispatch and baseline.
 
 ## State
 
-Current runtime records use `cco.wave.v3`, `cco.lifecycle.v2`, and
-`cco.receipt.v2`.
+Current runtime records use `aog.wave.v1`, `aog.lifecycle.v1`, and
+`aog.receipt.v1`.
 
-Readers scan only their declared scopes. CCO admits one normal writer at a time for
+Readers scan only their declared scopes. AOG admits one normal writer at a time for
 a canonical workspace and fails closed on conflicting live work. `status`,
 `continue`, `native-failure`, `retry`, `restart`, and `cleanup` operate on the
-current task; see [operations](plugins/codex-cost-orchestrator/skills/manage-cco/references/operations.md).
+current task; see [operations](plugins/agent-orchestration-gateway/skills/manage-aog/references/operations.md).
 
 ## Experimental cooperative writers
 
@@ -80,7 +82,7 @@ current task; see [operations](plugins/codex-cost-orchestrator/skills/manage-cco
 of fresh writer nodes that fits the requested native capacity, with a four-writer
 safety ceiling. A clean Git workspace uses managed worktrees; dirty Git and directory
 workspaces use bounded copies. File, byte, and journal limits apply to the whole wave,
-not once per writer. CCO stages exact backups and one bounded apply journal before
+not once per writer. AOG stages exact backups and one bounded apply journal before
 integration. Guarded writers may be followed by the single compiler-injected final
 reviewer; no other cooperative DAG shape is admitted.
 Successful cleanup removes completed isolate and journal material; an incomplete
@@ -99,14 +101,14 @@ current Codex installation with plugins, Hooks, and native Agents.
 ```text
 python -m pip install -r requirements.txt
 codex plugin marketplace add .
-codex plugin add codex-cost-orchestrator@codex-cost-orchestrator
-python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --bootstrap
+codex plugin add agent-orchestration-gateway@agent-orchestration-gateway
+python -B plugins/agent-orchestration-gateway/scripts/install_agents.py --workspace <PROJECT> --bootstrap
 ```
 
-Review and trust the five CCO Hooks in `/hooks`, start a new Codex task, then run:
+Review and trust the five AOG Hooks in `/hooks`, start a new Codex task, then run:
 
 ```text
-python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
+python -B plugins/agent-orchestration-gateway/scripts/install_agents.py --workspace <PROJECT> --doctor
 ```
 
 ## Development
@@ -114,7 +116,7 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 ```text
 python -X utf8 -B -m unittest discover -s tests -v
 python -m ruff check plugins tests benchmarks .github/scripts
-python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
+python .github/scripts/validate_plugin.py plugins/agent-orchestration-gateway
 git diff --check
 ```
 
