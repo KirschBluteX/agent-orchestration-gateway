@@ -1,124 +1,125 @@
 # Agent Orchestration Gateway
 
-[简体中文](README.zh-CN.md)
+## English
 
-Agent Orchestration Gateway (AOG) is a local control plane for Codex native Agents.
-Primary keeps intent, integration, and final acceptance; AOG dispatches closed,
-scoped work and returns exact acceptance evidence. Gateway means the admission and
-lifecycle boundary between Primary and native Agents, not a network or provider proxy.
-AOG remains pre-1.0.
+Agent Orchestration Gateway (AOG) is a thin, explicit Codex Skill for supervising software work.
+Primary clarifies the initiative with the user, proposes a non-overlapping module DAG, and dispatches
+approved modules as native Codex tasks. Each module may use bounded native subagents for independent
+leaves. Codex itself owns tasks, worktrees, Goals, and waits; AOG adds no runtime, Hooks, database, or
+lifecycle state.
 
-## Delegation contract
+## 简体中文
 
-Normal work is delegated by default through one canonical `prepare` command. The
-input is a schema-validated `aog.delegation.v1` envelope: closed work, explicit
-acceptance IDs, and repository-relative scopes. Every scope is exactly one of
-`{"kind":"exact","path":"…"}` or `{"kind":"prefix","path":"…"}`.
+Agent Orchestration Gateway（AOG）是一个轻量、显式调用的 Codex 软件工作编排 Skill。
+Primary 先与用户澄清目标，提出写入范围互不重叠的模块 DAG，并在用户一次确认后创建原生
+Codex 任务。每个模块可把独立叶子工作交给有界的原生子代理。任务、worktree、Goal 和等待
+状态均由 Codex 管理；AOG 不增加运行时、Hook、数据库或生命周期状态。
+
+## Workflow / 工作流
 
 ```text
-python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --capacity <N>
+User approval
+      |
+      v
+Primary supervisor -- native wait_threads --> module tasks in managed worktrees
+                                                |
+                                                +-- native leaf subagents
+                                                +-- one module commit
+      |
+      +-- topological commit assembly --> local delivery branch
 ```
 
-Invoke each returned action with only its supplied tool input. Primary must clarify or close
-unresolved work before `prepare`; every native child must be prepared by AOG. A pre-existing
-`aog.planner-proposal.v1` value is accepted only as stateless, schema-validated DAG input. It is
-not a planner route, lifecycle, or direct-spawn permission.
+1. Invoke `$agent-orchestration-gateway:orchestrate` explicitly.
+2. Primary asks only material questions and inspects enough repository context to define ownership.
+3. Primary presents one table with modules, dependencies, write scopes, model/effort, child caps, and
+   review policy. Nothing is dispatched before approval.
+4. A stateless validator checks the structural plan, including cycles and every cross-module scope
+   overlap.
+5. Ready modules run in parallel native tasks. Dependency modules start only after predecessor
+   results and commits are available.
+6. Primary assembles accepted module commits on a dedicated local branch. AOG never pushes or merges
+   into a pre-existing branch without a separate request.
 
-Current Codex Desktop builds may replace the prepared Agent message with opaque
-ciphertext at the Hook boundary. The default `trusted_host` policy admits it only
-when every visible field matches exactly one prepared dispatch, then binds the exact
-ciphertext digest and `tool_use_id` in the existing durable receipt and requires the
-same pair at postflight. This restores native V2 spawn, reuse, and continuation
-without adding another runtime or ledger. It trusts the host; it does not prove that
-the hidden plaintext equals the prepared message. Set
-`AOG_OPAQUE_MESSAGE_POLICY=strict` before starting Codex to reject all opaque Agent
-inputs until the host exposes an authenticated plaintext digest.
+`wait_threads` and `wait_agent` are event waits. They do not poll or consume model sampling while
+blocked. A timeout ends only that wait window; it does not restart or duplicate work.
 
-Primary stays in control only for explicit authority, clarification, an explicit
-direct request, or exactly one declared tool with a total upper bound under 30 seconds.
-After dispatch,
-repeat long `wait_agent` windows until completion or required attention. A
-`timed_out` result is only an expired wait window: wait again on the same live dispatch;
-do not treat the child as failed, narrate unchanged progress, or duplicate its work.
+## Routing / 模型路由
 
-## Deterministic routing and review
-
-| Assurance | Automatic route |
+| Role / 角色 | Default / 默认 |
 | --- | --- |
-| Mechanical explorer or worker | Luna when the active native capability catalogue exposes it; otherwise Terra |
-| Bounded explorer or worker | Terra |
-| Guarded work and final reviewer | Terra |
+| Module root / 模块根任务 | Codex configured model and effort / Codex 配置默认值 |
+| Mechanical deterministic leaf / 机械且可确定验证的叶子任务 | Luna/max |
+| Other leaf or high-impact reviewer / 其他叶子任务或高影响审查 | Terra/max |
 
-The compiler filters routes through the active native capability catalogue, so a
-model not offered by the host is never attempted. AOG does not start another Agent
-runtime to reach Luna; a valid Luna entry that is not explicitly disabled makes the
-existing static route eligible. It marks work
-guarded for semantic or manual verification, public
-interfaces, security/authentication, concurrency, persistence, migration or
-recovery, installer work, filesystem transactions, irreversible actions, test
-failure, retry, deviation, scope expansion, or a new dependency. A guarded plan
-gets one final independent reviewer after every non-reviewer source node. The only way to omit
-that reviewer is the current plan's explicit `accept_risk: true`. Primary final
-authority and deterministic verification remain required.
+The approval table can override a module root. A module uses zero to eight leaves based on real
+independent work; the cap is never a quota. The same leaf is reused for corrections in the same
+scope. Only security, concurrency, persistence, public contracts, installation, destructive, or
+broad semantic changes receive one independent reviewer.
 
-An idle owner may be reused only for one direct clean predecessor with the exact
-role, assurance, selected route, and scopes; it must have zero inherited context,
-no retry, deviation, interruption, blocker, or unresolved receipt/lease. Each reuse
-still has a fresh dispatch and baseline.
+## Plan validation / 计划校验
 
-## State
-
-Current runtime records use `aog.wave.v1`, `aog.lifecycle.v1`, and
-`aog.receipt.v1`.
-
-Readers scan only their declared scopes. AOG admits one normal writer at a time for
-a canonical workspace and fails closed on conflicting live work. `status`,
-`continue`, `native-failure`, `retry`, `restart`, and `cleanup` operate on the
-current task; see [operations](plugins/agent-orchestration-gateway/skills/manage-aog/references/operations.md).
-
-## Experimental cooperative writers
-
-`writer_isolation=cooperative` is opt-in and admits the largest pairwise-disjoint set
-of fresh writer nodes that fits the requested native capacity, with a four-writer
-safety ceiling. A clean Git workspace uses managed worktrees; dirty Git and directory
-workspaces use bounded copies. File, byte, and journal limits apply to the whole wave,
-not once per writer. AOG stages exact backups and one bounded apply journal before
-integration. Guarded writers may be followed by the single compiler-injected final
-reviewer; no other cooperative DAG shape is admitted.
-Successful cleanup removes completed isolate and journal material; an incomplete
-journal and its backups remain until
-rollback or explicit intervention establishes a safe outcome.
-
-This is not an OS sandbox. Children, Primary, and the local host remain trusted;
-inspect the final delta and never rely on cooperative isolation to contain a
-malicious or compromised process.
-
-## Install
-
-Requirements are Python 3.11+ and `zstandard` on Python versions below 3.14, plus a
-current Codex installation with plugins, Hooks, and native Agents.
+Send UTF-8 JSON to the validator through standard input:
 
 ```text
-python -m pip install -r requirements.txt
+python -B plugins/agent-orchestration-gateway/skills/orchestrate/scripts/validate_plan.py
+```
+
+```json
+{
+  "goal": "Add the approved capability",
+  "base_sha": "0123456789abcdef0123456789abcdef01234567",
+  "modules": [
+    {
+      "id": "core",
+      "type": "work",
+      "objective": "Implement the core behavior",
+      "depends_on": [],
+      "writes": [{"kind": "prefix", "path": "src/core"}],
+      "acceptance": [{"id": "core-tests", "criterion": "Focused tests pass"}]
+    }
+  ]
+}
+```
+
+The standard-library validator reads at most 256 KiB, accepts at most eight modules, rejects
+duplicate JSON keys and unknown fields, validates safe repository-relative `exact` file and `prefix`
+directory scopes, rejects redundant or cross-module overlap, validates dependency references, and
+detects cycles. It emits deterministic normalized JSON and never reads or writes repository state.
+
+Parallel writable work requires a clean Git baseline. For a non-Git project, AOG asks before
+initializing Git and creating the initial commit. If the user declines, read-only modules may remain
+parallel, but writable work is limited to one local, uncommitted module. All Git plans require a
+clean baseline so managed worktrees inspect the same state Primary approved.
+
+Write scopes are an orchestration contract, not an OS sandbox. Module roots still inspect diffs and
+verify changed paths before committing.
+
+## Install / 安装
+
+Requirements: a current Codex build with native tasks and subagents, plus Python 3.11 or newer for
+plan validation.
+
+```text
 codex plugin marketplace add .
 codex plugin add agent-orchestration-gateway@agent-orchestration-gateway
-python -B plugins/agent-orchestration-gateway/scripts/install_agents.py --workspace <PROJECT> --bootstrap
 ```
 
-Review and trust the five AOG Hooks in `/hooks`, start a new Codex task, then run:
+Start a new Codex task after installation, then invoke:
 
 ```text
-python -B plugins/agent-orchestration-gateway/scripts/install_agents.py --workspace <PROJECT> --doctor
+$agent-orchestration-gateway:orchestrate
 ```
 
-## Development
+The plugin uses the models and authentication already configured in Codex. It has no provider or
+API-key configuration.
+
+## Development / 开发
 
 ```text
 python -X utf8 -B -m unittest discover -s tests -v
-python -m ruff check plugins tests benchmarks .github/scripts
-python .github/scripts/validate_plugin.py plugins/agent-orchestration-gateway
-git diff --check
+python -m ruff check plugins tests
+python <skill-creator>/scripts/quick_validate.py plugins/agent-orchestration-gateway/skills/orchestrate
+python <plugin-creator>/scripts/validate_plugin.py plugins/agent-orchestration-gateway
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed under
-the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).

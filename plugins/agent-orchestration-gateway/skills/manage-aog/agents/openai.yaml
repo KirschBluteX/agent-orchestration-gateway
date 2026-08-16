@@ -1,6 +1,0 @@
-interface:
-  display_name: "Manage AOG"
-  short_description: "Install, diagnose, inspect, or recover AOG safely."
-  default_prompt: "Use $agent-orchestration-gateway:manage-aog to diagnose and recover this AOG installation."
-policy:
-  allow_implicit_invocation: false
