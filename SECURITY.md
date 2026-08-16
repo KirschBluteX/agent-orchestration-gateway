@@ -21,10 +21,9 @@ journals and their backups remain until a safe rollback or explicit intervention
 
 ## State and Hooks
 
-Current state uses `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. Predecessor state,
-wave, lifecycle, and receipt artifacts are rejected before use and require cleanup before a new
-task. State can reveal repository paths, objectives, routes, changed paths, and acceptance
-evidence; protect the local state directory accordingly.
+Current state uses `cco.wave.v3`, `cco.lifecycle.v2`, and `cco.receipt.v2`. State can reveal
+repository paths, objectives, routes, changed paths, and acceptance evidence; protect the local
+state directory accordingly.
 
 CCO ships five exact Hook definitions. It has no global all-tool matcher. Hooks bind native calls
 and results to an exact dispatch, scope, baseline, owner, and receipt. A host Hook crash or timeout
@@ -46,13 +45,3 @@ the user's behalf.
 Scoped readers inspect only declared exact/prefix scopes. Normal writers are admitted one at a time
 for a canonical workspace and conflicting live work fails closed. An exact initialized-submodule
 scope treats that submodule as one bounded unit and includes its ignored content.
-
-## Offline host-edge repair
-
-Codex Desktop owns its task-card database. CCO does not mutate it from a Hook. The repair utility
-is offline-only: leave the active task, keep `CODEX_THREAD_ID` unset, pass
-`--offline-confirm`, and specify exact parent and child IDs. It writes an owner-only rollback
-journal before a verified repair and retains the current journal even when wall-clock ordering is
-anomalous. The proof reader scans the complete bounded rollout lifecycle rather than trusting a
-terminal window, rechecks that exact proof immediately before the database commit, and fails closed
-when an earlier interruption or late change is observed.

@@ -4,6 +4,19 @@ CCO follows semantic versioning while it remains pre-1.0. A pre-1.0 minor releas
 breaking changes. Public, installer, and manifest identities use a plain release version without
 build metadata.
 
+## Unreleased
+
+### Changed
+
+- Native routing now treats every bundled capability entry except an explicitly disabled one as
+  available, allowing current Codex builds to route mechanical work to Luna without a backend-
+  version gate.
+- Automatic routing has one source of truth: static Luna/Terra defaults intersected with the host
+  catalogue. The undocumented global/project route override and its trusted-root configuration
+  path were removed; task-level explicit model and effort pins remain supported.
+- Removed the standalone offline task-card repair utility and consolidated duplicated repository
+  policy, operations documentation, and overlapping contract tests.
+
 ## 0.9.3 - 2026-08-12
 
 ### Changed

@@ -52,4 +52,4 @@ relevant code change or to diagnose failure; never run one check concurrently or
 and a worker for the same revision.
 
 Use `$codex-cost-orchestrator:manage-cco` only for installation, trust, lifecycle commands,
-cleanup, or offline host-edge maintenance.
+or cleanup.

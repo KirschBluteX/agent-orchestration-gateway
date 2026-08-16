@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 import sys
 import unittest
@@ -11,8 +10,6 @@ sys.path.insert(0, str(SCRIPTS))
 
 from routing_catalog import (  # noqa: E402
     RoutingCatalogError,
-    load_route_policy,
-    normalize_route_policy,
     resolve_route_plan,
 )
 
@@ -76,12 +73,37 @@ class RoutingCatalogTests(unittest.TestCase):
             ],
         )
 
-    def test_v1_model_is_not_offered_to_the_v2_spawn_backend(self) -> None:
+    def test_v1_or_missing_native_metadata_offers_luna_first(self) -> None:
+        for label, version in (("v1", "v1"), ("missing", None)):
+            with self.subTest(version=label):
+                host_catalog = catalog(
+                    ("gpt-5.6-luna", ("max",)),
+                    ("gpt-5.6-terra", ("max",)),
+                )
+                luna = host_catalog["models"][0]
+                if version is None:
+                    del luna["multi_agent_version"]
+                else:
+                    luna["multi_agent_version"] = version
+
+                route = resolve_route_plan(
+                    [request(assurance="mechanical")], host_catalog
+                )["routes"][0]
+
+                self.assertEqual(
+                    route["candidates"],
+                    [
+                        {"effort": "max", "model": "gpt-5.6-luna"},
+                        {"effort": "max", "model": "gpt-5.6-terra"},
+                    ],
+                )
+
+    def test_explicitly_disabled_native_model_is_not_offered(self) -> None:
         host_catalog = catalog(
             ("gpt-5.6-luna", ("max",)),
             ("gpt-5.6-terra", ("max",)),
         )
-        host_catalog["models"][0]["multi_agent_version"] = "v1"
+        host_catalog["models"][0]["multi_agent_version"] = "disabled"
 
         route = resolve_route_plan(
             [request(assurance="mechanical")], host_catalog
@@ -91,6 +113,29 @@ class RoutingCatalogTests(unittest.TestCase):
             route["candidates"],
             [{"effort": "max", "model": "gpt-5.6-terra"}],
         )
+
+    def test_picker_visibility_does_not_override_native_availability(self) -> None:
+        cases = (
+            {"show_in_picker": False},
+            {"hidden": True},
+            {"visibility": "hide"},
+        )
+        for metadata in cases:
+            with self.subTest(metadata=metadata):
+                host_catalog = catalog(
+                    ("gpt-5.6-luna", ("max",)),
+                    ("gpt-5.6-terra", ("max",)),
+                )
+                host_catalog["models"][0].update(metadata)
+
+                route = resolve_route_plan(
+                    [request(assurance="mechanical")], host_catalog
+                )["routes"][0]
+
+                self.assertEqual(
+                    route["candidates"][0],
+                    {"effort": "max", "model": "gpt-5.6-luna"},
+                )
 
     def test_complex_routes_use_terra_without_an_implicit_luna_fallback(self) -> None:
         cases = [
@@ -115,32 +160,6 @@ class RoutingCatalogTests(unittest.TestCase):
         with self.assertRaisesRegex(RoutingCatalogError, "keep the node in Primary"):
             resolve_route_plan([request(assurance="bounded")], luna_only)
 
-    def test_automatic_policy_cannot_weaken_complex_or_sol_floors(self) -> None:
-        with self.assertRaisesRegex(RoutingCatalogError, "Luna/Terra route policy"):
-            normalize_route_policy(
-                {
-                    "worker": {
-                        "bounded": {
-                            "candidates": [
-                                {"effort": "max", "model": "gpt-5.6-luna"}
-                            ]
-                        }
-                    }
-                }
-            )
-        with self.assertRaisesRegex(RoutingCatalogError, "Luna/Terra route policy"):
-            normalize_route_policy(
-                {
-                    "worker": {
-                        "mechanical": {
-                            "candidates": [
-                                {"effort": "max", "model": "gpt-5.6-sol"}
-                            ]
-                        }
-                    }
-                }
-            )
-
     def test_user_fixed_pin_is_host_validated_and_may_select_sol(self) -> None:
         route = resolve_route_plan(
             [
@@ -161,27 +180,21 @@ class RoutingCatalogTests(unittest.TestCase):
             [{"effort": "ultra", "model": "gpt-5.6-sol"}],
         )
 
-    def test_trusted_project_policy_uses_a_stable_absolute_root(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            home = root / "home"
-            project = root / "project"
-            home.mkdir()
-            project.mkdir()
-            (home / "cco.toml").write_text(
-                f'trusted_project_roots = ["{project.as_posix()}"]\n',
-                encoding="utf-8",
+    def test_unsupported_exact_pin_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RoutingCatalogError, "not supported"):
+            resolve_route_plan(
+                [
+                    request(
+                        assurance="bounded",
+                        constraints={
+                            "fixed_effort": "ultra",
+                            "fixed_model": "gpt-5.6-terra",
+                            "source": "user",
+                        },
+                    )
+                ],
+                self.catalog,
             )
-            (project / ".codex").mkdir()
-            (project / ".codex" / "cco.toml").write_text("# trusted\n", encoding="utf-8")
-
-            self.assertTrue(load_route_policy(project, codex_home=home)["project_trusted"])
-
-            (home / "cco.toml").write_text(
-                'trusted_project_roots = ["."]\n', encoding="utf-8"
-            )
-            with self.assertRaisesRegex(RoutingCatalogError, "absolute paths"):
-                load_route_policy(project, codex_home=home)
 
 if __name__ == "__main__":
     unittest.main()

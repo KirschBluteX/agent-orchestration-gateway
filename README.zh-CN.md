@@ -2,11 +2,8 @@
 
 [English](README.md)
 
-> **预 1.0（pre-1.0）发布政策：**公开、安装程序和清单的发布标识均为无构建元数据的 `0.9.3`。在 1.0 之前，次版本可能包含破坏性变更。历史的 2.x 至 5.x 标签已压缩为 0.9 之前的开发历史；Git 历史保持不变。
-
 Codex Cost Orchestrator（CCO）是 Codex 原生 Agent 的本地控制面。Primary 保留意图、
-集成和最终验收；CCO 负责已闭合、已定范围工作的派发与验收证据。当前预 1.0 版本为
-`0.9.3`。
+集成和最终验收；CCO 负责已闭合、已定范围工作的派发与验收证据。CCO 仍处于预 1.0 阶段。
 
 ## 派发契约
 
@@ -39,12 +36,12 @@ python -B <PLUGIN_ROOT>/scripts/control_plane.py prepare --repo <WORKSPACE> --ca
 
 | 保障等级 | 自动路由 |
 | --- | --- |
-| mechanical explorer 或 worker | 当前 V2 后端提供 Luna 时用 Luna，否则直接用 Terra |
+| mechanical explorer 或 worker | 当前原生能力目录提供 Luna 时用 Luna，否则直接用 Terra |
 | bounded explorer 或 worker | Terra |
 | guarded 工作和最终 reviewer | Terra |
 
-CCO 会先与当前 V2 原生能力目录取交集，不会尝试仅供其他 Agent 后端使用的模型。
-CCO 不会为了调用 Luna 再启动一套 V1 Agent 运行时；后续宿主通过 V2 提供 Luna 时，
+CCO 会先与当前原生能力目录取交集，不会尝试宿主未提供的模型。
+CCO 不会为了调用 Luna 再启动额外 Agent 运行时；只要目录中有有效且未显式禁用的 Luna 条目，
 现有静态路由会直接生效，无需迁移 CCO 协议。
 语义或人工验证、公开接口、安全/认证、并发、持久化、迁移或恢复、安装器、文件系统
 事务、不可逆动作、测试失败、重试、偏差、范围扩大或新依赖都会让工作进入 guarded。
@@ -55,15 +52,14 @@ guarded plan 在所有非 reviewer 源节点之后有一个独立最终 reviewer
 没有继承上下文、重试、偏差、中断、阻塞或未结 receipt/lease 时，才可复用 owner。
 每次复用仍生成新的 dispatch 和基线。
 
-## 状态与升级
+## 状态
 
-当前协议为 `cco.wave.v3`、`cco.lifecycle.v2` 与 `cco.receipt.v2`。早期活动状态、wave、
-lifecycle、receipt 或 aggregation 工件不会原地升级；升级到 0.9.3 前必须清理，再开始
-新任务。不存在迁移命令，也不存在活动状态兼容层。
+当前协议为 `cco.wave.v3`、`cco.lifecycle.v2` 与 `cco.receipt.v2`。
 
 只读任务只扫描声明的范围。对于同一规范工作区，CCO 只允许一个普通 writer，并会对
 冲突的活动工作 fail closed。`status`、`continue`、`native-failure`、`retry`、`restart`
-和 `cleanup` 仅操作当前任务；详见 [操作说明](docs/OPERATIONS.md)。
+和 `cleanup` 仅操作当前任务；详见
+[操作说明](plugins/codex-cost-orchestrator/skills/manage-cco/references/operations.md)。
 
 ## 实验性 cooperative writers
 
@@ -97,14 +93,6 @@ python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace 
 
 Doctor 会拒绝缺失、重复或未知的 CCO Hook 定义。
 
-## 离线 host-edge 修复
-
-Codex Desktop 拥有持久化 task-card edge。CCO 不会在 Hook 中修改该数据库。可选修复工具是
-离线兜底：离开活动任务，保持 `CODEX_THREAD_ID` 未设置，使用 `--offline-confirm`，并提供
-精确的 parent 和 child ID。修复前会持久化创建仅 owner 可读写的回滚 journal，并在数据库提交前
-重新校验精确 rollout 证明。详见
-[操作说明](docs/OPERATIONS.md#offline-host-edge-repair)。
-
 ## 开发
 
 ```text
@@ -114,5 +102,5 @@ python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 git diff --check
 ```
 
-参见 [CONTRIBUTING.md](CONTRIBUTING.md)、[SECURITY.md](SECURITY.md) 和
-[ROADMAP.md](ROADMAP.md)。项目采用 [MIT License](LICENSE)。
+参见 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。项目采用
+[MIT License](LICENSE)。

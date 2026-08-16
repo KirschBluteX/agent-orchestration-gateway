@@ -44,7 +44,6 @@ from operation_deadline import (
 from routing_catalog import (
     RoutingCatalogError,
     load_native_catalog,
-    load_route_policy,
     resolve_route_plan,
 )
 from state_lock import StateLockBusy, acquire
@@ -4173,16 +4172,15 @@ class ControlPlane:
             }
             for node in nodes
         ]
-        policy = load_route_policy(Path(plan["workspace_root"]))["policy"]
         errors: dict[str, str] = {}
         try:
-            route_plan = resolve_route_plan(requests, native_catalog, policy=policy)
+            route_plan = resolve_route_plan(requests, native_catalog)
             return {item["node"]: item for item in route_plan["routes"]}, errors
         except RoutingCatalogError:
             routes: dict[str, dict[str, Any]] = {}
             for request in requests:
                 try:
-                    resolved = resolve_route_plan([request], native_catalog, policy=policy)
+                    resolved = resolve_route_plan([request], native_catalog)
                     routes[request["node"]] = resolved["routes"][0]
                 except RoutingCatalogError as error:
                     errors[request["node"]] = str(error)

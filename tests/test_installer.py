@@ -174,41 +174,16 @@ class InstallerTests(unittest.TestCase):
                 observed.append(workspace)
                 return hook_inventory()
 
-            def policy(workspace: Path) -> dict[str, object]:
-                observed.append(workspace)
-                return install_agents.load_route_policy(workspace)
-
             self.assertEqual(
                 doctor(
                     target,
                     workspace=child,
                     native_loader=native_catalog,
                     hook_loader=hooks,
-                    policy_loader=policy,
                 ),
                 0,
             )
-            self.assertEqual(observed, [repo.resolve(), repo.resolve()])
-            self.assertEqual(
-                doctor(
-                    target,
-                    workspace=ROOT,
-                    native_loader=native_catalog,
-                    hook_loader=lambda _workspace: hook_inventory(),
-                    policy_loader=lambda _workspace: {
-                        "policy": {
-                            "worker": {
-                                "mechanical": {
-                                    "candidates": [
-                                        {"effort": "max", "model": "gpt-unsupported"}
-                                    ]
-                                }
-                            }
-                        }
-                    },
-                ),
-                1,
-            )
+            self.assertEqual(observed, [repo.resolve()])
 
 
 if __name__ == "__main__":

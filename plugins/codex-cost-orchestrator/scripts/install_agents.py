@@ -23,7 +23,6 @@ from typing import Any, Callable, Mapping
 from routing_catalog import (
     RoutingCatalogError,
     load_native_catalog,
-    load_route_policy,
     resolve_route_plan,
 )
 from workspace_guard import WorkspaceGuardError, discover_workspace
@@ -437,7 +436,6 @@ def doctor(
     workspace: Path,
     native_loader: Callable[[], dict[str, object]] | None = None,
     hook_loader: Callable[[Path], dict[str, object]] | None = None,
-    policy_loader: Callable[[Path], dict[str, object]] | None = None,
 ) -> int:
     errors: list[str] = []
     if sys.version_info < (3, 11):
@@ -534,7 +532,6 @@ def doctor(
         errors.append(f"CCO Hook trust could not be verified: {error}")
     try:
         catalog = (native_loader or load_native_catalog)()
-        policy = (policy_loader or load_route_policy)(canonical_workspace)["policy"]
         plan = resolve_route_plan(
             [
                 {
@@ -545,7 +542,6 @@ def doctor(
                 }
             ],
             catalog,
-            policy=policy,
         )
         selected = plan["routes"][0]["candidates"][0]
         print(f"ROUTE READY: {selected['model']}/{selected['effort']}")

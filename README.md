@@ -4,11 +4,7 @@
 
 Codex Cost Orchestrator (CCO) is a local control plane for Codex native Agents.
 Primary keeps intent, integration, and final acceptance; CCO dispatches closed,
-scoped work and returns exact acceptance evidence. CCO is pre-1.0: its public,
-installer, and manifest identity is `0.9.3` with no build metadata, and a
-pre-1.0 minor release may include breaking changes. Historical labels from 2.x
-through 5.x are compressed into pre-0.9 development history; Git history
-remains unchanged.
+scoped work and returns exact acceptance evidence. CCO remains pre-1.0.
 
 ## Delegation contract
 
@@ -47,14 +43,14 @@ do not treat the child as failed, narrate unchanged progress, or duplicate its w
 
 | Assurance | Automatic route |
 | --- | --- |
-| Mechanical explorer or worker | Luna when the active V2 backend exposes it; otherwise Terra |
+| Mechanical explorer or worker | Luna when the active native capability catalogue exposes it; otherwise Terra |
 | Bounded explorer or worker | Terra |
 | Guarded work and final reviewer | Terra |
 
-The compiler filters routes through the active V2 native capability catalogue, so a
-model advertised only for another Agent backend is never attempted. CCO does not start
-a second V1 Agent runtime to reach Luna; when a future host exposes Luna through V2, the
-existing static route becomes eligible without a protocol migration. It marks work
+The compiler filters routes through the active native capability catalogue, so a
+model not offered by the host is never attempted. CCO does not start another Agent
+runtime to reach Luna; a valid Luna entry that is not explicitly disabled makes the
+existing static route eligible without a protocol migration. It marks work
 guarded for semantic or manual verification, public
 interfaces, security/authentication, concurrency, persistence, migration or
 recovery, installer work, filesystem transactions, irreversible actions, test
@@ -68,17 +64,15 @@ role, assurance, selected route, and scopes; it must have zero inherited context
 no retry, deviation, interruption, blocker, or unresolved receipt/lease. Each reuse
 still has a fresh dispatch and baseline.
 
-## State and upgrade
+## State
 
 Current runtime records use `cco.wave.v3`, `cco.lifecycle.v2`, and
-`cco.receipt.v2`. Earlier active state, wave, lifecycle, receipt, and aggregation
-artifacts are not upgraded in place: clean them up before starting a 0.9.3 task.
-There is no migration command and no active-state compatibility layer.
+`cco.receipt.v2`.
 
 Readers scan only their declared scopes. CCO admits one normal writer at a time for
 a canonical workspace and fails closed on conflicting live work. `status`,
 `continue`, `native-failure`, `retry`, `restart`, and `cleanup` operate on the
-current task; see [operations](docs/OPERATIONS.md).
+current task; see [operations](plugins/codex-cost-orchestrator/skills/manage-cco/references/operations.md).
 
 ## Experimental cooperative writers
 
@@ -115,15 +109,6 @@ Review and trust the five CCO Hooks in `/hooks`, start a new Codex task, then ru
 python -B plugins/codex-cost-orchestrator/scripts/install_agents.py --workspace <PROJECT> --doctor
 ```
 
-## Offline host-edge repair
-
-Codex Desktop owns persisted task-card edges. CCO never changes that database from a
-Hook. The optional repair utility is an offline fallback: leave the active task, keep
-`CODEX_THREAD_ID` unset, use `--offline-confirm`, and name the exact parent and child
-IDs. It durably creates an owner-only rollback journal and rechecks the exact rollout proof
-immediately before a repair commits. See
-[operations](docs/OPERATIONS.md#offline-host-edge-repair).
-
 ## Development
 
 ```text
@@ -133,5 +118,5 @@ python .github/scripts/validate_plugin.py plugins/codex-cost-orchestrator
 git diff --check
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
-[ROADMAP.md](ROADMAP.md). Licensed under the [MIT License](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Licensed under
+the [MIT License](LICENSE).

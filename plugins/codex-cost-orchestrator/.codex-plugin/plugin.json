@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Codex Cost Orchestrator",
     "shortDescription": "Static native Agent routes with exact-state acceptance.",
-    "longDescription": "Codex Cost Orchestrator is a thin local control plane for Codex native Agents. Primary supplies one schema-validated canonical DAG; CCO derives dependency-ready waves, strict direct-dependency owner reuse, static native routes, scoped workspace baselines, reader/writer admission, continuation cursors, restart fencing, and acceptance-ID evidence. Mechanical work prefers Luna only when the active V2 backend exposes it, otherwise Terra is selected directly; bounded and guarded work use Terra, and a guarded plan receives one final independent reviewer unless the current plan explicitly accepts risk. Codex remains the only Agent runtime, while Primary keeps intent, integration, and final acceptance.",
+    "longDescription": "A local control plane for closed, scoped Codex Agent work. CCO provides deterministic native routing, lifecycle fencing, workspace verification, owner reuse, and acceptance evidence while Primary retains final authority.",
     "developerName": "KirschQAQ",
     "category": "Productivity",
     "capabilities": [

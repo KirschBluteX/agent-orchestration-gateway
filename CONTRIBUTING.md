@@ -10,8 +10,7 @@ below 3.14. Codex CLI is needed only for live native-catalog and end-to-end chec
 
 For installation changes, bootstrap the profiles, review and trust the five exact CCO Hook
 definitions in `/hooks`, start a new Codex task, and only then run `--doctor`. Doctor must fail
-for missing, duplicate, or unknown CCO Hook definitions; do not paper over that result by adding
-compatibility definitions.
+for missing, duplicate, or unknown CCO Hook definitions.
 
 Run before opening a pull request:
 
@@ -33,10 +32,8 @@ git diff --check
   current wave/lifecycle/receipt protocols.
 - Treat cooperative writers as experimental copies/worktrees with bounded backup journals, never
   as a security sandbox.
-- Keep offline host-edge repair outside Hooks: it may close only exact proof-backed edges after a
-  durable owner-only journal and commit-time proof check.
-- Do not add compatibility adapters, a second planner lifecycle, host background work, or external
-  accounting services without an explicit project decision.
+- Do not add a second planner lifecycle, host background work, or external accounting services
+  without an explicit project decision.
 - Preserve user-owned files and unrelated worktree changes.
 
 Behavior changes need focused tests and matching English and Chinese documentation when they affect

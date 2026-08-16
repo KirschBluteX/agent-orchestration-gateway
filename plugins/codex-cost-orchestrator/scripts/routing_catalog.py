@@ -13,21 +13,14 @@ import os
 from pathlib import Path
 import re
 import shutil
-import stat
 import subprocess
 from typing import Any, Callable, Mapping
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - installer requires Python 3.11+
-    tomllib = None  # type: ignore[assignment]
 
 ROUTE_PLAN_PROTOCOL = "cco.route.v1"
 NATIVE_CATALOG_MAX_BYTES = 4 * 1024 * 1024
 MAX_FALLBACK_CANDIDATES = 6
 ASSURANCES = frozenset({"mechanical", "bounded", "guarded"})
 ROLES = frozenset({"explorer", "worker", "reviewer"})
-NATIVE_MULTI_AGENT_VERSION = "v2"
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EFFORT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 NODE_RE = re.compile(r"^[a-z0-9][a-z0-9_]{0,63}$")
@@ -73,21 +66,7 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
     for index, model in enumerate(catalog["models"]):
         if not isinstance(model, Mapping):
             raise RoutingCatalogError(f"native model {index} is malformed")
-        visibility_values = (
-            ("show_in_picker", True),
-            ("hidden", False),
-            ("disabled", False),
-        )
-        if any(
-            key in model
-            and (type(model[key]) is not bool or model[key] is not required)
-            for key, required in visibility_values
-        ):
-            continue
-        if "visibility" in model and model.get("visibility") not in {"list", "visible", "picker"}:
-            continue
-        version = model.get("multi_agent_version")
-        if version != NATIVE_MULTI_AGENT_VERSION:
+        if model.get("multi_agent_version") == "disabled":
             continue
         slug = model.get("slug")
         if not isinstance(slug, str) or MODEL_RE.fullmatch(slug) is None:
@@ -104,52 +83,6 @@ def native_capability_records(catalog: object) -> list[dict[str, str]]:
         {"effort": effort, "model": model}
         for model, effort in sorted(records, key=lambda pair: (pair[0], pair[1]))
     ]
-
-
-def validate_route_pair(value: object, label: str = "route pair") -> dict[str, str]:
-    if not isinstance(value, Mapping) or set(value) != {"effort", "model"}:
-        raise RoutingCatalogError(f"{label} is malformed")
-    model = value["model"]
-    effort = value["effort"]
-    if not isinstance(model, str) or MODEL_RE.fullmatch(model) is None:
-        raise RoutingCatalogError(f"{label}.model is malformed")
-    if not isinstance(effort, str) or EFFORT_RE.fullmatch(effort) is None:
-        raise RoutingCatalogError(f"{label}.effort is malformed")
-    return {"effort": effort, "model": model}
-
-
-def route_pair_is_fully_fixed(constraints: Mapping[str, Any]) -> bool:
-    return constraints.get("fixed_model") is not None and constraints.get("fixed_effort") is not None
-
-
-def _sol_family(model: str) -> bool:
-    return "sol" in model.casefold()
-
-
-def _luna_family(model: str) -> bool:
-    return "luna" in model.casefold()
-
-
-def _terra_family(model: str) -> bool:
-    return "terra" in model.casefold()
-
-
-def _automatic_model_allowed(role: str, assurance: str, model: str) -> bool:
-    if _sol_family(model):
-        return False
-    if role in {"explorer", "worker"} and assurance == "mechanical":
-        return _luna_family(model) or _terra_family(model)
-    return _terra_family(model)
-
-
-def _automatic_candidate_order(
-    role: str, assurance: str, pair: Mapping[str, str]
-) -> tuple[int, str, int]:
-    model = pair["model"]
-    family = 0 if _luna_family(model) else 1
-    if role not in {"explorer", "worker"} or assurance != "mechanical":
-        family = 0
-    return (family, model, EFFORT_PRIORITY.index(pair["effort"]))
 
 
 def _normalize_constraints(value: object, label: str) -> dict[str, str | None]:
@@ -206,79 +139,9 @@ def _default_models(role: str, assurance: str) -> list[str]:
     return list(DEFAULT_ROUTE_MODELS[(role, assurance)])
 
 
-def _validate_policy_candidates(role: str, assurance: str, candidates: object, label: str) -> list[dict[str, str]]:
-    if not isinstance(candidates, list) or not candidates:
-        raise RoutingCatalogError(f"{label}.candidates must be a non-empty list")
-    normalized: list[dict[str, str]] = []
-    for index, candidate in enumerate(candidates):
-        pair = validate_route_pair(candidate, f"{label}.candidates[{index}]")
-        if pair["effort"] not in EFFORT_PRIORITY:
-            raise RoutingCatalogError(
-                "automatic configuration effort must be max, xhigh, or high"
-            )
-        if not _automatic_model_allowed(role, assurance, pair["model"]):
-            raise RoutingCatalogError(
-                "automatic configuration violates the Luna/Terra route policy"
-            )
-        normalized.append(pair)
-    if len({(item["model"], item["effort"]) for item in normalized}) != len(normalized):
-        raise RoutingCatalogError(f"{label}.candidates must be duplicate-free")
-    if normalized != sorted(
-        normalized,
-        key=lambda item: _automatic_candidate_order(role, assurance, item),
-    ):
-        raise RoutingCatalogError(
-            f"{label}.candidates must preserve automatic route preference"
-        )
-    return normalized
-
-
-def normalize_route_policy(value: object, label: str = "route policy") -> dict[str, list[dict[str, str]]]:
-    """Normalize role×assurance candidate overrides without weakening floors."""
-
-    if value is None:
-        return {}
-    if not isinstance(value, Mapping):
-        raise RoutingCatalogError(f"{label} is malformed")
-    routes = value.get("routes", value)
-    if not isinstance(routes, Mapping):
-        raise RoutingCatalogError(f"{label}.routes is malformed")
-    normalized: dict[str, list[dict[str, str]]] = {}
-    for role, assurance_map in routes.items():
-        if role not in ROLES or not isinstance(assurance_map, Mapping):
-            raise RoutingCatalogError(f"{label} contains an invalid role")
-        for assurance, route in assurance_map.items():
-            if assurance not in ASSURANCES or not isinstance(route, Mapping):
-                raise RoutingCatalogError(f"{label} contains an invalid assurance")
-            if role == "reviewer" and assurance != "guarded":
-                raise RoutingCatalogError(f"{label} reviewer routes must be guarded")
-            key = f"{role}.{assurance}"
-            normalized[key] = _validate_policy_candidates(
-                role, assurance, route.get("candidates"), f"{label}.{key}"
-            )
-    return normalized
-
-
-def _policy_models(policy: Mapping[str, list[dict[str, str]]], role: str, assurance: str) -> list[dict[str, str]]:
-    key = f"{role}.{assurance}"
-    if key in policy:
-        return [dict(item) for item in policy[key]]
-    return [{"model": model, "effort": "max"} for model in _default_models(role, assurance)]
-
-
-def _policy_document(policy: Mapping[str, list[dict[str, str]]]) -> dict[str, Any]:
-    """Return the nested public policy shape accepted by ``resolve_route_plan``."""
-
-    document: dict[str, Any] = {}
-    for key, candidates in policy.items():
-        role, assurance = key.split(".", 1)
-        document.setdefault(role, {})[assurance] = {
-            "candidates": [dict(candidate) for candidate in candidates]
-        }
-    return document
-
-
-def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, str]], policy: Mapping[str, list[dict[str, str]]]) -> list[dict[str, str]]:
+def _candidate_pairs(
+    request: Mapping[str, Any], native_records: list[dict[str, str]]
+) -> list[dict[str, str]]:
     constraints = request["constraints"]
     fixed_model = constraints["fixed_model"]
     fixed_effort = constraints["fixed_effort"]
@@ -286,19 +149,7 @@ def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, 
     for record in native_records:
         supported.setdefault(record["model"], set()).add(record["effort"])
 
-    policy_key = f"{request['role']}.{request['assurance']}"
     if constraints["source"] == "automatic":
-        if policy_key in policy:
-            exact = [
-                dict(pair)
-                for pair in policy[policy_key]
-                if pair["effort"] in supported.get(pair["model"], set())
-            ][:MAX_FALLBACK_CANDIDATES]
-            if not exact:
-                raise RoutingCatalogError(
-                    "configured route has no supported native Agent candidate; keep the node in Primary"
-                )
-            return exact
         candidates: list[dict[str, str]] = []
         for model in _default_models(request["role"], request["assurance"]):
             for effort in _effort_order(supported.get(model, set())):
@@ -311,13 +162,9 @@ def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, 
         if fixed_model is not None:
             model_candidates = [fixed_model]
         else:
-            configured = _policy_models(
-                policy, request["role"], request["assurance"]
+            model_candidates = _default_models(
+                request["role"], request["assurance"]
             )
-            model_candidates = []
-            for configured_pair in configured:
-                if configured_pair["model"] not in model_candidates:
-                    model_candidates.append(configured_pair["model"])
         candidates = []
         for model in model_candidates:
             for effort in _effort_order(supported.get(model, set()), fixed_effort):
@@ -329,7 +176,11 @@ def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, 
             if len(candidates) >= MAX_FALLBACK_CANDIDATES:
                 break
 
-    if constraints["source"] == "user" and route_pair_is_fully_fixed(constraints):
+    if (
+        constraints["source"] == "user"
+        and fixed_model is not None
+        and fixed_effort is not None
+    ):
         if not candidates:
             raise RoutingCatalogError("user-fixed model/effort pair is not supported by native Agents")
         return candidates[:1]
@@ -341,8 +192,6 @@ def _candidate_pairs(request: Mapping[str, Any], native_records: list[dict[str, 
 def resolve_route_plan(
     requests: object,
     native_catalog: object,
-    *,
-    policy: object = None,
 ) -> dict[str, Any]:
     """Resolve all node routes in one deterministic local operation."""
 
@@ -352,10 +201,9 @@ def resolve_route_plan(
     if len({item["node"] for item in normalized}) != len(normalized):
         raise RoutingCatalogError("route request nodes must be unique")
     records = native_capability_records(native_catalog)
-    normalized_policy = normalize_route_policy(policy)
     routes: list[dict[str, Any]] = []
     for request in normalized:
-        candidates = _candidate_pairs(request, records, normalized_policy)
+        candidates = _candidate_pairs(request, records)
         routes.append(
             {
                 "assurance": request["assurance"],
@@ -368,115 +216,6 @@ def resolve_route_plan(
     return {
         "protocol": ROUTE_PLAN_PROTOCOL,
         "routes": routes,
-    }
-
-
-def _codex_home() -> Path:
-    configured = os.environ.get("CODEX_HOME")
-    return Path(configured).expanduser() if configured else Path.home() / ".codex"
-
-
-def _load_toml(path: Path, label: str) -> dict[str, Any]:
-    if tomllib is None:
-        raise RoutingCatalogError("Python 3.11 or newer is required for route configuration")
-    try:
-        with path.open("rb") as handle:
-            value = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise RoutingCatalogError(f"{label} is invalid: {error}") from error
-    if not isinstance(value, dict):
-        raise RoutingCatalogError(f"{label} is malformed")
-    return value
-
-
-def _canonical_root(value: Path) -> str:
-    try:
-        return os.path.normcase(str(value.expanduser().resolve()))
-    except OSError as error:
-        raise RoutingCatalogError("trusted project root is unavailable") from error
-
-
-def _is_reparse(metadata: os.stat_result) -> bool:
-    attributes = getattr(metadata, "st_file_attributes", 0)
-    return stat.S_ISLNK(metadata.st_mode) or bool(
-        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-    )
-
-
-def _stable_project_root(value: Path) -> tuple[Path, tuple[int, int]]:
-    """Resolve a project exactly once and bind policy loading to that directory."""
-
-    try:
-        root = value.expanduser().resolve(strict=True)
-        metadata = root.lstat()
-    except OSError as error:
-        raise RoutingCatalogError("project CCO root is unavailable") from error
-    if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
-        raise RoutingCatalogError("project CCO root must be a real directory")
-    return root, (int(metadata.st_dev), int(metadata.st_ino))
-
-
-def _project_policy(root: Path, identity: tuple[int, int]) -> dict[str, Any]:
-    """Read a policy only while its trusted root remains the same directory."""
-
-    directory = root / ".codex"
-    try:
-        directory_metadata = directory.lstat()
-    except FileNotFoundError:
-        return {}
-    except OSError as error:
-        raise RoutingCatalogError("project CCO configuration is unavailable") from error
-    if _is_reparse(directory_metadata) or not stat.S_ISDIR(directory_metadata.st_mode):
-        raise RoutingCatalogError("project CCO configuration directory is unsafe")
-    path = directory / "cco.toml"
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return {}
-    except OSError as error:
-        raise RoutingCatalogError("project CCO configuration is unavailable") from error
-    if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
-        raise RoutingCatalogError("project CCO configuration is unsafe")
-    config = _load_toml(path, "project CCO configuration")
-    try:
-        current = root.lstat()
-    except OSError as error:
-        raise RoutingCatalogError("project CCO root is unavailable") from error
-    if (
-        _is_reparse(current)
-        or not stat.S_ISDIR(current.st_mode)
-        or (int(current.st_dev), int(current.st_ino)) != identity
-    ):
-        raise RoutingCatalogError("trusted project root changed while loading configuration")
-    return config
-
-
-def load_route_policy(repo: Path, *, codex_home: Path | None = None) -> dict[str, Any]:
-    """Load global and explicitly trusted project policy without network state."""
-
-    home = (codex_home or _codex_home()).resolve()
-    global_path = home / "cco.toml"
-    global_config = _load_toml(global_path, "global CCO configuration") if global_path.is_file() else {}
-    trusted = global_config.get("trusted_project_roots", [])
-    if not isinstance(trusted, list) or any(not isinstance(item, str) for item in trusted):
-        raise RoutingCatalogError("trusted_project_roots must be a list of paths")
-    project, project_identity = _stable_project_root(Path(repo))
-    project_root = os.path.normcase(str(project))
-    trusted_roots: set[str] = set()
-    for item in trusted:
-        candidate = Path(item).expanduser()
-        if not candidate.is_absolute():
-            raise RoutingCatalogError("trusted_project_roots must contain absolute paths")
-        trusted_roots.add(_canonical_root(candidate))
-    project_config: dict[str, Any] = {}
-    if project_root in trusted_roots:
-        project_config = _project_policy(project, project_identity)
-    global_policy = normalize_route_policy(global_config.get("routes"), "global CCO routes")
-    project_policy = normalize_route_policy(project_config.get("routes"), "project CCO routes")
-    merged = {**global_policy, **project_policy}
-    return {
-        "policy": _policy_document(merged),
-        "project_trusted": project_root in trusted_roots,
     }
 
 
