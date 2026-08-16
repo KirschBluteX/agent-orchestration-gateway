@@ -91,12 +91,15 @@ class ProjectContractTests(unittest.TestCase):
             {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
         )
 
-    def test_repository_has_one_bilingual_readme_and_no_legacy_runtime(self) -> None:
-        readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("Agent Orchestration Gateway", readme)
-        self.assertIn("English", readme)
-        self.assertIn("简体中文", readme)
-        self.assertFalse((ROOT / "README.zh-CN.md").exists())
+    def test_repository_has_separate_readmes_and_no_legacy_runtime(self) -> None:
+        english = (ROOT / "README.md").read_text(encoding="utf-8")
+        chinese = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
+        self.assertIn("[简体中文](README.zh-CN.md)", english)
+        self.assertIn("## Workflow", english)
+        self.assertNotIn("## 工作流", english)
+        self.assertIn("[English](README.md)", chinese)
+        self.assertIn("## 工作流", chinese)
+        self.assertNotIn("## Workflow", chinese)
         self.assertFalse((ROOT / "AGENTS.md").exists())
         for path in ("hooks", "agents", "scripts", "skills/manage-aog"):
             self.assertFalse((PLUGIN / path).exists(), path)
