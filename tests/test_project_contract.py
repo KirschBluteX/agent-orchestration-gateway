@@ -31,6 +31,20 @@ class ProjectContractTests(unittest.TestCase):
         metadata = (SKILL / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn("allow_implicit_invocation: false", metadata)
 
+        supervisor = (SKILL / "references" / "supervisor.md").read_text(
+            encoding="utf-8"
+        )
+        module = (SKILL / "references" / "module.md").read_text(encoding="utf-8")
+        compact_supervisor = " ".join(supervisor.split())
+        compact_module = " ".join(module.split())
+        self.assertIn("Eight is only the native wait batch ceiling", compact_supervisor)
+        self.assertIn("Read-only `writes: []`", compact_supervisor)
+        self.assertIn("explicit terminal/deleted evidence", compact_supervisor)
+        self.assertIn(
+            "immediately use one long event-driven `wait_agent`", compact_module
+        )
+        self.assertIn("Report a genuine unresolved choice to Primary", compact_module)
+
     def test_manifest_and_marketplace_match_release(self) -> None:
         manifest = json.loads(
             (PLUGIN / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")

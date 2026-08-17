@@ -5,6 +5,13 @@ other modules. Write only within the declared `exact` file or `prefix` directory
 outside them is allowed only to understand callers and contracts. Ask the supervisor before any
 scope, dependency, public behavior, or acceptance change.
 
+The module objective is an exclusive responsibility, not a topic label. Treat the prompt's stated
+non-goals as binding: do not independently investigate, test, or summarize a sibling's responsibility
+even when the same files are useful background. `writes: []` means read-only, not semantically shared.
+
+Do not call `request_user_input`. Report a genuine unresolved choice to Primary with its consequence;
+Primary applies the decision-value gate and either resolves it or asks the user.
+
 ## Establish the module
 
 1. Before Git inspection or commit, require repository-override variables (`GIT_DIR`,
@@ -16,15 +23,18 @@ scope, dependency, public behavior, or acceptance change.
    the project is not a Git work tree and do not initialize Git.
 3. Inspect enough current code to confirm the prompt's assumptions. If evidence contradicts the
    objective or ownership boundary, report it instead of stacking a speculative fix.
-4. Assign one owner to each implementation scope and each validation check for the current revision.
-   Do not have the module root and a leaf independently inspect or test the same work while it runs.
+4. Assign one owner to each implementation scope, responsibility, and validation check for the current
+   revision. Do not have the module root and a leaf independently inspect or test the same work while it
+   runs. If the prompt's boundary is not exclusive, stop and report it instead of broadening the module.
 
-## Use leaf agents selectively
+## Delegate independent leaves first
 
 The module root remains responsible for decisions, integration, validation, and its final commit.
-Use native subagents only for closed leaves that can run independently; zero children is valid.
-Never exceed the prompt's child cap or eight children, and respect the currently available native
-capacity.
+Enumerate the module's independently executable leaves before doing substantive work. Dispatch every
+such leaf immediately, up to the approved cap and native capacity; the cap is a ceiling, never a quota.
+The root may retain only coordination, integration, or acceptance work that no leaf can own. Zero
+children is valid only when no independent leaf exists. Never exceed the prompt's child cap or eight
+children, and respect the currently available native capacity.
 
 - Use Luna/max for mechanical, deterministic leaves with an exact expected artifact or check.
 - Use Terra/max for implementation, diagnosis, exploration, tests, and review that require judgment.
@@ -40,9 +50,11 @@ Do not split tightly coupled work merely to fill capacity. Use `followup_task` t
 for same-scope corrections. Create another leaf only for an independent review or a genuine model
 escalation.
 
-After dispatch, use one long event-driven `wait_agent` for all live leaves. Do not poll, duplicate
-their inspection, or run their checks while waiting. A timeout expires only that wait window; keep
-the same agents and use another long wait only when continued waiting is required.
+After dispatch, immediately use one long event-driven `wait_agent` for all live leaves. While they run,
+do not perform the delegated analysis, duplicate their inspection, or run their checks. A timeout
+expires only that wait window; keep the same agents and use another long wait only when continued
+waiting is required. A temporary agent or tool failure does not justify a replacement; retain the
+original leaf and report the blocker instead of switching to an untracked agent substrate.
 
 ## Review only high-impact changes
 

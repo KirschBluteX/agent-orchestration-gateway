@@ -115,6 +115,13 @@ class ValidatePlanTests(unittest.TestCase):
         self.assert_invalid(duplicate_acceptance, "acceptance id")
         self.assert_invalid(plan(module("a"), module("a")), "module id")
 
+    def test_rejects_duplicate_module_objectives_after_normalization(self) -> None:
+        payload = plan(module("a"), module("b"))
+        payload["modules"][0]["objective"] = "Map the editor architecture"
+        payload["modules"][1]["objective"] = "  MAP  THE EDITOR\nARCHITECTURE  "
+
+        self.assert_invalid(payload, "duplicate module objective")
+
     def test_rejects_ambiguous_or_unsafe_paths(self) -> None:
         bad_paths = [
             "../src",

@@ -23,11 +23,12 @@ Primary supervisor -- native wait_threads --> module tasks in managed worktrees
 ```
 
 1. Invoke `$agent-orchestration-gateway:orchestrate` explicitly.
-2. Primary asks only material questions and inspects enough repository context to define ownership.
-3. Primary presents one table with modules, dependencies, write scopes, model/effort, child caps,
-   and review policy. Nothing is dispatched before approval.
-4. A stateless validator checks the structural plan, including cycles and every cross-module scope
-   overlap.
+2. Primary asks only when an undiscoverable answer materially changes behavior, ownership, risk, or
+   scope; module tasks return such blockers to Primary instead of questioning the user directly.
+3. Primary assigns every outcome, evidence stream, check, and write scope to one owner, then proposes
+   the smallest non-overlapping DAG. One module is valid; eight is only the native wait batch ceiling.
+4. Primary presents one approval table with exclusive responsibilities, non-goals, dependencies,
+   write scopes, model/effort, child caps, and review policy. A stateless validator checks the plan.
 5. Ready modules run in parallel native tasks. Dependency modules start only after predecessor
    results and commits are available.
 6. Primary assembles accepted module commits on a dedicated local branch. AOG never pushes or
@@ -44,10 +45,11 @@ blocked. A timeout ends only that wait window; it does not restart or duplicate 
 | Mechanical deterministic leaf | Luna/max |
 | Other leaf or high-impact reviewer | Terra/max |
 
-The approval table can override a module root. A module uses zero to eight leaves based on real
-independent work; the cap is never a quota. The same leaf is reused for corrections in the same
-scope. Only security, concurrency, persistence, public contracts, installation, destructive, or
-broad semantic changes receive one independent reviewer.
+The approval table can override a module root. A module dispatches every independently executable
+leaf up to its approved cap, then waits without duplicating leaf work; the cap is never a quota.
+The same leaf is reused for corrections in the same scope. Only security, concurrency, persistence,
+public contracts, installation, destructive, or broad semantic changes receive one independent
+reviewer.
 
 ## Plan Validation
 
@@ -75,10 +77,11 @@ python -B plugins/agent-orchestration-gateway/skills/orchestrate/scripts/validat
 ```
 
 The standard-library validator reads at most 256 KiB, accepts at most eight modules, rejects
-duplicate JSON keys and unknown fields, validates safe repository-relative `exact` file and
-`prefix` directory scopes, rejects redundant or cross-module overlap, validates dependency
-references, and detects cycles. It emits deterministic normalized JSON and never reads or writes
-repository state.
+duplicate JSON keys, unknown fields, exact duplicate module objectives, and unsafe
+repository-relative paths. It rejects redundant or cross-module write overlap, validates dependency
+references, and detects cycles. Semantic responsibility is reviewed in the approval table because a
+stateless structural validator cannot infer whether two differently worded investigations overlap.
+It emits deterministic normalized JSON and never reads or writes repository state.
 
 Parallel writable work requires a clean Git baseline. For a non-Git project, AOG asks before
 initializing Git and creating the initial commit. If the user declines, read-only modules may remain

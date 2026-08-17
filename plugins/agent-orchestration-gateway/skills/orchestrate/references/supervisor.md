@@ -2,27 +2,42 @@
 
 Act as the user's manager and decision interface. Do not implement module code in Primary.
 
+## One question gate
+
+Ask the user only when all of these are true: the answer cannot be discovered from the repository or
+the approved defaults, it changes behavior, ownership, risk, or scope, and proceeding without it would
+make the result materially different or unsafe. Otherwise choose the documented default and continue.
+Primary owns this gate. Module tasks report an unresolved decision to Primary instead of opening a user
+input request themselves. An explicit instruction or approved choice never satisfies this gate.
+
 ## Shape the initiative
 
-1. Clarify only choices that can change behavior, ownership, risk, or scope. Ask a small set of concrete
-   questions per round and use repository evidence before asking discoverable questions.
-2. Inspect read-only only far enough to identify owners, dependencies, acceptance seams, and disjoint write
-   boundaries. Stop exploring a module once its prompt can stand alone.
-3. Build at most eight top-level modules. Give each one objective, explicit acceptance criteria, and
-   repository-relative scopes. Use `exact` only for a file, `prefix` for a directory, and `[]` for read-only work.
-4. Add dependencies only for real data or commit flow. Add an `integration` module only when at least two
-   predecessors require shared wiring or aggregate validation. Its scopes cover only new integration edits.
-5. Reject overlapping scopes. If two modules need the same path, combine them or make one the sole owner and
-   pass its result to the dependent module.
+1. Use repository evidence before asking any question. Inspect only far enough to identify owners,
+   dependencies, acceptance seams, and disjoint write boundaries.
+2. Build a private responsibility matrix with one row per independently deliverable outcome. Assign
+   exactly one owner to each row. A module is admitted only when its objective, evidence, and acceptance
+   are independent of every sibling; topical similarity is not a boundary.
+3. Create the smallest DAG that covers those rows. One module is valid. Eight is only the native wait
+   batch ceiling, never a target or quota. Merge modules when one would repeat another's investigation,
+   provide a generic overview of siblings, or exist only to make the table look complete.
+4. Add dependencies only for real data or commit flow. Add an `integration` module only for shared
+   wiring or an aggregate artifact that cannot be produced by Primary from predecessor reports. An
+   integration task must consume those reports and must not re-research their scopes.
+5. Reject semantic and path overlap. If two modules need the same decision, evidence, or path, combine
+   them or make one the sole owner and pass its result to the dependent module. Read-only `writes: []`
+   does not make overlapping responsibilities safe.
 
 Show one compact approval table before dispatch:
 
-| Module | Objective | Depends on | Writes | Model / effort | Child cap | Review |
+| Module | Exclusive outcome / non-goals | Depends on | Writes | Model / effort | Child cap | Review |
 | --- | --- | --- | --- | --- | --- | --- |
 
 Default a module root to Codex's configured model and effort by omitting overrides. Use a specific model or
-effort only when the user approves that exact value. Set a zero-to-eight child cap from plausible independent
-leaves, never as a quota. Mark review as `none` or `one if high-impact (Terra/max)`.
+effort only when the user approves that exact value. Set the child cap from plausible independent leaves,
+never as a quota; a cap of zero is valid when no independent leaf exists. Include the module's exclusive
+responsibility and explicit non-goals in the prompt. Mark review as `none` or `one if high-impact
+(Terra/max)`. Native task titles must identify the module and effective model/effort, for example
+`[AOG] editor-core [gpt-5.6-terra/max]`.
 
 Also show the unused local delivery branch and these fixed effects: Git module roots create one completion
 commit, leaves never commit, Primary assembles commits, and AOG never pushes or merges into a pre-existing
@@ -48,8 +63,10 @@ Construct this JSON in memory, send it to `scripts/validate_plan.py` through sta
 ```
 
 Use `integration` only with at least two direct dependencies. The validator rejects unknown fields, unsafe
-paths, duplicate IDs, cycles, redundant or cross-module scopes, more than eight modules, and input above
-256 KiB. Its stdout is the structural plan; keep execution choices in the conversation, not a second plan.
+paths, duplicate IDs and exact duplicate objectives, cycles, redundant or cross-module scopes, more than
+eight modules, and input above 256 KiB. It cannot prove semantic ownership, so the responsibility matrix
+and approval table remain mandatory. Its stdout is the structural plan; keep execution choices in the
+conversation, not a second plan.
 
 ## Prepare Git
 
@@ -68,19 +85,25 @@ Create one native Goal after approval. Settle an unfinished Goal or ask the user
 ## Dispatch dependency waves
 
 Dispatch every ready module up to the plan and native capacity. Use Codex project worktrees for Git and local
-tasks only for the non-Git exception. Omit model and effort unless exact overrides were approved.
+tasks only for the non-Git exception. Omit model and effort unless exact overrides were approved. Dispatch
+only the approved modules; do not invent a fallback scope to compensate for a slow or failed task.
 
 Each self-contained task prompt must say `AOG module task`, invoke
 `$agent-orchestration-gateway:orchestrate`, and include the goal, module ID, objective, acceptance,
-expected start, predecessor commits/results, exclusive scopes, model/effort, child cap, review policy,
-preservation and no-push rules, conditional commit rule, required evidence, and blocker behavior.
+exclusive responsibility and non-goals, expected start, predecessor commits/results, write scopes,
+model/effort, child cap, review policy, preservation and no-push rules, conditional commit rule,
+required evidence, and blocker behavior.
 
 After dispatch, call `wait_threads` once for all live tasks with current cursors and the longest
 practical bounded timeout. It does not poll or sample while blocked. Process completion or attention,
 then wait once on the remainder. On a bare timeout, report active tasks and end unless the user asked
 to keep waiting; never busy-poll. Do not inspect, solve, or test active delegated scopes. Send
 same-scope corrections through `send_message_to_thread` to the existing task; create another only
-for a newly approved independent module or when the original is irrecoverably unavailable.
+for a newly approved independent module or after the host provides explicit terminal/deleted evidence
+that the original cannot be recovered. A timeout, provider 4xx/5xx, `No Codex thread found`,
+`thread_list_unavailable`, a missing cursor, or `waitingOnUserInput` without an actual question may
+block progress but is not terminal/deleted evidence. Retain the original task/worktree and never
+redispatch on those signals alone.
 
 ## Assemble and finish
 

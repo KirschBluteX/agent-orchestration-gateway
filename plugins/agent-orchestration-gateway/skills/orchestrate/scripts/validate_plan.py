@@ -59,6 +59,10 @@ def _has_surrogate(value: str) -> bool:
     return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
 
 
+def _semantic_key(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+
 def _reject_constant(value: str) -> None:
     raise ValidationError(f"non-standard JSON constant is not allowed: {value}")
 
@@ -319,12 +323,20 @@ def validate_plan(payload: dict[str, Any]) -> dict[str, Any]:
     raw_modules = _list(payload, "modules", "plan", minimum=1, maximum=MAX_MODULES)
     modules: dict[str, dict[str, Any]] = {}
     acceptance_ids: set[str] = set()
+    objective_owners: dict[str, str] = {}
     all_scopes: list[tuple[str, dict[str, str]]] = []
     for index, raw_module in enumerate(raw_modules):
         module = _validate_module(raw_module, index)
         identifier = module["id"]
         if identifier in modules:
             raise ValidationError(f"duplicate module id: {identifier}")
+        objective_key = _semantic_key(module["objective"])
+        if objective_key in objective_owners:
+            raise ValidationError(
+                "duplicate module objective across "
+                f"{objective_owners[objective_key]} and {identifier}"
+            )
+        objective_owners[objective_key] = identifier
         modules[identifier] = module
         for criterion in module["acceptance"]:
             key = criterion["id"].casefold()
